@@ -33,14 +33,14 @@ class PrioritizedURL:
 class PriorityURLQueue:
     """Intelligent URL queue with priority-based processing"""
 
-    def __init__(self):
+    def __init__(self, settings: Dict[str, Any] = None):
         self._queue = []
         self._url_scores: Dict[str, float] = {}
         self._domain_scores: Dict[str, float] = {}
         self._url_patterns: Dict[str, int] = {}
-        self._lock = asyncio.Lock()
-        self._not_empty = asyncio.Event()
-        self._waiters = []
+        self._condition = asyncio.Condition()
+        from src import constants as K
+        self.settings = settings or K.DEFAULT_SETTINGS_VALUES
 
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL"""
@@ -99,6 +99,10 @@ class PriorityURLQueue:
                 # Example: from blog.example.com to images.example.com is OK
                 pass
             else:
+                from src import constants as K
+                if not self.settings.get(K.SETTING_STAY_IN_DOMAIN, True):
+                    logger.debug(f"Domains don't match, but Stay in Domain is OFF - allowing: {url_domain}")
+                    return True
                 # Completely different domains - reject
                 logger.debug(f"Domains don't match and aren't related: {source_domain} vs {url_domain} - rejecting")
                 return False
@@ -217,21 +221,24 @@ class PriorityURLQueue:
     def _calculate_url_priority(
         self, url: str, depth: int, source_url: str = "", context: dict = None
     ) -> float:
-        """
-        Calculate URL priority based on multiple factors:
-        - Downward path enforcement (only follow links deeper than source URL)
-        - Media context (higher priority for links from thumbnails/images)
-        - Path similarity (higher priority for URLs in same section as starting URL)
-        - URL patterns (prioritize URLs similar to successful ones)
-        - Domain reputation (based on media count success)
-        - Depth (modified to not overly penalize deeper URLs on same path)
-        - Media first processing (prioritize media URLs over navigation)
-        """
+        context = context or {}
+
+        # Start URLs ALWAYS bypass downward-path enforcement.
+        # Any comparison of url == source_url at root level returns False otherwise.
+        if context.get("is_start_url"):
+            return context.get("priority", 1000.0)
+
         # Check if this is a downward URL from the source
         # If not, give it zero priority which will effectively skip it
-        if source_url and not self._is_downward_url(url, source_url):
+        # EXCEPTION: If it is a known media container or migrated URL, BYPASS the downward check
+        is_blessed = context.get("is_media_container") or context.get("is_migrated")
+        
+        if source_url and not is_blessed and not self._is_downward_url(url, source_url):
             logger.debug(f"Skipping URL: {url} (not considered related to {source_url})")
             return 0.0
+        
+        if is_blessed:
+            logger.debug(f"Bypassing relationship check for BLESSED URL (media/migrated): {url}")
             
         # Add an explicit log for URLs that pass the downward check
         logger.debug(f"URL {url} passed the relationship check with {source_url} - calculating priority")
@@ -262,8 +269,8 @@ class PriorityURLQueue:
             
         # Media context factor (high priority boost)
         # If this URL was found in an image context (e.g., inside <a> containing <img>)
-        elif context.get('from_image', False):
-            base_priority *= 20.0  # Major boost for image-linked content
+        if context.get('from_image', False):
+            base_priority *= 25.0  # Super boost for image-linked content
         
         # Path similarity to initial/source URL (stay in same section)
         # This is the MOST important factor to keep exploration near user's starting point
@@ -292,7 +299,12 @@ class PriorityURLQueue:
                     else:
                         break
                 
-                # Strong boost for sharing path prefix with original URL
+                # Subpath boost (staying inside the same folder/category)
+                if common_length > 0 and common_length >= len(source_parts) - 1:
+                    base_priority *= 3.0
+                    logger.debug(f"Subpath boost applied for {url}")
+                
+                # Additional boost for deep commonality
                 if common_length > 0:
                     # The more path components in common, the higher the boost
                     path_similarity_factor = 3.0 + (common_length * 2.0)
@@ -349,12 +361,19 @@ class PriorityURLQueue:
             base_priority *= 0.005  # Even more severely reduce priority for homepage
             logger.debug(f"Deprioritizing homepage URL: {url}")
         
-        # Detect and deprioritize other navigation URLs
+        # Detect and deprioritize other navigation URLs, but preserve pagination
         nav_patterns = ['index', 'home', 'main', 'contact', 'about', 'login', 'signup', 
-                       'register', 'search', 'categories', 'tags', 'menu']
-        for nav in nav_patterns:
-            if nav in path or nav in query:
-                base_priority *= 0.2  # Significantly reduce priority for likely navigation pages
+                       'register', 'search', 'categories', 'tags', 'menu', 'category', 'tag', 'archive', 'partner', 'blogroll', 'ads', 'external']
+        pagination_patterns = ['page/', 'page=', 'p=', 'pg=', 'next']
+        
+        is_pagination = any(pag in path or pag in query for pag in pagination_patterns)
+        
+        if is_pagination:
+            base_priority *= 0.8  # Mild penalty for pagination (keep it exploring pages)
+        else:
+            for nav in nav_patterns:
+                if nav in path or nav in query:
+                    base_priority *= 0.05  # Severely reduce priority for likely navigation pages
         
         # Detect likely content pages based on URL patterns
         if self._is_likely_content_page(url):
@@ -454,7 +473,7 @@ class PriorityURLQueue:
 
     async def put(self, url: str, depth: int, source_url: str = "", context: dict = None):
         """Add URL to the priority queue with context information"""
-        async with self._lock:
+        async with self._condition:
             # Make sure we use the most appropriate source URL for downward path enforcement
             effective_source_url = source_url
             if context and 'start_url' in context:
@@ -489,41 +508,27 @@ class PriorityURLQueue:
                 context=context or {},
             )
             heappush(self._queue, item)
-            self._not_empty.set()  # Signal that queue is not empty
+            self._condition.notify_all()  # Signal that queue is not empty
 
     async def get(self, timeout: float = None) -> Tuple[str, int, str, dict]:
         """Get URL with highest priority"""
-        while True:
-            async with self._lock:
-                if self._queue:
-                    item = heappop(self._queue)
-                    if not self._queue:
-                        self._not_empty.clear()
-                    logger.debug(f"Processing URL: {item.url} (depth={item.depth}, priority={-item.priority:.2f})")
-                    return item.url, item.depth, item.source_url, item.context
+        async with self._condition:
+            if not self._queue:
+                if timeout is None:
+                    await self._condition.wait()
+                else:
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        raise asyncio.QueueEmpty()
 
-                if not timeout:
-                    self._not_empty.clear()
-
-            try:
-                async with self._lock:
-                    waiter = asyncio.create_task(self._not_empty.wait())
-                    self._waiters.append(waiter)
-
-                try:
-                    if timeout:
-                        await asyncio.wait_for(waiter, timeout)
-                    else:
-                        await waiter
-                finally:
-                    self._waiters.remove(waiter)
-
-            except asyncio.TimeoutError:
+            # Double check queue is still not empty after waking up
+            if not self._queue:
                 raise asyncio.QueueEmpty()
-            except asyncio.CancelledError:
-                if not waiter.done():
-                    waiter.cancel()
-                raise
+
+            item = heappop(self._queue)
+            logger.debug(f"Processing URL: {item.url} (depth={item.depth}, priority={-item.priority:.2f})")
+            return item.url, item.depth, item.source_url, item.context
 
     def empty(self) -> bool:
         """Check if queue is empty"""

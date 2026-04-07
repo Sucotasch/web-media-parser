@@ -28,7 +28,7 @@ def is_image_url(url):
     Check if URL is likely to be a direct image file based on extension or pattern
     """
     image_extensions = [
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif"
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp", ".avif"
     ]
     url_lower = url.lower()
     
@@ -126,7 +126,7 @@ def is_media_url(url):
     
     # Check for standard media file extensions
     media_extensions = [
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".avif",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif",
         ".mp4", ".webm", ".ogg", ".mov", ".mp3", ".wav", ".pdf"
     ]
     
@@ -167,9 +167,7 @@ def is_media_url(url):
         ".gif",
         ".bmp",
         ".webp",
-        ".svg",
         ".tiff",
-        ".ico",
         ".avif",
         # Videos
         ".mp4",
@@ -249,7 +247,7 @@ def is_media_url(url):
     path = parsed_url.path
 
     # Advanced regex patterns from RipUtils.java
-    image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|gif|png|webp|avif|svg|tiff)(\?.*)?)", re.IGNORECASE)
+    image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|gif|png|webp|avif|tiff)(\?.*)?)", re.IGNORECASE)
     video_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(mp4|webm|ogg|mov|avi|wmv|flv|mkv|m4v|ts|m3u8)(\?.*)?)", re.IGNORECASE)
     
     # Check for streaming URL patterns (HLS, DASH, etc)

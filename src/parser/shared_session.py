@@ -7,7 +7,9 @@ Shared asynchronous HTTP client session manager
 
 import aiohttp
 import logging
-from typing import Dict, Any
+import socket
+import ssl
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +66,7 @@ class AsyncClientManager:
         return {
             "User-Agent": self.settings.get(
                 "user_agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             ),
             "Accept-Language": self.settings.get("accept_language", "en-US,en;q=0.9"),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -85,30 +87,26 @@ class AsyncClientManager:
         Creates the session if it doesn't exist.
         """
         if self._session is None or self._session.closed:
-            logger.info("Creating new aiohttp.ClientSession.")
-            # Define connector arguments based on Brotli support
-            connector_args = {}
-            if HAS_BROTLI:
-                # aiohttp typically handles brotli automatically if installed and ClientSession is created without specific connector.
-                # However, explicitly using TCPConnector with ssl=False if needed for specific environments.
-                # For general cases, aiohttp's default connector is usually fine.
-                # If issues arise with SSL verification on some sites:
-                # connector = aiohttp.TCPConnector(ssl=False)
-                # self._session = aiohttp.ClientSession(connector=connector, ...)
-                pass # aiohttp handles brotli by default if available
+            logger.info("Creating new aiohttp.ClientSession with Windows stability fixes.")
+            
+            # --- Windows Stability Fixes ---
+            # 1. Force AF_INET (IPv4) to avoid the common 30s IPv6 hang on Windows.
+            # 2. Use a standard SSL context to reduce handshake issues.
+            ssl_context = ssl.create_default_context()
+            connector = aiohttp.TCPConnector(
+                family=socket.AF_INET,
+                ssl=ssl_context,
+                use_dns_cache=True,
+                ttl_dns_cache=300
+            )
 
-            # Create session with or without explicit TCPConnector for brotli
-            # Let aiohttp handle brotli by default.
-            # If specific SSL handling is needed (e.g. self-signed certs on local dev),
-            # a custom TCPConnector can be passed:
-            # connector = aiohttp.TCPConnector(ssl=False) # Example: disable SSL verification
-            # self._session = aiohttp.ClientSession(connector=connector, ...)
             self._session = aiohttp.ClientSession(
+                connector=connector,
                 timeout=self._timeout_config,
                 headers=self._get_default_headers(),
-                # connector_owner=False # If passing a shared connector
+                trust_env=True  # Respect system proxies if they exist
             )
-            logger.info(f"New aiohttp.ClientSession created. Brotli enabled in session: {HAS_BROTLI and self._session.headers.get('Accept-Encoding','').lower().startswith('gzip, deflate, br')}")
+            logger.info(f"New stable aiohttp.ClientSession created. Brotli enabled: {HAS_BROTLI}")
         return self._session
 
     async def close(self):

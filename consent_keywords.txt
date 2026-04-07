@@ -1,0 +1,3 @@
+accept_all
+manage_my_preferences
+reject_all

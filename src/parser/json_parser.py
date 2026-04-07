@@ -14,6 +14,7 @@ from urllib.parse import urlparse, urljoin
 
 from src.parser.webpage_parser import WebpageParser, HAS_BROTLI
 from src.parser.utils import is_image_url, is_media_url, normalize_url
+import src.constants as K
 
 logger = logging.getLogger(__name__)
 
@@ -46,66 +47,63 @@ class JSONWebpageParser:
     # __aenter__ and __aexit__ removed, session managed externally by AsyncClientManager
     # _get_headers and _get_timeout removed, managed by AsyncClientManager
 
-    async def parse(self) -> Tuple[Set[str], List[Tuple[str, str, Dict[str, Any]]]]:
+    async def parse(self) -> Tuple[Set[str], List[Tuple[str, str, Dict[str, Any]]], Optional[str], str, Optional[int]]:
         """
         Parse JSON from the URL and extract media files
 
         Returns:
-            Tuple of (discovered_links, media_files)
+            Tuple of (discovered_links, media_files, error_status, error_message, http_status_code)
         """
+        http_status = None
         try:
             # No longer using 'async with self' as session is managed externally
-            json_data = await self._get_json()
+            json_data, http_status = await self._get_json_with_status()
             if not json_data:
-                return set(), []
+                return set(), [], K.PARSER_UNKNOWN_ERROR, "Failed to fetch or parse JSON", http_status
 
             # Process JSON data
             self._extract_media_from_json(json_data)
             self._extract_links_from_json(json_data)
 
-            return self.links, self.media_files
+            return self.links, self.media_files, K.PARSER_SUCCESS, "Successfully parsed.", http_status
         except Exception as e:
-            logger.error(f"Error parsing JSON from {self.url}: {str(e)}")
-            raise
+            error_msg = f"Error parsing JSON from {self.url}: {str(e)}"
+            logger.error(error_msg)
+            return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, error_msg, http_status
 
-    async def _get_json(self) -> Optional[Dict[str, Any]]:
+    async def _get_json_with_status(self) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """
-        Get JSON data from URL
-
-        Returns:
-            Parsed JSON data or None if failed
+        Get JSON data from URL and return status code
         """
         try:
-            # Headers for this specific request, if any, can be added here.
-            # Session default headers are set by AsyncClientManager.
-            # For JSON, usually, specific 'Accept' header might be useful if not default.
             request_specific_headers = {
                  "Accept": self.settings.get("json_accept_header", "application/json, text/javascript, */*; q=0.01"),
-                 # Add other headers if needed, e.g. X-Requested-With
                  "X-Requested-With": "XMLHttpRequest",
             }
 
             async with self.session.get(self.url, headers=request_specific_headers) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch JSON from {self.url}: {response.status}")
-                    return None
+                http_status = response.status
+                if http_status != 200:
+                    logger.error(f"Failed to fetch JSON from {self.url}: {http_status}")
+                    return None, http_status
 
                 try:
-                    return await response.json()
+                    return await response.json(), http_status
                 except Exception as e:
                     logger.error(f"Failed to parse JSON from {self.url}: {str(e)}")
-                    # Try to parse as text in case it's not valid JSON
+                    # Try to parse as text
                     content = await response.text()
                     if content.strip().startswith('{') or content.strip().startswith('['):
                         try:
-                            return json.loads(content)
+                            return json.loads(content), http_status
                         except json.JSONDecodeError:
                             logger.error(f"Failed to decode JSON content from {self.url}")
-                    return None
+                    return None, http_status
 
         except Exception as e:
             logger.error(f"Network error fetching JSON from {self.url}: {str(e)}")
-            return None
+            return None, None
+
 
     def _extract_media_from_json(self, data: Any, path: str = "") -> None:
         """

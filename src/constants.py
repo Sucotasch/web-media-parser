@@ -30,7 +30,7 @@ DEFAULT_DOMAIN_PROBATION_RETRIES = 0 # Retries for downloads from domains on "pr
 
 
 # HTTP Headers
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DEFAULT_ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"
 DEFAULT_ACCEPT_IMAGE_HEADER = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
@@ -113,6 +113,8 @@ SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
 SETTING_STOP_WORDS = "stop_words" # List of strings
 SETTING_MAX_DOWNLOAD_SPEED = "max_download_speed" # in KB/s, 0 for unlimited
 SETTING_PAGE_TIMEOUT = "page_timeout" # Timeout for page loading/parsing
+SETTING_MAX_BROWSER_INSTANCES = "max_browser_instances"
+SETTING_PROXY = "proxy_server"
 
 # Default settings dictionary structure (used by SettingsDialog to save/load)
 DEFAULT_SETTINGS_VALUES = {
@@ -139,6 +141,8 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_STOP_WORDS: DEFAULT_STOP_WORDS,
     SETTING_MAX_DOWNLOAD_SPEED: 0, # KB/s
     SETTING_PAGE_TIMEOUT: DEFAULT_PAGE_TIMEOUT,
+    SETTING_MAX_BROWSER_INSTANCES: 2,
+    SETTING_PROXY: "",
 }
 
 # Parser Error Statuses
@@ -171,7 +175,7 @@ JSON_LINK_KEY_PATTERNS = [
 
 # Comprehensive File Extensions
 IMAGE_EXTENSIONS = [
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif", ".ico"
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp", ".avif"
 ]
 VIDEO_EXTENSIONS = [
     ".mp4", ".webm", ".ogg", ".mov", ".avi", ".wmv", ".flv", ".mkv", 

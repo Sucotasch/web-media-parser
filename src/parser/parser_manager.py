@@ -13,12 +13,15 @@ import pickle
 import asyncio
 import logging
 import hashlib
+from asyncio import Lock, Semaphore
 
 import aiofiles
 import threading
 import traceback
 from typing import Dict, Any, Set, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
+
+from src.parser.scrapling_adapter import ScraplingWebpageParser, SCRAPLING_TIMEOUT_FALLBACK
 
 from PySide6.QtCore import QObject, Signal
 # from bs4 import BeautifulSoup # Not used directly in ParserManager
@@ -43,6 +46,8 @@ from src import constants as K # Import constants
 
 logger = logging.getLogger(__name__)
 
+PARSER_DONE_SENTINEL = None
+
 
 class ParserManager(QObject):
     """Enhanced parser manager with async support"""
@@ -63,9 +68,11 @@ class ParserManager(QObject):
 
         self.is_running = False
         self.is_paused = False
-        self._pause_event = asyncio.Event()
         self._stop_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
         self._pause_event.set()
+        self.url_queue = PriorityURLQueue(self.settings)
+        self.download_queue = asyncio.Queue()
 
         self.max_depth = self.settings.get(K.SETTING_SEARCH_DEPTH, K.DEFAULT_SEARCH_DEPTH)
         
@@ -83,20 +90,37 @@ class ParserManager(QObject):
 
         self.url_queue = PriorityURLQueue()
         self.download_queue = asyncio.Queue()
+        self._url_lock = asyncio.Lock()
         self.processed_urls = set()
-        self.downloaded_files = set() # Stores URLs of media marked for download to avoid re-processing
+        self.downloaded_files = set() 
+        
+        # Limit concurrent browser instances to avoid RAM exhaustion
+        max_browsers = self.settings.get(K.SETTING_MAX_BROWSER_INSTANCES, 2)
+        self._browser_semaphore = asyncio.Semaphore(max_browsers)
+        
+        self.async_client_manager = AsyncClientManager(self.settings)
+        self.session = None
 
         self.stats = {
             "pages_processed": 0, "images_found": 0, "videos_found": 0,
             "files_downloaded": 0, "files_skipped": 0,
         }
         
-        self.loop = asyncio.new_event_loop()
         self.async_client_manager: AsyncClientManager = AsyncClientManager(self.settings)
         
         self.parser_tasks = []
         self.downloader_tasks = []
         self.blocked_domains: Set[str] = self._load_domain_blocklist()
+        # Handle to the top-level asyncio task — used for cancellation on restart
+        self._main_asyncio_task: Optional[asyncio.Task] = None
+        # Track how many download jobs are currently in-flight in run_in_executor
+        # Parser workers must NOT exit while this is > 0, as migrations may re-populate url_queue
+        self._active_downloads: int = 0
+        # All currently active MediaDownloader instances (for graceful abort on stop)
+        self._active_downloader_sessions: List[Any] = []
+        # Shared cookie store for Scrapling: {domain: [cookie_dicts]}
+        # Populated after first I-Agree click, injected into subsequent sessions for same domain
+        self._scrapling_domain_cookies: Dict[str, list] = {}
 
     def _load_domain_blocklist(self, blocklist_file_name: str = K.DOMAIN_BLOCKLIST_FILENAME) -> Set[str]:
         blocked_domains: Set[str] = set()
@@ -123,7 +147,7 @@ class ParserManager(QObject):
             except Exception as e:
                 logger.error(f"Error loading domain blocklist from {path_to_load}: {e}", exc_info=True)
         else:
-            logger.warning(
+            logger.debug(
                 f"Domain blocklist file not found. Tried: '{script_dir_path}' and '{provided_path}'. "
                 "Proceeding with an empty blocklist."
             )
@@ -139,94 +163,153 @@ class ParserManager(QObject):
         else:
             self.url_queue.update_url_pattern(url, False)
 
+    def _reset_session_state(self) -> None:
+        """
+        Full reset of all per-run mutable state.
+        MUST be called at the start of every new parsing session to avoid
+        leftover data from a previous run causing queue conflicts or duplicate skips.
+        """
+        self.url_queue = PriorityURLQueue()
+        self.download_queue = asyncio.Queue()
+        self._url_lock = asyncio.Lock()
+        self.processed_urls = set()
+        self.downloaded_files = set()
+        self.domain_health = {}
+        self.quarantined_domains = set()
+        self.quarantine_queue = asyncio.Queue()
+        self.parser_tasks = []
+        self.downloader_tasks = []
+        self._active_downloads = 0
+        self._active_downloader_sessions = []
+        self._scrapling_domain_cookies = {}
+        self._main_asyncio_task = None
+        self.is_paused = False
+        self._pause_event.set()  # Ensure not stuck in paused state
+        self.stats = {
+            "pages_processed": 0, "images_found": 0, "videos_found": 0,
+            "files_downloaded": 0, "files_skipped": 0,
+        }
+        logger.info("Session state fully reset.")
+
     def start_parsing(self):
+        """Schedule the main parsing task on the running qasync event loop."""
+        # Reset ALL state from any previous run before starting clean
+        self._reset_session_state()
+        
+        # Apply proxy to environment for aiohttp trust_env=True
+        proxy_server = self.settings.get(K.SETTING_PROXY, "")
+        if proxy_server:
+            os.environ["HTTP_PROXY"] = f"http://{proxy_server}"
+            os.environ["HTTPS_PROXY"] = f"http://{proxy_server}"
+            logger.info(f"Global proxy set to: {proxy_server}")
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("HTTPS_PROXY", None)
+
         self.is_running = True
         self._stop_event.clear()
-        if not self.loop or self.loop.is_closed(): self.loop = asyncio.new_event_loop()
-        
-        asyncio.run_coroutine_threadsafe(
-            self.url_queue.put(self.start_url, 0, self.start_url, {"is_start_url": True, "start_url": self.start_url}),
-            self.loop
-        )
-        self.loop_thread = threading.Thread(target=self._run_event_loop, name="AsyncEventLoopThread")
-        self.loop_thread.daemon = True
-        self.loop_thread.start()
-        self.monitor_thread = threading.Thread(target=self._monitor_progress, name="ProgressMonitorThread")
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
+        # Store the task handle so we can cancel it on stop/restart
+        self._main_asyncio_task = asyncio.ensure_future(self._run_async_parsing())
 
-    def _run_event_loop(self):
-        asyncio.set_event_loop(self.loop)
+    async def _run_async_parsing(self):
+        """Top-level async entry point. Seeds the URL queue, starts _main_task,
+        and runs a progress monitor as a concurrent task."""
+        # FIX #4: Allow older ParserManager processes to fully cancel and release network/browser resources
+        await asyncio.sleep(0.8)
+
+        # Seed with empty source_url so _is_downward_url returns True unconditionally
+        # (passing start_url as source causes priority=0 since url==source_url at root path)
+        await self.url_queue.put(
+            self.start_url, 0, "",
+            {"is_start_url": True, "start_url": self.start_url, "priority": 1000.0}
+        )
+        logger.info(f"Seeded URL queue with start URL: {self.start_url}")
+        monitor_task = asyncio.create_task(self._async_monitor_progress())
         try:
-            self.loop.run_until_complete(self._main_task())
-        except Exception as e:
-            logger.error(f"Error in event loop: {str(e)}", exc_info=True)
+            await self._main_task()
         finally:
-            if self.async_client_manager:
-                try:
-                    if self.loop.is_running(): # Should ideally be closed via _main_task's async with
-                        self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self.async_client_manager.close()))
-                    elif not self.loop.is_closed():
-                         self.loop.run_until_complete(self.async_client_manager.close())
-                    logger.info("AsyncClientManager session closed during event loop shutdown.")
-                except Exception as e:
-                    logger.error(f"Error closing AsyncClientManager session in _run_event_loop: {e}", exc_info=True)
-            if self.loop and not self.loop.is_closed():
-                self.loop.close()
-                logger.info("Asyncio event loop closed.")
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
     async def _main_task(self):
+        """
+        Main orchestration task.
+        Sentinels are always dispatched in finally so downloaders never deadlock.
+        """
+        from playwright.async_api import async_playwright
+        
+        num_downloaders = self.settings.get(K.SETTING_DOWNLOADER_THREADS, K.DEFAULT_DOWNLOADER_THREADS)
+        downloader_tasks = []
         try:
             async with self.async_client_manager as session:
-                parser_count = self.settings.get(K.SETTING_PARSER_THREADS, K.DEFAULT_PARSER_THREADS)
-                downloader_count = self.settings.get(K.SETTING_DOWNLOADER_THREADS, K.DEFAULT_DOWNLOADER_THREADS)
-                logger.info(f"Main task started. Parser threads: {parser_count}, Downloader threads: {downloader_count}")
+                self.session = session
 
-                self.parser_tasks = [asyncio.create_task(self._parser_worker(session), name=f"parser_{i}") for i in range(parser_count)]
-                self.downloader_tasks = [asyncio.create_task(self._downloader_worker(), name=f"downloader_{i}") for i in range(downloader_count)]
+                num_parsers = self.settings.get(K.SETTING_PARSER_THREADS, K.DEFAULT_PARSER_THREADS)
+
+                logger.info("Initializing shared Playwright browser instance...")
                 
-                all_tasks = self.parser_tasks + self.downloader_tasks
-                stop_waiter = asyncio.create_task(self._stop_event.wait(), name="StopEventWaiter")
+                proxy_server = self.settings.get(K.SETTING_PROXY, "")
+                playwright_proxy = {"server": f"http://{proxy_server}"} if proxy_server else None
                 
-                # Wait only for the stop event, not for individual workers to complete
-                await stop_waiter
-                logger.info("Stop event received, cancelling tasks.")
-                
-                # Cancel all worker tasks
-                for task in all_tasks:
-                    task.cancel()
-                
-                # Wait for all tasks to finish cancellation
-                if all_tasks:
-                    await asyncio.gather(*all_tasks, return_exceptions=True)
+                async with async_playwright() as p:
+                    self.shared_browser = await p.chromium.launch(
+                        headless=not self.settings.get("debug_show_browser", False),
+                        args=["--disable-gpu", "--no-sandbox"],
+                        proxy=playwright_proxy
+                    )
+
+                    logger.info(f"Starting {num_parsers} parser workers and {num_downloaders} downloader workers...")
+
+                    parser_tasks = [asyncio.create_task(self._parser_worker(i)) for i in range(num_parsers)]
+                    downloader_tasks = [asyncio.create_task(self._downloader_worker(i)) for i in range(num_downloaders)]
+
+                    # Wait for parsers — they exit when queue empties or stop_event fires
+                    await asyncio.gather(*parser_tasks, return_exceptions=True)
+                    logger.info("All parser workers have finished.")
+
+                    # Wait for downloaders (sentinels sent in finally below)
+                    await asyncio.gather(*downloader_tasks, return_exceptions=True)
+                    logger.info("All downloader workers have finished.")
+                    
+                    await self.shared_browser.close()
+
+        except asyncio.CancelledError:
+            logger.info("Main parsing task cancelled.")
+            # Cancel all workers immediately
+            for t in downloader_tasks:
+                if not t.done(): t.cancel()
+            for t in parser_tasks:
+                if not t.done(): t.cancel()
+            raise
         except Exception as e:
-            logger.error(f"Critical error in main task: {str(e)}", exc_info=True)
+            logger.error(f"Error in main task: {str(e)}", exc_info=True)
         finally:
-            logger.info("_main_task finished.")
-            # Emit parsing finished signal when main task is actually done
+            # Send sentinels to gracefully unblock downloaders, but ONLY if we weren't abruptly cancelled by stop()
             if not self._stop_event.is_set():
-                self.parsing_finished.emit()
+                for _ in range(num_downloaders):
+                    try:
+                        self.download_queue.put_nowait(PARSER_DONE_SENTINEL)
+                    except Exception:
+                        pass
+            self.is_running = False
+            self.parsing_finished.emit()
+            logger.info("Parsing process completed.")
 
     async def _handle_empty_queues_and_quarantine(self) -> bool:
-        if not (self.download_queue.empty() and self.url_queue.empty() and self.stats["pages_processed"] > 0):
+        """
+        Returns True if there is still work to do (parsers should keep running).
+        Returns False only when BOTH url_queue is empty AND no downloads are actively
+        in-flight (meaning no Migrator re-injections can happen).
+        """
+        if not self.url_queue.empty():
             return True
-        quarantine_size = self.quarantine_queue.qsize()
-        if quarantine_size > 0:
-            logger.info(f"Main queues empty. Processing {quarantine_size} URLs from quarantine.")
-            self.status_updated.emit(f"Processing {quarantine_size} URLs from quarantined domains...")
-            items_to_process = min(quarantine_size, K.QUARANTINE_BATCH_PROCESS_SIZE)
-            for _ in range(items_to_process):
-                try:
-                    item = await self.quarantine_queue.get()
-                    domain = urlparse(item["url"]).netloc
-                    if domain in self.quarantined_domains:
-                        self.quarantined_domains.remove(domain)
-                        if domain in self.domain_health: self.domain_health[domain]["failures"] = 0
-                    await self.download_queue.put(item)
-                    self.quarantine_queue.task_done()
-                except asyncio.QueueEmpty: break
+        # Stay alive if downloads are running — they may trigger Migrator re-queues
+        if self._active_downloads > 0:
+            await asyncio.sleep(0.2)  # Brief yield to allow download completion
             return True
-        logger.debug("All queues empty, waiting for more work or stop signal.")
         return False
 
     async def _get_next_url_to_parse(self) -> Optional[Tuple[str, int, str, Dict[str, Any]]]:
@@ -243,27 +326,80 @@ class ParserManager(QObject):
                 "format=json" in query or "output=json" in query or "callback=" in query)
 
     async def _invoke_parser(self, url: str, session, is_json_api: bool, context: Dict[str, Any]):
-        links_found: Any = set() 
-        media_files_found: List[Tuple[str, str, Dict[str, Any]]] = []
-        if is_json_api:
-            logger.debug(f"Using JSONWebpageParser for {url}")
-            async with JSONWebpageParser(url=url, settings=self.settings, external_session=session) as p:
-                links_found, media_files_found = await p.parse()
-        else:
-            logger.debug(f"Using WebpageParser for {url}")
-            p = WebpageParser(
-                url=url, settings=self.settings,
-                process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
-                # process_dynamic argument removed
-                external_session=session, pattern_manager=self.pattern_manager
-            )
-            parse_result = await p.parse()
-            links_found = parse_result[0]  # links dict
-            media_files_found = parse_result[1]  # media files list
-            # parse_result[2] is error_status, parse_result[3] is error_message, parse_result[4] is http_status_code
-            if parse_result[2] != K.PARSER_SUCCESS:  # If there's an error status
-                logger.error(f"Error parsing {url}: {parse_result[3]}")
-        return links_found, media_files_found
+        """Select and invoke the appropriate parser for the given URL."""
+        try:
+            # Check if domain is in the quarantined set (tracked separately from asyncio.Queue)
+            domain = urlparse(url).netloc
+            is_protected = domain in self.quarantined_domains
+
+            if is_json_api:
+                p = JSONWebpageParser(url, self.settings, self.session)
+                parse_result = await p.parse()
+            else:
+                # Tier 1: Fast Static Parser (aiohttp + BeautifulSoup)
+                p = WebpageParser(url, self.settings, False, self.session, self.pattern_manager)
+                parse_result = await p.parse()
+                
+                # Links, media, status, msg, code = parse_result
+                # Tier 2: Conditional Scrapling upgrade if enabled and static found NO media
+                # We also force Scrapling for the START URL if it looks empty, to bypass portals.
+                depth = context.get("depth", 0)
+                is_media_container = context.get("is_media_container", False)
+                media_type_hint = context.get("media_type_hint", "image")
+                is_js_enabled = bool(self.settings.get(K.SETTING_PROCESS_JS, False))
+                # 0 items is our strict trigger for JS-heavy or interstitial pages
+                low_media_found = (not parse_result[1] or len(parse_result[1]) == 0)
+                
+                if (low_media_found or depth == 0) and is_js_enabled and not self._stop_event.is_set():
+                    # Log based on why we are upgrading
+                    if depth == 0:
+                        reason = "start page"
+                    else:
+                        reason = "0 valid media found by static parser"
+                    
+                    if is_media_container:
+                        reason += f" on media container ({media_type_hint})"
+                    
+                    logger.info(f"Targeting Scrapling for {url} ({reason}).")
+                    try:
+                        async with self._browser_semaphore:
+                            if self._stop_event.is_set():
+                                return parse_result
+
+                            sp = ScraplingWebpageParser(
+                                url, self.settings,
+                                use_stealth=is_protected,
+                                scrapling_cookies=self._scrapling_domain_cookies,
+                                shared_browser=getattr(self, "shared_browser", None),
+                                pattern_manager=self.pattern_manager,
+                                media_type_hint=media_type_hint
+                            )
+                            scrapling_result = await sp.parse()
+                            
+                            # If Scrapling found MORE media than static, OR static was empty, use Scrapling
+                            s_media_count = len(scrapling_result[1]) if scrapling_result[1] else 0
+                            p_media_count = len(parse_result[1]) if parse_result[1] else 0
+                            
+                            if s_media_count > p_media_count or p_media_count == 0:
+                                # We throw away the static result (including its junk links)
+                                parse_result = scrapling_result
+                                logger.info(f"Scrapling upgrade successful: {s_media_count} items (discarded static 'junk' links).")
+                            elif scrapling_result[2] == K.PARSER_SUCCESS:
+                                # Even if 0, Scrapling might have 'better' internal links after the bypass click
+                                parse_result = scrapling_result
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"Scrapling upgrade failed for {url}: {str(e)}")
+
+            links, media, status, msg, code = parse_result
+            return links, media, status, msg, code
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Error in _invoke_parser for {url}: {str(e)}", exc_info=True)
+            return {}, [], K.PARSER_UNKNOWN_ERROR, str(e), None
 
     async def _process_parser_results(self, url: str, depth: int, 
                                       links_data: Any, media_files: List[Tuple[str, str, Dict[str, Any]]],
@@ -304,39 +440,63 @@ class ParserManager(QObject):
         self.stats["pages_processed"] += 1
         self.status_updated.emit(f"Processed: {url}")
 
-    async def _parser_worker(self, session):
-        while not self._stop_event.is_set():
-            if self.is_paused:
+    # (old stub removed)
+    async def _parser_worker(self, worker_id: int):
+        """
+        Worker task for parsing webpages
+        """
+        logger.info(f"Parser worker {worker_id} started.")
+        try:
+            while not self._stop_event.is_set():
+                # Check if we should pause
                 await self._pause_event.wait()
-                if self._stop_event.is_set(): break
-                continue
-            continue_processing = await self._handle_empty_queues_and_quarantine()
-            if not continue_processing:
-                # All work is done, but keep the worker alive until stop is requested
-                await asyncio.sleep(1.0)
-                continue
-            url_data = await self._get_next_url_to_parse()
-            if not url_data:
-                await asyncio.sleep(0.1) 
-                continue
-            current_url, depth, source_page_url, context = url_data
-            logger.debug(f"Parser worker got URL: {current_url} (depth={depth})")
-            try:
-                if not current_url.startswith(("http://", "https://")):
-                    current_url = urljoin(source_page_url or self.start_url, current_url)
-                current_url = normalize_url(current_url)
-                if current_url in self.processed_urls:
-                    self.url_queue.task_done(); continue
-                self.processed_urls.add(current_url)
-                is_json = self._determine_parser_type(current_url)
-                links_found, media_files_found = await self._invoke_parser(current_url, session, is_json, context)
-                await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
-            except Exception as e:
-                logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
-                if current_url not in self.processed_urls: self.processed_urls.add(current_url)
-            finally:
-                self.url_queue.task_done()
-        logger.info(f"Parser worker {threading.get_ident()} finished.")
+                
+                # Try to get next URL from queue
+                try:
+                    url_data = await self.url_queue.get(timeout=1.0)
+                except asyncio.QueueEmpty:
+                    # Queue is empty, check if we should finish
+                    if not await self._handle_empty_queues_and_quarantine():
+                        break
+                    continue
+                
+                if url_data is None: # Should not happen with PriorityURLQueue but for safety
+                    break
+                    
+                current_url, depth, source_page_url, context = url_data
+                
+                try:
+                    # Normalize and validate URL
+                    if not current_url.startswith(("http://", "https://")):
+                        current_url = urljoin(source_page_url or self.start_url, current_url)
+                    current_url = normalize_url(current_url)
+                    
+                    # Check if URL was already processed (protected by lock)
+                    async with self._url_lock:
+                        if current_url in self.processed_urls:
+                            self.url_queue.task_done()
+                            continue
+                        self.processed_urls.add(current_url)
+                    
+                    is_json = self._determine_parser_type(current_url)
+                    links_found, media_files_found, status, msg, code = await self._invoke_parser(current_url, self.session, is_json, context)
+                    
+                    if status != K.PARSER_SUCCESS:
+                        logger.warning(f"Parser returned {status} for {current_url}: {msg}")
+                    
+                    await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
+                finally:
+                    self.url_queue.task_done()
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Parser worker {worker_id} cancelled.")
+        except Exception as e:
+            logger.error(f"Error in parser worker {worker_id}: {str(e)}", exc_info=True)
+        finally:
+            logger.info(f"Parser worker {worker_id} exiting.")
 
     async def _process_media_files(self, media_files: List[Tuple[str, str, Dict[str, Any]]], source_url: str) -> None:
         if not media_files: return
@@ -349,15 +509,24 @@ class ParserManager(QObject):
                 abs_url = urljoin(source_url, url) if not (url.startswith("http://") or url.startswith("https://")) else url
                 abs_url = normalize_url(abs_url)
                 if abs_url in self.downloaded_files: continue 
-                    
-                if is_webpage_url(abs_url) and not is_media_url(abs_url):
-                    logger.debug(f"Treating as webpage rather than media: {abs_url}")
-                    assumed_depth_for_media_webpage = 1 
-                    if assumed_depth_for_media_webpage < self.max_depth:
-                        ctx = {"source_url": source_url, "start_url": self.start_url, "from_media_item": True, "media_context": attrs, "priority": 5.0}
-                        await self.url_queue.put(abs_url, assumed_depth_for_media_webpage, self.start_url, ctx)
+                
+                # Check Blocklist for media domain
+                media_domain = get_domain(abs_url)
+                if media_domain in self.blocked_domains:
+                    logger.debug(f"Skipping media from blocked domain: {abs_url} (Domain: {media_domain})")
                     continue
                 
+                # Check Stop Words for media URL
+                stop_words_list = self.settings.get(K.SETTING_STOP_WORDS, K.DEFAULT_STOP_WORDS)
+                if any(stop_word.lower() in abs_url.lower() for stop_word in stop_words_list):
+                    logger.debug(f"Skipping media with stop word: {abs_url}")
+                    continue
+                    
+                # Strict check: if it looks like a webpage but NOT a media file, skip putting in download queue
+                if (is_webpage_url(abs_url) or abs_url.rstrip("/").lower().endswith((".html", ".htm", ".php"))) and not is_media_url(abs_url):
+                    logger.debug(f"Skipping potential webpage/HTML link from media list: {abs_url}")
+                    continue
+                    
                 base_filename = self._get_filename_from_url(abs_url, media_type)
                 target_dir_path_final = self.download_path 
                 page_domain_for_subdir = get_domain(source_url)
@@ -385,60 +554,150 @@ class ParserManager(QObject):
             except Exception as err:
                 logger.error(f"Error processing media file {url}: {str(err)}", exc_info=True)
 
-    async def _downloader_worker(self) -> None:
-        while not self._stop_event.is_set():
+    async def _process_download(self, media_item: Dict[str, Any]):
+        """
+        Process a single media download task
+        """
+        url = media_item["url"]
+        filepath = media_item["filepath"]
+        media_type = media_item["media_type"]
+        source_url = media_item.get("source_url")
+        
+        domain = urlparse(url).netloc
+        if domain in self.quarantined_domains:
+            # Silently skip quarantined domain files but log once per worker/domain if needed
+            self.stats["files_skipped"] += 1
+            return
+            
+        if domain not in self.domain_health:
+            self.domain_health[domain] = {"failures": 0, "total": 0}
+        
+        domain_state = self.domain_health[domain]
+        is_probation = domain_state["failures"] > 0
+        
+        timeout_val = K.DEFAULT_DOMAIN_PROBATION_TIMEOUT if is_probation else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
+        retries_val = K.DEFAULT_DOMAIN_PROBATION_RETRIES if is_probation else self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
+        
+        # Create a new downloader instance for this specific file
+        downloader = MediaDownloader(
+            url=url, 
+            filepath=filepath, 
+            settings=self.settings, 
+            media_type=media_type, 
+            source_url=source_url
+        )
+        downloader.set_progress_callback(self._update_current_progress)
+        downloader.set_stop_event(self._stop_event)  # V7: enable graceful abort
+        
+        self.status_updated.emit(f"Downloading: {os.path.basename(filepath)}")
+        
+        try:
+            # MediaDownloader.download will be a pure async function
+            # _active_downloads stays high until AFTER Migrator logic to prevent
+            # parser workers exiting before the re-queued URL is visible in url_queue.
+            self._active_downloads += 1
+            self._active_downloader_sessions.append(downloader)
             try:
-                if self.is_paused:
-                    await self._pause_event.wait()
-                    if self._stop_event.is_set(): break
-                    continue
-                media_item = await asyncio.wait_for(self.download_queue.get(), timeout=0.5)
-                logger.debug(f"Downloader worker got media item: {media_item['url']}")
-            except asyncio.TimeoutError: continue
-            if not media_item:
-                self.download_queue.task_done(); continue
-            try:
-                url = media_item["url"]
-                filepath_from_queue = media_item["filepath"] 
-                domain = urlparse(url).netloc
-                if domain in self.quarantined_domains:
-                    await self.quarantine_queue.put(media_item)
-                    self.download_queue.task_done(); continue
-                if domain not in self.domain_health: self.domain_health[domain] = {"failures": 0, "total": 0}
-                domain_state = self.domain_health[domain]
-                is_probation = domain_state["failures"] > 0
-                
-                timeout_val = K.DEFAULT_DOMAIN_PROBATION_TIMEOUT if is_probation else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
-                retries_val = K.DEFAULT_DOMAIN_PROBATION_RETRIES if is_probation else self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
-                
-                downloader = MediaDownloader(
-                    url=url, filepath=filepath_from_queue, settings=self.settings,
-                    media_type=media_item["media_type"], source_url=media_item["source_url"],
-                )
-                downloader.set_progress_callback(self._update_current_progress)
-                base_filename_for_status = os.path.basename(filepath_from_queue)
-                self.status_updated.emit(f"Downloading: {base_filename_for_status}")
-                
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: downloader.download(timeout=timeout_val, retries=retries_val)
-                )
+                # Provide the aiohttp ClientSession from ParserManager for cookie/state pooling
+                result = await downloader.download(session=self.session, timeout=timeout_val, retries=retries_val)
+
                 
                 domain_state["total"] += 1
-                if result["success"]:
+                error_msg = result.get("error", "")
+                if result.get("success"):
                     self.stats["files_downloaded"] += 1
-                    if domain_state["failures"] > 0: domain_state["failures"] = max(0, domain_state["failures"] - 1)
+                    if domain_state["failures"] > 0:
+                        domain_state["failures"] = max(0, domain_state["failures"] - 1)
                 else:
                     self.stats["files_skipped"] += 1
-                    domain_state["failures"] += 1
-                    logger.warning(f"Failed to download file: {url} - {result['error']}")
-                    if domain_state["failures"] >= K.DEFAULT_QUARANTINE_FAILURE_THRESHOLD:
+                    is_filter_reject = any(msg in error_msg for msg in ["too small", "Non-media", "Size mismatch", "Webpage/script", "Aborted:"])
+                    
+                    if is_filter_reject or any(msg in error_msg for msg in ["timeout", "403 Client Error"]):
+                        if is_filter_reject:
+                            logger.debug(f"File filtered out for {url}: {error_msg}")
+                        
+                        # --- Universal Migrator (Image Proxy Bypass) ---
+                        # If the proxy times out HEAD requests or returns HTML instead of binary,
+                        # re-parse to find the real direct image URL embedded inside.
+                        # FIX #3: Catch Timeouts as image hosts block bot queries
+                        is_timeout_or_block = any(msg in error_msg for msg in ["timeout", "403 Client Error"])
+                        should_migrate = "Webpage/script received" in error_msg or is_timeout_or_block
+
+                        if should_migrate:
+                            async with self._url_lock:
+                                if url not in self.processed_urls:
+                                    logger.warning(f"[MIGRATOR] Re-queuing as webpage (HTML/block detected from supposed image): {url}")
+                                    await self.url_queue.put(url, 0, source_url, {
+                                        "is_webpage": True,
+                                        "priority": 500.0,
+                                        "is_media_container": True,
+                                        "is_migrated": True
+                                    })
+                                else:
+                                    logger.warning(f"[MIGRATOR] Skipping (already processed as page): {url}")
+                        else:
+                            logger.debug(f"[MIGRATOR] Not triggering — error_msg: {error_msg!r}")
+                    else:
+                        domain_state["failures"] += 1
+                        logger.warning(f"Failed to download {url}: {error_msg}")
+                    
+                    # Check for quarantine threshold (only for real failures)
+                    if not is_filter_reject and domain_state["failures"] >= K.DEFAULT_QUARANTINE_FAILURE_THRESHOLD:
                         self.quarantined_domains.add(domain)
-                        logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} failures.")
-            except Exception as err:
-                logger.error(f"Error in downloader_worker for {media_item.get('url', 'Unknown URL')}: {str(err)}", exc_info=True)
+                        logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} real failures.")
             finally:
-                self.download_queue.task_done()
-        logger.info(f"Downloader worker {threading.get_ident()} finished.")
+                # Decrement AFTER all Migrator logic so parser workers wait correctly
+                self._active_downloads -= 1
+                try:
+                    self._active_downloader_sessions.remove(downloader)
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Execution error in _process_download for {url}: {str(e)}")
+            self.stats["files_skipped"] += 1
+
+    async def _downloader_worker(self, worker_id: int):
+        """
+        Worker task for downloading media files
+        """
+        logger.info(f"Downloader worker {worker_id} started.")
+        
+        try:
+            while True:
+                # Check if we should stop (but first process what's in queue)
+                if self._stop_event.is_set() and self.download_queue.empty():
+                    break
+                    
+                # Check for pause
+                await self._pause_event.wait()
+                
+                # IMPORTANT: Get item OUTSIDE the try/finally that calls task_done()
+                try:
+                    item = await self.download_queue.get()
+                except asyncio.CancelledError:
+                    break
+                    
+                if item is PARSER_DONE_SENTINEL:
+                    self.download_queue.task_done()
+                    break
+                    
+                try:
+                    # Process download with a small random jitter to mimic human timing
+                    import random
+                    await asyncio.sleep(random.uniform(0.2, 0.7))
+                    await self._process_download(item)
+                    
+                except Exception as e:
+                    logger.error(f"Error in downloader worker {worker_id}: {str(e)}", exc_info=True)
+                finally:
+                    # Called ONLY if get() was successful to prevent 'called too many times' ValueError
+                    self.download_queue.task_done()
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Downloader worker {worker_id} cancelled.")
+        finally:
+            logger.info(f"Downloader worker {worker_id} exiting.")
 
     def pause_parsing(self) -> None:
         self.is_paused = True; self._pause_event.clear(); logger.info("Parsing paused")
@@ -448,25 +707,60 @@ class ParserManager(QObject):
 
     def stop_parsing(self) -> None:
         logger.info("Attempting to stop parsing...")
-        self.is_running = False; self._stop_event.set(); self._pause_event.set()
+        self.is_running = False
+        self._stop_event.set()
+        self._pause_event.set()  # Unblock paused workers
+        # Cancel the top-level asyncio task — this propagates CancelledError
+        # into all nested awaits (including blocked Playwright fetches)
+        self.cancel_all_tasks()
+        # Abort all in-flight HTTP download sessions immediately (they run in thread executor)
+        for dl in list(self._active_downloader_sessions):
+            try:
+                dl.session.close()
+            except Exception:
+                pass
+        self._active_downloader_sessions.clear()
         try:
-            while not self.download_queue.empty(): self.download_queue.get_nowait()
-            while not self.quarantine_queue.empty(): self.quarantine_queue.get_nowait()
-            self.url_queue = PriorityURLQueue() 
+            while not self.download_queue.empty():
+                try:
+                    self.download_queue.get_nowait()
+                    self.download_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            while not self.quarantine_queue.empty():
+                try:
+                    self.quarantine_queue.get_nowait()
+                    self.quarantine_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self.url_queue = PriorityURLQueue(self.settings)
             logger.info("Queues cleared.")
-        except Exception as e: logger.error(f"Error clearing queues: {str(e)}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error clearing queues: {str(e)}", exc_info=True)
         logger.info("Parsing stop procedure initiated. Tasks will shut down.")
 
-    def _monitor_progress(self) -> None:
-        while self.is_running and not self._stop_event.is_set():
+    def cancel_all_tasks(self) -> None:
+        """Cancel the top-level asyncio task and all its children."""
+        if self._main_asyncio_task and not self._main_asyncio_task.done():
+            self._main_asyncio_task.cancel()
+            logger.info("Main asyncio task cancellation requested.")
+
+    async def _async_monitor_progress(self) -> None:
+        """Async coroutine that replaces the old blocking thread monitor."""
+        while not self._stop_event.is_set():
             try:
-                if self.is_paused and not self._pause_event.is_set(): time.sleep(0.5); continue
                 total_found = self.stats["images_found"] + self.stats["videos_found"]
                 total_proc = self.stats["files_downloaded"] + self.stats["files_skipped"]
-                if total_found > 0: self.total_progress_updated.emit(int((total_proc / total_found) * 100))
-                else: self.total_progress_updated.emit(0) 
-                time.sleep(0.5) 
-            except Exception as e: logger.error(f"Error in progress monitor: {str(e)}", exc_info=True); time.sleep(1)
+                if total_found > 0:
+                    self.total_progress_updated.emit(int((total_proc / total_found) * 100))
+                else:
+                    self.total_progress_updated.emit(0)
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in progress monitor: {str(e)}", exc_info=True)
+                await asyncio.sleep(1)
         logger.info("Progress monitor finished.")
 
     def _update_current_progress(self, progress: int) -> None: self.current_progress_updated.emit(progress)

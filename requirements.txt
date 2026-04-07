@@ -16,6 +16,7 @@ brotlicffi>=1.0.9  # Alternative brotli implementation for aiohttp
 beautifulsoup4>=4.11.0
 html5lib>=1.1
 lxml>=4.9.3
+lxml_html_clean>=0.1.0
 
 # Media processing
 Pillow>=9.0.0
@@ -30,3 +31,12 @@ uvloop>=0.17.0; sys_platform != 'win32'  # uvloop doesn't support Windows
 # Security
 certifi>=2023.7.22
 cryptography>=41.0.0
+
+# Scrapling and Advanced JS Rendering
+scrapling>=0.2.0
+playwright>=1.40.0
+qasync>=0.27.1
+curl_cffi>=0.5.10
+browserforge>=1.1.0
+msgspec>=0.18.0
+patchright>=1.40.0

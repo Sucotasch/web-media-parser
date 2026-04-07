@@ -8,6 +8,7 @@ Main window of the application
 import os
 import time
 import logging
+import asyncio
 from datetime import datetime
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QGroupBox,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QEventLoop
+from PySide6.QtCore import Qt, Signal, QSize, QUrl, QEventLoop
 from PySide6.QtGui import QIcon, QDesktopServices
 import asyncio
 from src.gui.settings_dialog import SettingsDialog
@@ -46,14 +47,11 @@ class MainWindow(QMainWindow):
 
         # Initialize variables
         self.settings_dialog = SettingsDialog(self)
-        # Restore last used download directory from settings
         self.download_dir = self.settings_dialog.get_last_download_dir()
         self.parser_manager = None
-        self.parser_thread = None
-
-        # Set up event loop
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        # NOTE: No self.loop here. The event loop is owned by qasync (main.py).
+        # asyncio.ensure_future() and asyncio.create_task() work correctly
+        # because qasync.QEventLoop is already set as the running loop.
 
         # Initialize UI
         self.init_ui()
@@ -226,12 +224,6 @@ class MainWindow(QMainWindow):
                 self.download_dir = last_dir
                 self.dir_input.setText(last_dir)
 
-    async def _load_previous_state(self, state_path: str):
-        """Load previous session state"""
-        if os.path.exists(state_path):
-            await self.parser_manager.load_state(state_path)
-            self.log_handler.info(f"Loaded previous session state from: {state_path}")
-
     def start_parsing(self):
         """
         Start the parsing process
@@ -256,6 +248,20 @@ class MainWindow(QMainWindow):
         self.log_handler.info(f"Files will be saved to {download_path}")
 
         settings = self.settings_dialog.get_settings()
+        
+        # Stop and cancel previous manager if it exists to prevent 'ghost tasks'
+        if self.parser_manager:
+            self.log_handler.info("Releasing resources from previous session...")
+            self.parser_manager.stop_parsing()
+            asyncio.create_task(self._start_new_manager_deferred(url, download_path, settings))
+        else:
+            self._start_new_manager(url, download_path, settings)
+
+    async def _start_new_manager_deferred(self, url, download_path, settings):
+        await asyncio.sleep(0.5) # Allow 500ms for event loop graceful shutdown of tasks
+        self._start_new_manager(url, download_path, settings)
+
+    def _start_new_manager(self, url, download_path, settings):
         self.parser_manager = ParserManager(
             url=url,
             download_path=download_path,
@@ -263,30 +269,14 @@ class MainWindow(QMainWindow):
             log_handler=self.log_handler,
         )
 
-        # Check for previous session state
-        state_dir = os.path.join(self.download_dir, "sessions")
-        os.makedirs(state_dir, exist_ok=True)
-        state_path = os.path.join(state_dir, "last_session.pkl")
-
-        # Create an event loop for the async load if not already running
-        if not self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._load_previous_state(state_path), self.loop
-            )
-
-        # Connect signals
+        # Connect signals (parser_manager stays in the main/qasync thread)
         self.parser_manager.total_progress_updated.connect(self.update_total_progress)
-        self.parser_manager.current_progress_updated.connect(
-            self.update_current_progress
-        )
+        self.parser_manager.current_progress_updated.connect(self.update_current_progress)
         self.parser_manager.parsing_finished.connect(self.on_parsing_finished)
         self.parser_manager.status_updated.connect(self.update_status)
 
-        # Start parsing thread
-        self.parser_thread = QThread()
-        self.parser_manager.moveToThread(self.parser_thread)
-        self.parser_thread.started.connect(self.parser_manager.start_parsing)
-        self.parser_thread.start()
+        # Schedule the async parsing pipeline on the running qasync event loop
+        self.parser_manager.start_parsing()
 
         self.update_ui_state(True)
         self.status_bar.showMessage("Parsing started")
@@ -319,12 +309,6 @@ class MainWindow(QMainWindow):
         self.parser_manager.stop_parsing()
         self.status_bar.showMessage("Parsing stopped")
         self.log_handler.info("Parsing stopped by user")
-
-        # Wait for thread to finish
-        if self.parser_thread and self.parser_thread.isRunning():
-            self.parser_thread.quit()
-            self.parser_thread.wait()
-
         self.update_ui_state(False)
 
     def update_total_progress(self, value):
@@ -368,12 +352,7 @@ class MainWindow(QMainWindow):
         """
         self.log_handler.info("Parsing finished")
         self.status_bar.showMessage("Parsing finished")
-        # Cleanup
-        if self.parser_thread and self.parser_thread.isRunning():
-            self.parser_thread.quit()
-            self.parser_thread.wait()
         self.update_ui_state(False)
-        # No popup message, just log
         if self.parser_manager:
             stats = self.parser_manager.get_stats()
             self.log_handler.info(
@@ -384,54 +363,14 @@ class MainWindow(QMainWindow):
                 f"Skipped: {stats['files_skipped']}"
             )
 
-    async def _save_session_async(self):
-        """
-        Async helper method to save session state
-        """
-        try:
-            state_dir = os.path.join(self.download_dir, "sessions")
-            os.makedirs(state_dir, exist_ok=True)
-            state_path = os.path.join(state_dir, "last_session.pkl")
-            await self.parser_manager.save_state(state_path)
-            self.log_handler.info(f"Session state saved to: {state_path}")
-        except Exception as e:
-            self.log_handler.error(f"Error saving session state: {str(e)}")
-
-    def run_coroutine(self, coroutine):
-        """Run a coroutine in the Qt event loop"""
-        try:
-            future = asyncio.Future()
-            asyncio.create_task(self._run_coroutine(coroutine, future))
-            return future
-        except Exception as e:
-            self.log_handler.error(f"Error running coroutine: {str(e)}")
-            return None
-
-    async def _run_coroutine(self, coroutine, future):
-        """Helper method to run coroutine and set future result"""
-        try:
-            result = await coroutine
-            future.set_result(result)
-        except Exception as e:
-            future.set_exception(e)
-
     def closeEvent(self, event):
         """
-        Handle window close event and save session state if parsing is active
+        Handle window close event and stop any active parsing.
+        Simplified to be synchronous and prevent hangs.
         """
-        if self.parser_manager and self.parser_manager.is_running:
-            # Create event loop to run coroutine
-            loop = QEventLoop()
-
-            # Create and run coroutine
-            async def save_and_stop():
-                await self._save_session_async()
-                self.stop_parsing()
-                loop.quit()
-
-            asyncio.ensure_future(save_and_stop())
-            loop.exec_()
-
+        if self.parser_manager:
+            self.parser_manager.stop_parsing()
+        
         event.accept()
 
     def get_download_directory(self):

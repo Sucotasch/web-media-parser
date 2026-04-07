@@ -47,7 +47,7 @@ class SettingsDialog(QDialog):
             "search_depth": 3,
             "page_limit": 1000,
             "stay_in_domain": True,
-            "process_js": True,  # Enable JavaScript processing by default
+            "process_js": False,  # Requires Playwright browser; enable only for JS-heavy SPAs
             "process_dynamic": True,
             "page_timeout": 30,
             # Pattern settings
@@ -362,6 +362,13 @@ class SettingsDialog(QDialog):
         self.retry_count_spin.setToolTip("Number of retries for failed requests")
         http_grid.addWidget(self.retry_count_spin, 4, 1)
 
+        # Proxy Server
+        http_grid.addWidget(QLabel("Proxy Server:"), 5, 0)
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("e.g. 127.0.0.1:2080")
+        self.proxy_edit.setToolTip("Proxy server (host:port). Leave empty to disable.")
+        http_grid.addWidget(self.proxy_edit, 5, 1)
+
         http_layout.addWidget(http_group)
 
         # Add all tabs
@@ -512,6 +519,7 @@ class SettingsDialog(QDialog):
         self.accept_language_edit.setText(self.settings.get("accept_language", ""))
         self.timeout_spin.setValue(self.settings.get("timeout", 30))
         self.retry_count_spin.setValue(self.settings.get("retry_count", 3))
+        self.proxy_edit.setText(self.settings.get("proxy_server", ""))
 
     def get_settings_from_ui(self):
         """
@@ -566,24 +574,25 @@ class SettingsDialog(QDialog):
         settings["accept_language"] = self.accept_language_edit.text()
         settings["timeout"] = self.timeout_spin.value()
         settings["retry_count"] = self.retry_count_spin.value()
+        settings["proxy_server"] = self.proxy_edit.text().strip()
 
         return settings
 
     def save_settings(self):
         """
-        Save settings to file and remember last used download directory
+        Save settings to file next to the executable (or project root in dev mode).
         """
         self.settings = self.get_settings_from_ui()
-        # Save last used download directory if available from parent/main window
         if hasattr(self.parent(), "get_download_directory"):
             self.settings["last_download_dir"] = self.parent().get_download_directory()
-        
-        # Save settings in the same directory as the executable
-        settings_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "settings.json")
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(self.settings, f, indent=4)
-            
-        print(f"[SettingsDialog] Saved settings to {settings_path}")
+
+        settings_path = self._get_settings_path()
+        try:
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=4)
+            print(f"[SettingsDialog] Saved settings to {settings_path}")
+        except Exception as e:
+            print(f"[SettingsDialog] Error saving settings: {e}")
         self.accept()
 
     def reset_settings(self):
@@ -593,67 +602,49 @@ class SettingsDialog(QDialog):
         self.settings = self.default_settings.copy()
         self.apply_settings_to_ui()
 
+    @staticmethod
+    def _get_settings_path() -> str:
+        """
+        Return path to settings.json that survives across runs.
+        - Frozen (PyInstaller): directory containing the .exe
+        - Development: project root (3 levels up from this file)
+        """
+        if getattr(sys, 'frozen', False):
+            # sys.executable = D:\...\dist\WebMediaParser.exe
+            return os.path.join(os.path.dirname(sys.executable), "settings.json")
+        # Dev: this file is src/gui/settings_dialog.py -> go up 3 levels
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "settings.json"
+        )
+
     def load_settings(self):
         """
-        Load settings from file or use defaults, including last used download directory
+        Load settings from file or use defaults.
         """
-        # Load settings from the same directory as the executable
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        settings_path = os.path.join(base_dir, "settings.json")
-        
-        # For PyInstaller bundle
-        if hasattr(sys, "_MEIPASS"):
-            # First try to find settings in the same directory as the exe
-            exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else base_dir
-            exe_settings_path = os.path.join(exe_dir, "settings.json")
-            if os.path.exists(exe_settings_path):
-                settings_path = exe_settings_path
-                print(f"[SettingsDialog] Using settings from executable directory: {settings_path}")
-        
-        # Also check the old location for backward compatibility
-        old_settings_path = os.path.join(os.path.expanduser("~"), ".web_media_parser", "settings.json")
-        
-        # First try to load from main location
+        settings_path = self._get_settings_path()
+        print(f"[SettingsDialog] Settings path: {settings_path}")
+
         if os.path.exists(settings_path):
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
+                    loaded = json.load(f)
+                # Merge with defaults so new keys added in code are always present
+                merged = self.default_settings.copy()
+                merged.update(loaded)
                 print(f"[SettingsDialog] Loaded settings from {settings_path}")
-                return settings
+                return merged
             except Exception as e:
-                print(f"[SettingsDialog] Error loading settings from {settings_path}: {str(e)}")
-        
-        # Then try old location for backward compatibility
-        if os.path.exists(old_settings_path):
-            try:
-                with open(old_settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-                print(f"[SettingsDialog] Loaded settings from old location {old_settings_path}")
-                # Save to new location for future use
-                try:
-                    with open(settings_path, "w", encoding="utf-8") as f:
-                        json.dump(settings, f, indent=4)
-                    print(f"[SettingsDialog] Migrated settings to new location {settings_path}")
-                except Exception as e:
-                    print(f"[SettingsDialog] Error migrating settings: {str(e)}")
-                return settings
-            except Exception as e:
-                print(f"[SettingsDialog] Error loading settings from old location: {str(e)}")
-        
-        # If no settings file exists anywhere, create default one
+                print(f"[SettingsDialog] Error loading settings: {e}")
+
+        # No file found — write fresh defaults and return them
         default_settings = self.default_settings.copy()
-        
-        # Set default min_video_size to 1000 to ensure video filtering works
-        default_settings["min_video_size"] = 1000
-        
-        # Save default settings
         try:
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(default_settings, f, indent=4)
-            print(f"[SettingsDialog] Created new settings file with defaults at {settings_path}")
+            print(f"[SettingsDialog] Created default settings at {settings_path}")
         except Exception as e:
-            print(f"[SettingsDialog] Error creating default settings: {str(e)}")
-        
+            print(f"[SettingsDialog] Error creating default settings: {e}")
         return default_settings
 
     def get_last_download_dir(self):

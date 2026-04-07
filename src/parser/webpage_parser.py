@@ -92,7 +92,7 @@ class WebpageParser:
         self.sync_session = self._create_sync_session() 
         
         if external_session is None:
-            raise ValueError("WebpageParser requires an external_session (aiohttp.ClientSession).")
+            logger.debug("WebpageParser initialized without external_session. HTTP fetching will be disabled.")
         self.session = external_session 
         
         self.pattern_manager = pattern_manager
@@ -358,6 +358,13 @@ class WebpageParser:
                 if not url: continue
                 abs_url = urljoin(self.url, url)
                 if abs_url.startswith(("http://", "https://")):
+                    # Heuristic: Skip obvious tracking pixels and trackers
+                    if any(kw in abs_url.lower() for kw in ['pixel', 'tracker', 'telemetry', 'metrics', 'doubleclick', 'analytics']):
+                        continue
+                        
+                    if hasattr(self, 'pattern_manager') and self.pattern_manager:
+                        abs_url = self.pattern_manager.transform_image_url(abs_url, self.url)
+                        
                     attrs = {"width": source_data.get("width"), "media": source_data.get("media"), "type": source_data.get("type"), "source": source_data.get("source"), "is_cdn": self._is_cdn_url(abs_url, "img")}
                     self.media_files.append(("image", abs_url, attrs)); found += 1
         
@@ -366,9 +373,69 @@ class WebpageParser:
             if url:
                 abs_url = urljoin(self.url, url)
                 if abs_url.startswith(("http://", "https://")):
+                    # Heuristic: Skip obvious tracking pixels and trackers
+                    if any(kw in abs_url.lower() for kw in ['pixel', 'tracker', 'telemetry', 'metrics', 'doubleclick', 'analytics']):
+                        continue
+                        
+                    if hasattr(self, 'pattern_manager') and self.pattern_manager:
+                        transformed = self.pattern_manager.transform_image_url(abs_url, self.url)
+                        if transformed != abs_url:
+                            attrs['is_pattern_transformed'] = True
+                            abs_url = transformed
+                            
                     attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
                     self.media_files.append(("image", abs_url, attrs)); found += 1
+                    
                     parent_a = img.find_parent('a', href=True)
+                    if parent_a and parent_a.get('href'):
+                        link_url = parent_a.get('href')
+                        link_abs_url = urljoin(self.url, link_url)
+                        
+                        if hasattr(self, 'pattern_manager') and self.pattern_manager:
+                            link_abs_url = self.pattern_manager.transform_image_url(link_abs_url, self.url)
+                            
+                        if link_abs_url.startswith(("http://", "https://")):
+                            if is_image_url(link_abs_url):
+                                link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
+                                self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                if link_abs_url in self.links: del self.links[link_abs_url]
+                            elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
+                                link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
+                                self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                if link_abs_url in self.links: del self.links[link_abs_url]
+                            else: 
+                                # Universal Container Rule (Image/Video)
+                                media_type_hint = "image"
+                                link_url_lower = link_abs_url.lower()
+                                img_class = img.get('class', '')
+                                img_class_str = " ".join(img_class).lower() if isinstance(img_class, list) else str(img_class).lower()
+                                img_alt = str(img.get('alt', '')).lower()
+                                
+                                video_keywords = ['watch', 'video', 'play', 'embed', 'clip', 'reel']
+                                is_video = any(kw in link_url_lower for kw in video_keywords) or \
+                                           any(kw in img_class_str for kw in ['video', 'thumb', 'poster', 'preview']) or \
+                                           any(kw in img_alt for kw in ['video', 'play'])
+                                           
+                                if is_video:
+                                    media_type_hint = "video"
+                                
+                                self.links[link_abs_url] = {
+                                    'from_image': True, 
+                                    'thumbnail_url': abs_url, 
+                                    'is_webpage': True, 
+                                    'is_media_container': True,
+                                    'media_type_hint': media_type_hint,
+                                    'priority': 100.0
+                                }
+        for elem in soup.find_all(attrs={"style": True}):
+            for url in self._extract_inline_css_images(elem):
+                abs_url = urljoin(self.url, url)
+                if abs_url.startswith(("http://", "https://")):
+                    attrs = {"source": "css", "element": elem.name, "is_cdn": self._is_cdn_url(abs_url, "img")}
+                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                    
+                    # Track links hiding behind CSS background images (modern SPA thumbnails)
+                    parent_a = elem if elem.name == 'a' and elem.has_attr('href') else elem.find_parent('a', href=True)
                     if parent_a and parent_a.get('href'):
                         link_url, link_abs_url = parent_a.get('href'), urljoin(self.url, parent_a.get('href'))
                         if link_abs_url.startswith(("http://", "https://")):
@@ -379,14 +446,21 @@ class WebpageParser:
                                 link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
                                 self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                             else: 
-                                self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'potential_media_container': True, 'priority': 15.0}
-        
-        for elem in soup.find_all(attrs={"style": True}):
-            for url in self._extract_inline_css_images(elem):
-                abs_url = urljoin(self.url, url)
-                if abs_url.startswith(("http://", "https://")):
-                    attrs = {"source": "css", "element": elem.name, "is_cdn": self._is_cdn_url(abs_url, "img")}
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                                # Universal Container Rule for CSS backgrounds
+                                media_type_hint = "image"
+                                link_url_lower = link_abs_url.lower()
+                                video_keywords = ['watch', 'video', 'play', 'embed', 'clip', 'reel']
+                                if any(kw in link_url_lower for kw in video_keywords):
+                                    media_type_hint = "video"
+                                    
+                                self.links[link_abs_url] = {
+                                    'from_image': True, 
+                                    'thumbnail_url': abs_url, 
+                                    'is_webpage': True, 
+                                    'is_media_container': True,
+                                    'media_type_hint': media_type_hint,
+                                    'priority': 100.0
+                                }
         
         for link_tag in soup.find_all("link", rel=re.compile(r"icon|apple-touch-icon")):
             href = link_tag.get("href")
@@ -429,6 +503,15 @@ class WebpageParser:
                     if platform:
                         attrs = {"width": iframe_tag.get("width", ""), "height": iframe_tag.get("height", ""), "platform": platform, "type": "embed"}
                         self.media_files.append(("video", abs_url, attrs)); found += 1
+                    else:
+                        # Generic iframe - treat as media container
+                        self.links[abs_url] = {
+                            'from_iframe': True,
+                            'is_webpage': True,
+                            'is_media_container': True,
+                            'media_type_hint': 'video', # Most iframes are for video players
+                            'priority': 80.0
+                        }
         
         for meta_tag in soup.find_all("meta", property=re.compile(r"og:video|twitter:player")):
             content = meta_tag.get("content")
@@ -442,6 +525,14 @@ class WebpageParser:
     async def _extract_links(self, soup: BeautifulSoup) -> None: 
         found = 0
         for a_tag in soup.find_all("a", href=True):
+            # --- V7: Visibility Filter (Honeypot Evasion) ---
+            style = a_tag.get("style", "").lower()
+            if "display: none" in style or "display:none" in style or "visibility: hidden" in style or "visibility:hidden" in style:
+                continue
+            parent_style = a_tag.parent.get("style", "").lower() if a_tag.parent else ""
+            if "display: none" in parent_style or "display:none" in parent_style or "visibility: hidden" in parent_style or "visibility:hidden" in parent_style:
+                continue
+                
             href = a_tag["href"].strip()
             if not href or href.startswith(("javascript:", "#", "mailto:", "tel:")): continue
             abs_url = urljoin(self.url, href)
