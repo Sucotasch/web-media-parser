@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
+import aiohttp
 
 from src.parser.shared_session import AsyncClientManager
 from src import constants as K # For accessing default header constants
@@ -31,6 +32,7 @@ class TestAsyncClientManager(unittest.TestCase):
         
         # Mock the session instance that will be created
         mock_session_instance = AsyncMock()
+        mock_session_instance.headers = {"Accept-Encoding": "gzip, deflate"}
         mock_aiohttp_session_class.return_value = mock_session_instance
         
         settings = {
@@ -82,8 +84,6 @@ class TestAsyncClientManager(unittest.TestCase):
             self.assertEqual(actual_timeout.sock_read, expected_timeout_config.sock_read)
 
 
-        # Need to import aiohttp for ClientTimeout comparison if not already done
-        import aiohttp # Moved import here for clarity on where ClientTimeout comes from
         asyncio.run(_test())
 
     def test_session_recreation_if_closed(self):
