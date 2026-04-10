@@ -17,8 +17,10 @@ async def test_js_processing():
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36",
     }
 
-    parser = WebpageParser(test_url, settings, process_js=True)
-    links, media_files = await parser.parse()
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        parser = WebpageParser(test_url, settings, process_js=True, external_session=session)
+        links, media_files, error_status, error_message, http_status_code = await parser.parse()
 
     # If JS processing works, we should find multiple images and links
     assert len(links) > 0, "No links found - JS processing may have failed"

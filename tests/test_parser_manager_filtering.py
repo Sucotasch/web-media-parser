@@ -21,7 +21,7 @@ class TestParserManagerFiltering(unittest.TestCase):
         # Basic settings for ParserManager initialization
         self.settings = {
             K.SETTING_SEARCH_DEPTH: K.DEFAULT_SEARCH_DEPTH,
-            K.SETTING_STAY_IN_DOMAIN: True, # To isolate domain blocking from stay_in_domain
+            K.SETTING_STAY_IN_DOMAIN: False, # To isolate domain blocking from stay_in_domain
             K.SETTING_STOP_WORDS: [],
             # Add other minimal required settings if ParserManager constructor needs them
         }
