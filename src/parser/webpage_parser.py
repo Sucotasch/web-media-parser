@@ -27,11 +27,8 @@ from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
 
 import aiohttp 
-import requests 
 import chardet
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 if not HAS_BROTLI:
     try:
@@ -89,8 +86,6 @@ class WebpageParser:
         # self.process_dynamic = process_dynamic # Removed, covered by process_js
         self.domain = get_domain(url)
         
-        self.sync_session = self._create_sync_session() 
-        
         if external_session is None:
             raise ValueError("WebpageParser requires an external_session (aiohttp.ClientSession).")
         self.session = external_session 
@@ -104,32 +99,6 @@ class WebpageParser:
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
 
-    def _create_sync_session(self) -> requests.Session: 
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT),
-            backoff_factor=0.5, 
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "HEAD"],
-            respect_retry_after_header=True,
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
-        session.mount("http://", adapter); session.mount("https://", adapter)
-        headers = {
-            "User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
-            "Accept-Language": self.settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
-            "Accept": K.DEFAULT_ACCEPT_HEADER, 
-            "Accept-Encoding": "gzip, deflate, br" if HAS_BROTLI else "gzip, deflate", 
-            "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1", "DNT": "1",
-        }
-        referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
-        if referrer_policy == "origin": headers["Referer"] = get_domain(self.url)
-        elif referrer_policy == "auto": headers["Referer"] = self.url
-        session.headers.update(headers)
-        return session
-
     async def _get_content(self) -> Tuple[Optional[str], Optional[str], str, Optional[int]]:
         """
         Get webpage content.
@@ -140,83 +109,119 @@ class WebpageParser:
             logger.error(msg)
             return None, K.PARSER_JS_REDIRECT_MAX_EXCEEDED, msg, None
 
-        try:
-            request_specific_headers = {} 
-            referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
-            if referrer_policy == "origin": request_specific_headers["Referer"] = get_domain(self.url)
-            elif referrer_policy == "auto": request_specific_headers["Referer"] = self.url
-            
-            cookies = {}
-            if self.settings.get(K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT):
-                consent_cookies = { 
-                    'cookieconsent_status': 'dismiss', 'gdpr_accepted': 'true', 
-                    'cookies_accepted': 'true', 'euconsent': 'true', 'CookieConsent': 'true',
-                    'cc_cookie_accept': '1', 'cookie_consent': 'true', 'privacy_policy_accepted': 'true'
-                }
-                cookies.update(consent_cookies)
-            
-            page_timeout_val = self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT)
-            request_timeout_config = aiohttp.ClientTimeout(total=page_timeout_val)
-
-            async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config) as response:
-                http_status = response.status
-                if 400 <= http_status < 500:
-                    msg = f"Client HTTP error {http_status} for {self.url}"
-                    logger.error(msg)
-                    return None, K.PARSER_HTTP_ERROR_4XX, msg, http_status
-                elif 500 <= http_status < 600:
-                    msg = f"Server HTTP error {http_status} for {self.url}"
-                    logger.error(msg)
-                    return None, K.PARSER_HTTP_ERROR_5XX, msg, http_status
-                
-                if http_status != 200: 
-                    msg = f"Non-200 HTTP status {http_status} for {self.url}"
-                    logger.warning(msg) 
-                
-                content_bytes = await response.read()
-                
-            encoding = await self._detect_encoding(content_bytes)
-            decoded_content: Optional[str] = None
+        max_retries = self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
+        content_bytes = None
+        http_status = None
+        
+        # 1. Very fast aiohttp attempt (or two)
+        for attempt in range(max_retries + 1):
             try:
-                decoded_content = content_bytes.decode(encoding, errors="replace")
-            except (UnicodeDecodeError, LookupError) as e:
-                msg = f"Failed to decode with {encoding} for {self.url}, falling back to utf-8: {str(e)}"
-                logger.warning(msg)
-                try:
-                    decoded_content = content_bytes.decode("utf-8", errors="replace")
-                except (UnicodeDecodeError, LookupError) as e_utf8:
-                    msg_utf8 = f"UTF-8 fallback decoding also failed for {self.url}: {str(e_utf8)}"
-                    logger.error(msg_utf8)
-                    return None, K.PARSER_CONTENT_DECODE_ERROR, msg_utf8, http_status
-            
-            if self.settings.get(K.SETTING_BYPASS_JS_REDIRECTS, K.DEFAULT_BYPASS_JS_REDIRECTS) and decoded_content:
-                redirect_url = self._extract_js_redirect(decoded_content)
-                if redirect_url:
-                    self.js_redirect_count += 1
-                    logger.info(f"Detected JS redirect from {self.url} to {redirect_url} (Count: {self.js_redirect_count})")
-                    abs_redirect_url = urljoin(self.url, redirect_url)
-                    self.url = abs_redirect_url 
-                    return await self._get_content() 
-            
-            return decoded_content, None, "Success", http_status 
+                request_specific_headers = {}
+                referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
+                
+                if referrer_policy != "none" and self.js_redirect_count == 0:
+                    source_url = self.settings.get("_source_url")
+                    if source_url and source_url != self.url:
+                        request_specific_headers["Referer"] = source_url
+                    elif referrer_policy == "origin":
+                        request_specific_headers["Referer"] = get_domain(self.url)
+                
+                cookies = {}
+                if self.settings.get(K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT):
+                    if attempt > 0:
+                        consent_cookies = { 
+                            'cookieconsent_status': 'dismiss', 'gdpr_accepted': 'true', 
+                            'cookies_accepted': 'true', 'euconsent': 'true', 'CookieConsent': 'true',
+                            'cc_cookie_accept': '1', 'cookie_consent': 'true', 'privacy_policy_accepted': 'true'
+                        }
+                        cookies.update(consent_cookies)
+                
+                page_timeout_val = self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT)
+                # VERY Aggressive connect timeout (5 secs max), so we don't hang queues
+                request_timeout_config = aiohttp.ClientTimeout(
+                    total=page_timeout_val, 
+                    connect=min(5, page_timeout_val // 2),
+                    sock_read=page_timeout_val - 2
+                )
 
-        except asyncio.TimeoutError as e:
-            msg = f"Timeout error fetching {self.url}: {str(e)}"
-            logger.error(msg)
-            return None, K.PARSER_TIMEOUT_ERROR, msg, None
-        except aiohttp.ClientResponseError as e: 
-            msg = f"HTTP ClientResponseError for {self.url}: Status {e.status}, Message: {e.message}"
-            logger.error(msg)
-            err_status = K.PARSER_HTTP_ERROR_4XX if 400 <= e.status < 500 else K.PARSER_HTTP_ERROR_5XX if 500 <= e.status < 600 else K.PARSER_NETWORK_ERROR
-            return None, err_status, msg, e.status
-        except aiohttp.ClientError as e: 
-            msg = f"Network (aiohttp.ClientError) fetching {self.url}: {str(e)}"
-            logger.error(msg)
-            return None, K.PARSER_NETWORK_ERROR, msg, None
-        except Exception as e:
-            msg = f"Generic error fetching content for {self.url}: {str(e)}"
-            logger.error(msg, exc_info=True)
-            return None, K.PARSER_UNKNOWN_ERROR, msg, None
+                if attempt > 0:
+                    logger.info(f"Retrying fetch of {self.url} via aiohttp (Attempt {attempt+1}/{max_retries+1})...")
+                    await asyncio.sleep(0.5 * attempt) # Fast backoff
+
+                async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config) as response:
+                    http_status = response.status
+                    if 400 <= http_status < 500:
+                        msg = f"Client HTTP error {http_status} for {self.url}"
+                        logger.error(msg)
+                        return None, K.PARSER_HTTP_ERROR_4XX, msg, http_status
+                    elif 500 <= http_status < 600:
+                        msg = f"Server HTTP error {http_status} for {self.url}"
+                        logger.error(msg)
+                        if attempt < max_retries: continue
+                        return None, K.PARSER_HTTP_ERROR_5XX, msg, http_status
+                    
+                    content_bytes = await response.read()
+                    break # Success with aiohttp
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                # If it's a network/timeout error, we break out early and use the requests fallback 
+                # instead of blindly retrying and wasting time on IP/TLS blocks.
+                logger.debug(f"aiohttp failed for {self.url} ({str(e)}). Switching to fallback...")
+                break
+            except Exception as e:
+                msg = f"Generic error fetching content for {self.url}: {str(e)}"
+                logger.error(msg, exc_info=True)
+                return None, K.PARSER_UNKNOWN_ERROR, msg, None
+
+        # 2. Fallback to requests if aiohttp couldn't fetch bytes (TLS fingerprint / block)
+        if not content_bytes:
+            try:
+                logger.info(f"Using sync fallback (requests) for {self.url}")
+                loop = asyncio.get_event_loop()
+                
+                def _sync_fetch():
+                    import requests
+                    fb_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"}
+                    if request_specific_headers.get("Referer"):
+                        fb_headers["Referer"] = request_specific_headers["Referer"]
+                    # Aggressive timeout for sync to prevent blocking thread pool
+                    fb_timeout = min(5, self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT))
+                    return requests.get(self.url, headers=fb_headers, timeout=fb_timeout)
+
+                resp = await loop.run_in_executor(None, _sync_fetch)
+                http_status = resp.status_code
+                if 400 <= http_status < 600:
+                    return None, K.PARSER_HTTP_ERROR_4XX if http_status < 500 else K.PARSER_HTTP_ERROR_5XX, f"HTTP {http_status} via fallback", http_status
+                content_bytes = resp.content
+            except Exception as fb_err:
+                return None, K.PARSER_NETWORK_ERROR, f"Fallback failed: {str(fb_err)}", http_status
+
+        if not content_bytes:
+            return None, K.PARSER_NETWORK_ERROR, "Failed to retrieve content bytes after all attempts", http_status
+
+        encoding = await self._detect_encoding(content_bytes)
+        decoded_content: Optional[str] = None
+        try:
+            decoded_content = content_bytes.decode(encoding, errors="replace")
+        except (UnicodeDecodeError, LookupError) as e:
+            msg = f"Failed to decode with {encoding} for {self.url}, falling back to utf-8: {str(e)}"
+            logger.warning(msg)
+            try:
+                decoded_content = content_bytes.decode("utf-8", errors="replace")
+            except (UnicodeDecodeError, LookupError) as e_utf8:
+                msg_utf8 = f"UTF-8 fallback decoding also failed for {self.url}: {str(e_utf8)}"
+                logger.error(msg_utf8)
+                return None, K.PARSER_CONTENT_DECODE_ERROR, msg_utf8, http_status
+        
+        if self.settings.get(K.SETTING_BYPASS_JS_REDIRECTS, K.DEFAULT_BYPASS_JS_REDIRECTS) and decoded_content:
+            redirect_url = self._extract_js_redirect(decoded_content)
+            if redirect_url:
+                self.js_redirect_count += 1
+                logger.info(f"Detected JS redirect from {self.url} to {redirect_url} (Count: {self.js_redirect_count})")
+                abs_redirect_url = urljoin(self.url, redirect_url)
+                self.url = abs_redirect_url 
+                return await self._get_content() 
+        
+        return decoded_content, None, "Success", http_status 
 
     async def _detect_encoding(self, content_bytes: bytes) -> str:
         if content_bytes.startswith(b"\xef\xbb\xbf"): return "utf-8-sig"
@@ -472,7 +477,7 @@ class WebpageParser:
             return {}, [], K.PARSER_UNKNOWN_ERROR, "No content fetched and no specific error reported.", http_status_code
 
         try:
-            soup = BeautifulSoup(content, "html.parser")
+            soup = BeautifulSoup(content, "lxml")
             await self._extract_images(soup) 
             await self._extract_videos(soup)
             await self._extract_links(soup)

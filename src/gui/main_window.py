@@ -213,6 +213,14 @@ class MainWindow(QMainWindow):
         if dir_path:
             self.download_dir = dir_path
             self.dir_input.setText(dir_path)
+            # Persist the change immediately so it's not lost on restart
+            if hasattr(self, "settings_dialog"):
+                self.settings_dialog.settings["last_download_dir"] = dir_path
+                self.settings_dialog.save_settings()
+                # save_settings calls self.accept(), but we can also just call its save logic directly if we don't want to close any dialogs, 
+                # but here SettingsDialog is just an object MainWindow holds, so it's fine.
+                # Actually, save_settings in our new version is safe to call.
+
 
     def show_settings(self):
         """

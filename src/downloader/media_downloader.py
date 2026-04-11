@@ -14,34 +14,93 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from src import constants as K # Import constants
+from requests.cookies import RequestsCookieJar
+from src import constants as K  # Import constants
 
 logger = logging.getLogger(__name__)
 
 # WRITE_BUFFER_SIZE is now in K.WRITE_BUFFER_SIZE
+
+
+class _NullCookieJar(RequestsCookieJar):
+    """Cookie jar that silently discards all Set-Cookie headers from responses.
+
+    Used with the shared download session to prevent cross-domain cookie
+    contamination when the same session is reused across many different sites.
+    All cookies sent by remote servers are dropped; none are stored or re-sent.
+    """
+    def set_cookie(self, cookie): pass   # Discard all incoming cookies
+    def update(self, other): pass        # Prevent any external cookie merge
+
+
+def create_shared_downloader_session(settings: dict) -> requests.Session:
+    """Create a single shared requests.Session for all MediaDownloader instances.
+
+    One session enables TCP/TLS keep-alive connection reuse across file downloads
+    and eliminates the per-file HTTPAdapter/Retry allocation overhead.
+    Per-file headers (Accept, Referer) are passed per-request, not at session
+    level, to avoid cross-file contamination.
+    A _NullCookieJar prevents cross-domain cookie leakage.
+    """
+    session = requests.Session()
+    session.cookies = _NullCookieJar()  # Prevent cross-domain cookie leakage
+    retry = Retry(
+        total=settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT),
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+    )
+    # Larger pool to support many concurrent download workers
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    # Only stable, file-invariant headers are set at session level.
+    # Accept and Referer vary per file and are sent per-request instead.
+    session.headers.update({
+        "User-Agent": settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
+        "Accept-Language": settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
+    })
+    logger.info(
+        "Shared downloader session created "
+        f"(pool_connections=20, pool_maxsize=50, "
+        f"retries={settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)})."
+    )
+    return session
+
 
 class MediaDownloader:
     """
     Media downloader class for downloading media files
     """
 
-    def __init__(self, url, filepath, settings, media_type="image", source_url=None):
+    def __init__(self, url, filepath, settings, media_type="image", source_url=None, shared_session=None, stop_event=None):
         """
         Initializes MediaDownloader.
         filepath: Full path including desired subdirectories, before final uniqueness.
+        shared_session: Optional pre-created requests.Session from ParserManager.
+                        When provided, connection reuse and retry are already configured.
+                        Per-file headers (Accept, Referer) are sent per-request instead.
+        stop_event: Optional threading.Event to monitor for aborting downloads.
         """
         self.url = url
-        self.filepath = filepath 
-        self.settings = settings # Settings from ParserManager, which got them from SettingsDialog
+        self.filepath = filepath
+        self.settings = settings  # Settings from ParserManager, which got them from SettingsDialog
         self.media_type = media_type
-        self.source_url = source_url 
+        self.source_url = source_url
+        self.stop_event = stop_event
         self.progress_callback = None
-        self.session = self._create_session()
-        self.rate_limit = self.settings.get(K.SETTING_MAX_DOWNLOAD_SPEED, 0) # 0 for unlimited
+        # Use provided shared session (preferred) or fall back to a local session
+        if shared_session is not None:
+            self.session = shared_session
+            self._owns_session = False  # Don't close a session we didn't create
+        else:
+            self.session = self._create_session()
+            self._owns_session = True
+        self.rate_limit = self.settings.get(K.SETTING_MAX_DOWNLOAD_SPEED, 0)  # 0 for unlimited
         # Use K.MAX_THREADS_PER_FILE_CAP as a hard upper limit
         self.threads_per_file = min(
             self.settings.get(K.SETTING_THREADS_PER_FILE, K.DEFAULT_THREADS_PER_FILE),
-            K.MAX_THREADS_PER_FILE_CAP 
+            K.MAX_THREADS_PER_FILE_CAP
         )
 
     def _create_session(self):
@@ -82,6 +141,32 @@ class MediaDownloader:
 
     def set_progress_callback(self, callback): self.progress_callback = callback
 
+    def _get_per_request_headers(self) -> dict:
+        """Build headers that vary per file and must be sent per-request.
+
+        Accept and Referer differ between image/video files and between source
+        pages, so they cannot be set once on a shared session without
+        contaminating unrelated downloads.
+        """
+        headers: dict = {}
+        # Media-type-specific Accept header
+        if self.media_type == "image":
+            headers["Accept"] = K.DEFAULT_ACCEPT_IMAGE_HEADER
+        elif self.media_type == "video":
+            headers["Accept"] = K.DEFAULT_ACCEPT_VIDEO_HEADER
+        else:
+            headers["Accept"] = K.DEFAULT_ACCEPT_HEADER
+        # Referer based on referrer policy setting
+        if self.source_url:
+            referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
+            if referrer_policy == "origin":
+                parsed_source = urlparse(self.source_url)
+                headers["Referer"] = f"{parsed_source.scheme}://{parsed_source.netloc}"
+            elif referrer_policy == "auto":
+                headers["Referer"] = self.source_url
+            # If "none": no Referer header added
+        return headers
+
     def download(self, timeout=None, retries=None): # retries param is less used now session handles it
         try:
             # Use specific timeout if provided, else from settings, else default constant
@@ -114,10 +199,12 @@ class MediaDownloader:
             
             timeout_to_use = custom_timeout if custom_timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
             content_length = 0
-            response_head = None # Define response_head before try block
+            response_head = None  # Define response_head before try block
+            # Per-request headers built once and reused for HEAD, GET, and chunks
+            per_req_hdrs = self._get_per_request_headers()
 
             try:
-                response_head = self.session.head(self.url, timeout=timeout_to_use)
+                response_head = self.session.head(self.url, headers=per_req_hdrs, timeout=timeout_to_use)
                 response_head.raise_for_status()
                 content_length = int(response_head.headers.get("Content-Length", 0))
                 content_type = response_head.headers.get("Content-Type", "").lower()
@@ -160,7 +247,7 @@ class MediaDownloader:
                     logger.warning(f"Multi-threaded download for {self.filepath} raised {e}, falling back.", exc_info=True)
             
             logger.info(f"Starting single-threaded download: {os.path.basename(self.filepath)}")
-            response_get = self.session.get(self.url, stream=True, timeout=timeout_to_use)
+            response_get = self.session.get(self.url, headers=per_req_hdrs, stream=True, timeout=timeout_to_use)
             response_get.raise_for_status()
 
             if content_length == 0:
@@ -181,6 +268,9 @@ class MediaDownloader:
                 network_chunk_size = 8192  
                 downloaded_bytes = 0
                 for chunk in response_get.iter_content(chunk_size=network_chunk_size):
+                    if self.stop_event and self.stop_event.is_set():
+                        return {"success": False, "error": "Download manually aborted"}
+                    
                     if chunk:
                         write_buffer.extend(chunk)
                         downloaded_bytes += len(chunk)
@@ -200,12 +290,14 @@ class MediaDownloader:
                     except Exception as e:
                         return {"success": False, "error": f"Disk write error: {e}"}
 
-            if content_length > 0 and os.path.getsize(self.filepath) != content_length:
-                try:
-                    os.remove(self.filepath)
-                except OSError:
-                    pass
-                return {"success": False, "error": f"Size mismatch: expected {content_length}, got {os.path.getsize(self.filepath)}"}
+            if content_length > 0:
+                actual_size = os.path.getsize(self.filepath)
+                if actual_size != content_length:
+                    try:
+                        os.remove(self.filepath)
+                    except OSError:
+                        pass
+                    return {"success": False, "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
 
             if self.progress_callback: self.progress_callback(100)
             logger.info(f"Download completed: {os.path.basename(self.filepath)}")
@@ -279,9 +371,16 @@ class MediaDownloader:
                         pass
 
     def _download_chunk(self, start, end, filename, total_size, progress_dict, progress_lock, timeout_val):
-        headers = {"Range": f"bytes={start}-{end}"}
-        network_chunk_size_thread = 8192 
+        # Merge per-file headers (Accept, Referer) with the byte-range header for this chunk
+        per_req_hdrs = self._get_per_request_headers()
+        headers = {**per_req_hdrs, "Range": f"bytes={start}-{end}"}
+        network_chunk_size_thread = 8192
         try:
+            # Guard: ensure the target directory exists before writing this chunk's temp file.
+            # Must be inside try so failures are caught and reported via progress_dict.
+            dir_name = os.path.dirname(filename)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
             response = self.session.get(self.url, headers=headers, stream=True, timeout=timeout_val)
             response.raise_for_status()
             write_buffer_chunk = bytearray()
@@ -289,6 +388,11 @@ class MediaDownloader:
             with open(filename, "wb") as f:
                 for chunk_data in response.iter_content(chunk_size=network_chunk_size_thread):
                     if not progress_dict["success"]: return # Check if another thread failed
+                    if self.stop_event and self.stop_event.is_set():
+                        with progress_lock:
+                            progress_dict["success"] = False
+                            progress_dict["errors"].append("Download manually aborted")
+                        return
                     if chunk_data:
                         write_buffer_chunk.extend(chunk_data)
                         downloaded_this_chunk += len(chunk_data)

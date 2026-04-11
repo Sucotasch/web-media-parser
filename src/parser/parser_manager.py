@@ -6,6 +6,7 @@ Enhanced parser manager that coordinates parsing and downloading process
 """
 
 import os
+import sys
 import re
 import time
 # import queue # Not used directly, asyncio.Queue is used
@@ -27,7 +28,7 @@ from src.parser.webpage_parser import WebpageParser
 from src.parser.json_parser import JSONWebpageParser
 from src.parser.priority_url_queue import PriorityURLQueue
 from src.parser.site_pattern_manager import SitePatternManager
-from src.downloader.media_downloader import MediaDownloader
+from src.downloader.media_downloader import MediaDownloader, create_shared_downloader_session
 from src.parser.utils import (
     # is_valid_url, # Not used
     get_domain,
@@ -63,15 +64,18 @@ class ParserManager(QObject):
 
         self.is_running = False
         self.is_paused = False
-        self._pause_event = asyncio.Event()
-        self._stop_event = asyncio.Event()
-        self._pause_event.set()
+        # NOTE: _pause_event, _stop_event, download_queue, quarantine_queue are
+        # intentionally NOT created here. They are asyncio primitives and must be
+        # created inside the asyncio event loop thread to be bound to the correct
+        # loop. They are created in start_parsing() before the loop starts.
+        self._pause_event = None
+        self._stop_event = None
 
         self.max_depth = self.settings.get(K.SETTING_SEARCH_DEPTH, K.DEFAULT_SEARCH_DEPTH)
         
         self.domain_health = {}
         self.quarantined_domains = set()
-        self.quarantine_queue = asyncio.Queue() # Max size can be a constant if needed
+        self.quarantine_queue = None  # Created in start_parsing on the correct loop
         
         self.pattern_manager = None
         if self.settings.get(K.SETTING_USE_PATTERNS, K.DEFAULT_USE_PATTERNS):
@@ -82,7 +86,7 @@ class ParserManager(QObject):
             logger.info("Using SitePatternManager for pattern transformations")
 
         self.url_queue = PriorityURLQueue()
-        self.download_queue = asyncio.Queue()
+        self.download_queue = None  # Created in start_parsing on the correct loop
         self.processed_urls = set()
         self.downloaded_files = set() # Stores URLs of media marked for download to avoid re-processing
 
@@ -90,9 +94,12 @@ class ParserManager(QObject):
             "pages_processed": 0, "images_found": 0, "videos_found": 0,
             "files_downloaded": 0, "files_skipped": 0,
         }
+        self._completed_naturally = False  # True only when parsing finished by itself, not user Stop
+        self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
         
         self.loop = asyncio.new_event_loop()
         self.async_client_manager: AsyncClientManager = AsyncClientManager(self.settings)
+        self._shared_downloader_session = None  # Created in _main_task, closed in _main_task.finally
         
         self.parser_tasks = []
         self.downloader_tasks = []
@@ -100,17 +107,38 @@ class ParserManager(QObject):
 
     def _load_domain_blocklist(self, blocklist_file_name: str = K.DOMAIN_BLOCKLIST_FILENAME) -> Set[str]:
         blocked_domains: Set[str] = set()
-        # Path relative to the current script directory
-        script_dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), blocklist_file_name)
-        
-        # Path as provided (could be relative to CWD or absolute)
-        provided_path = blocklist_file_name
+        path_to_load = None  # Must be initialized before any conditional assignment
 
-        path_to_load = None
-        if os.path.exists(script_dir_path):
-            path_to_load = script_dir_path
-        elif os.path.exists(provided_path):
-            path_to_load = provided_path
+        # 1. Try PyInstaller bundle resources first
+        if getattr(sys, 'frozen', False):
+            base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            bundled_path = os.path.join(base_dir, "resources", blocklist_file_name)
+            if os.path.exists(bundled_path):
+                path_to_load = bundled_path
+        
+        # 2. Try the actual executable directory (user-editable blocklist)
+        if not path_to_load and getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+            exe_path = os.path.join(exe_dir, blocklist_file_name)
+            if os.path.exists(exe_path):
+                path_to_load = exe_path
+
+        # 3. Try relative to the script directory (development)
+        if not path_to_load:
+            script_dir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), blocklist_file_name)
+            if os.path.exists(script_dir_path):
+                path_to_load = script_dir_path
+        
+        # 4. Try current working directory or provided path
+        if not path_to_load and os.path.exists(blocklist_file_name):
+            path_to_load = blocklist_file_name
+        
+        # 5. Try resources folder in development root
+        if not path_to_load:
+            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            dev_res_path = os.path.join(root_dir, "resources", blocklist_file_name)
+            if os.path.exists(dev_res_path):
+                path_to_load = dev_res_path
         
         if path_to_load:
             try:
@@ -124,7 +152,7 @@ class ParserManager(QObject):
                 logger.error(f"Error loading domain blocklist from {path_to_load}: {e}", exc_info=True)
         else:
             logger.warning(
-                f"Domain blocklist file not found. Tried: '{script_dir_path}' and '{provided_path}'. "
+                f"Domain blocklist file '{blocklist_file_name}' not found in any expected location. "
                 "Proceeding with an empty blocklist."
             )
         return blocked_domains
@@ -141,13 +169,24 @@ class ParserManager(QObject):
 
     def start_parsing(self):
         self.is_running = True
-        self._stop_event.clear()
-        if not self.loop or self.loop.is_closed(): self.loop = asyncio.new_event_loop()
-        
-        asyncio.run_coroutine_threadsafe(
-            self.url_queue.put(self.start_url, 0, self.start_url, {"is_start_url": True, "start_url": self.start_url}),
-            self.loop
-        )
+        # Create the event loop first so asyncio primitives are bound to it
+        if not self.loop or self.loop.is_closed():
+            self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
+        # (Re)create asyncio primitives on THIS loop to avoid cross-loop errors
+        self._stop_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # Unpaused by default
+        self.download_queue = asyncio.Queue()
+        self.quarantine_queue = asyncio.Queue()
+        self._completed_naturally = False
+        self._last_activity_time = time.time()
+
+        # Reset the url_queue's asyncio primitives (Lock and Event).
+        # This cannot be done here (GUI/QThread context) safely — it's done
+        # inside _main_task which runs in the event loop thread.
+
         self.loop_thread = threading.Thread(target=self._run_event_loop, name="AsyncEventLoopThread")
         self.loop_thread.daemon = True
         self.loop_thread.start()
@@ -176,6 +215,23 @@ class ParserManager(QObject):
                 logger.info("Asyncio event loop closed.")
 
     async def _main_task(self):
+        # Reset PriorityURLQueue's asyncio primitives now that the loop is running.
+        # This is the only safe place to do so, as asyncio.Lock/Event must be
+        # created inside a running event loop context.
+        self.url_queue.reset_async_primitives()
+
+        # Seed the initial URL into the queue (must be done after reset)
+        await self.url_queue.put(
+            self.start_url, 0, self.start_url,
+            {"is_start_url": True, "start_url": self.start_url}
+        )
+
+        # Create the shared requests.Session here so its lifecycle is entirely
+        # within _main_task: created before workers start, closed in finally
+        # after all workers are cancelled+gathered. A local reference prevents
+        # race conditions if start_parsing() is called again before this task ends.
+        shared_dl_session = create_shared_downloader_session(self.settings)
+        self._shared_downloader_session = shared_dl_session
         try:
             async with self.async_client_manager as session:
                 parser_count = self.settings.get(K.SETTING_PARSER_THREADS, K.DEFAULT_PARSER_THREADS)
@@ -184,15 +240,16 @@ class ParserManager(QObject):
 
                 self.parser_tasks = [asyncio.create_task(self._parser_worker(session), name=f"parser_{i}") for i in range(parser_count)]
                 self.downloader_tasks = [asyncio.create_task(self._downloader_worker(), name=f"downloader_{i}") for i in range(downloader_count)]
-                
-                all_tasks = self.parser_tasks + self.downloader_tasks
+
+                completion_task = asyncio.create_task(self._completion_monitor(), name="CompletionMonitor")
+                all_tasks = self.parser_tasks + self.downloader_tasks + [completion_task]
                 stop_waiter = asyncio.create_task(self._stop_event.wait(), name="StopEventWaiter")
                 
-                # Wait only for the stop event, not for individual workers to complete
+                # Wait for the stop event (set by user OR by _completion_monitor on natural finish)
                 await stop_waiter
                 logger.info("Stop event received, cancelling tasks.")
                 
-                # Cancel all worker tasks
+                # Cancel all worker and monitor tasks
                 for task in all_tasks:
                     task.cancel()
                 
@@ -203,9 +260,49 @@ class ParserManager(QObject):
             logger.error(f"Critical error in main task: {str(e)}", exc_info=True)
         finally:
             logger.info("_main_task finished.")
-            # Emit parsing finished signal when main task is actually done
-            if not self._stop_event.is_set():
+            # Close shared session AFTER gather — all workers are stopped at this point
+            self._shared_downloader_session = None
+            try:
+                shared_dl_session.close()
+                logger.info("Shared downloader session closed.")
+            except Exception as e:
+                logger.error(f"Error closing shared downloader session: {e}", exc_info=True)
+            # Emit only when parsing completed naturally (not stopped by user)
+            if self._completed_naturally:
                 self.parsing_finished.emit()
+
+    async def _completion_monitor(self) -> None:
+        """Monitors queue emptiness and triggers natural completion when all work is done.
+
+        Polls every second. When all three queues are empty AND pages_processed > 0
+        AND no activity has occurred for IDLE_COMPLETION_TIMEOUT_SECONDS, sets the
+        _stop_event via _completed_naturally=True, causing _main_task.finally to emit
+        parsing_finished.
+        """
+        while not self._stop_event.is_set():
+            await asyncio.sleep(1.0)
+            if self._stop_event.is_set():
+                break
+            if self.is_paused:
+                continue
+            if self.stats["pages_processed"] == 0:
+                continue  # Parsing hasn't started yet, no work to complete
+            all_empty = (
+                self.url_queue.empty() and
+                self.download_queue.empty() and
+                self.quarantine_queue.empty()
+            )
+            if all_empty:
+                idle_duration = time.time() - self._last_activity_time
+                if idle_duration >= K.IDLE_COMPLETION_TIMEOUT_SECONDS:
+                    logger.info(
+                        f"All queues idle for {idle_duration:.1f}s — triggering natural completion."
+                    )
+                    self.status_updated.emit("Parsing complete.")
+                    self._completed_naturally = True
+                    self._stop_event.set()
+                    return
+        logger.info("Completion monitor finished.")
 
     async def _handle_empty_queues_and_quarantine(self) -> bool:
         if not (self.download_queue.empty() and self.url_queue.empty() and self.stats["pages_processed"] > 0):
@@ -218,15 +315,23 @@ class ParserManager(QObject):
             for _ in range(items_to_process):
                 try:
                     item = await self.quarantine_queue.get()
+                    # Drop items that have exhausted their retry budget (prevents infinite loop)
+                    if item.get("quarantine_retries", 0) >= K.QUARANTINE_MAX_ITEM_RETRIES:
+                        logger.debug(f"Dropping quarantined URL after max retries: {item['url']}")
+                        self.quarantine_queue.task_done()
+                        continue
+                    item["quarantine_retries"] = item.get("quarantine_retries", 0) + 1
                     domain = urlparse(item["url"]).netloc
                     if domain in self.quarantined_domains:
-                        self.quarantined_domains.remove(domain)
-                        if domain in self.domain_health: self.domain_health[domain]["failures"] = 0
+                        self.quarantined_domains.discard(domain)
+                        if domain in self.domain_health:
+                            self.domain_health[domain]["failures"] = 0
                     await self.download_queue.put(item)
                     self.quarantine_queue.task_done()
-                except asyncio.QueueEmpty: break
+                except asyncio.QueueEmpty:
+                    break
             return True
-        logger.debug("All queues empty, waiting for more work or stop signal.")
+        logger.debug("All queues empty, waiting for completion signal.")
         return False
 
     async def _get_next_url_to_parse(self) -> Optional[Tuple[str, int, str, Dict[str, Any]]]:
@@ -302,6 +407,7 @@ class ParserManager(QObject):
                 await self.url_queue.put(abs_disc_url, depth + 1, url, new_ctx)
         
         self.stats["pages_processed"] += 1
+        self._last_activity_time = time.time()  # Track last activity for idle detection
         self.status_updated.emit(f"Processed: {url}")
 
     async def _parser_worker(self, session):
@@ -403,7 +509,7 @@ class ParserManager(QObject):
                 domain = urlparse(url).netloc
                 if domain in self.quarantined_domains:
                     await self.quarantine_queue.put(media_item)
-                    self.download_queue.task_done(); continue
+                    continue  # task_done() is safely handled by the `finally` block
                 if domain not in self.domain_health: self.domain_health[domain] = {"failures": 0, "total": 0}
                 domain_state = self.domain_health[domain]
                 is_probation = domain_state["failures"] > 0
@@ -414,6 +520,8 @@ class ParserManager(QObject):
                 downloader = MediaDownloader(
                     url=url, filepath=filepath_from_queue, settings=self.settings,
                     media_type=media_item["media_type"], source_url=media_item["source_url"],
+                    shared_session=self._shared_downloader_session,  # Reuse shared session
+                    stop_event=self._stop_event
                 )
                 downloader.set_progress_callback(self._update_current_progress)
                 base_filename_for_status = os.path.basename(filepath_from_queue)
@@ -424,16 +532,25 @@ class ParserManager(QObject):
                 )
                 
                 domain_state["total"] += 1
+                self._last_activity_time = time.time()  # Track last activity for idle detection
                 if result["success"]:
                     self.stats["files_downloaded"] += 1
                     if domain_state["failures"] > 0: domain_state["failures"] = max(0, domain_state["failures"] - 1)
                 else:
                     self.stats["files_skipped"] += 1
-                    domain_state["failures"] += 1
-                    logger.warning(f"Failed to download file: {url} - {result['error']}")
-                    if domain_state["failures"] >= K.DEFAULT_QUARANTINE_FAILURE_THRESHOLD:
-                        self.quarantined_domains.add(domain)
-                        logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} failures.")
+                    err_msg = str(result.get('error', ''))
+                    logger.warning(f"Failed to download file: {url} - {err_msg}")
+                    
+                    # Only penalize domain health for genuine network/server errors
+                    is_content_skip = any(skip_reason in err_msg.lower() for skip_reason in [
+                        "file too small", "already exists", "invalid extension", "unsupported"
+                    ])
+                    
+                    if not is_content_skip:
+                        domain_state["failures"] += 1
+                        if domain_state["failures"] >= K.DEFAULT_QUARANTINE_FAILURE_THRESHOLD:
+                            self.quarantined_domains.add(domain)
+                            logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} network failures.")
             except Exception as err:
                 logger.error(f"Error in downloader_worker for {media_item.get('url', 'Unknown URL')}: {str(err)}", exc_info=True)
             finally:
@@ -448,13 +565,25 @@ class ParserManager(QObject):
 
     def stop_parsing(self) -> None:
         logger.info("Attempting to stop parsing...")
-        self.is_running = False; self._stop_event.set(); self._pause_event.set()
+        self.is_running = False
+        self._stop_event.set()
+        self._pause_event.set()  # Unblock workers waiting on pause
         try:
-            while not self.download_queue.empty(): self.download_queue.get_nowait()
-            while not self.quarantine_queue.empty(): self.quarantine_queue.get_nowait()
-            self.url_queue = PriorityURLQueue() 
-            logger.info("Queues cleared.")
-        except Exception as e: logger.error(f"Error clearing queues: {str(e)}", exc_info=True)
+            while not self.download_queue.empty():
+                self.download_queue.get_nowait()
+            while not self.quarantine_queue.empty():
+                self.quarantine_queue.get_nowait()
+            # Clear PriorityURLQueue safely WITHOUT replacing the object reference.
+            # Replacing would abandon workers blocked in url_queue.get() -> _not_empty.wait()
+            # on the OLD Event, leaving them as orphaned coroutines indefinitely.
+            # Instead: clear the heap in-place and signal the Event to wake all waiters.
+            if hasattr(self.url_queue, '_queue'):
+                self.url_queue._queue.clear()
+            if hasattr(self.url_queue, '_not_empty'):
+                self.url_queue._not_empty.set()  # Wake blocked workers so they can exit
+            logger.info("Queues cleared safely.")
+        except Exception as e:
+            logger.error(f"Error clearing queues: {str(e)}", exc_info=True)
         logger.info("Parsing stop procedure initiated. Tasks will shut down.")
 
     def _monitor_progress(self) -> None:

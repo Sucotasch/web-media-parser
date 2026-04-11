@@ -1,0 +1,18 @@
+# Web Media Parser Domain Blocklist
+# Add domains to block here, one per line.
+# Lines starting with # are comments.
+
+# Example domains (uncomment to block)
+# ads.example.com
+# tracker.example.com
+
+# Well-known ad/tracking domains
+doubleclick.net
+google-analytics.com
+googletagmanager.com
+quantserve.com
+scorecardresearch.com
+zedo.com
+amazon-adsystem.com
+taboola.com
+outbrain.com

@@ -29,6 +29,9 @@ from PySide6.QtCore import Qt
 import json
 import os
 import sys
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsDialog(QDialog):
@@ -569,6 +572,21 @@ class SettingsDialog(QDialog):
 
         return settings
 
+    def _get_settings_path(self):
+        """
+        Get the persistent path for settings.json.
+        In frozen mode (EXE), returns the path next to the executable.
+        In dev mode, returns the path in the project root.
+        """
+        if getattr(sys, 'frozen', False):
+            # If frozen, save next to the actual .exe file, not in temp _MEIPASS
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            # If in dev, save in the project root (3 levels up from this file)
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            
+        return os.path.join(base_dir, "settings.json")
+
     def save_settings(self):
         """
         Save settings to file and remember last used download directory
@@ -578,12 +596,16 @@ class SettingsDialog(QDialog):
         if hasattr(self.parent(), "get_download_directory"):
             self.settings["last_download_dir"] = self.parent().get_download_directory()
         
-        # Save settings in the same directory as the executable
-        settings_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "settings.json")
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(self.settings, f, indent=4)
+        settings_path = self._get_settings_path()
+        try:
+            # Ensure directory exists (though for EXE dir it always should)
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=4)
+            logger.info(f"Saved settings to {settings_path}")
+        except Exception as e:
+            logger.error(f"Error saving settings to {settings_path}: {e}")
             
-        print(f"[SettingsDialog] Saved settings to {settings_path}")
         self.accept()
 
     def reset_settings(self):
@@ -595,65 +617,29 @@ class SettingsDialog(QDialog):
 
     def load_settings(self):
         """
-        Load settings from file or use defaults, including last used download directory
+        Load settings from file or use defaults, including last used download directory.
+        Unifies path logic for consistency.
         """
-        # Load settings from the same directory as the executable
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        settings_path = os.path.join(base_dir, "settings.json")
+        settings_path = self._get_settings_path()
         
-        # For PyInstaller bundle
-        if hasattr(sys, "_MEIPASS"):
-            # First try to find settings in the same directory as the exe
-            exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else base_dir
-            exe_settings_path = os.path.join(exe_dir, "settings.json")
-            if os.path.exists(exe_settings_path):
-                settings_path = exe_settings_path
-                print(f"[SettingsDialog] Using settings from executable directory: {settings_path}")
-        
-        # Also check the old location for backward compatibility
-        old_settings_path = os.path.join(os.path.expanduser("~"), ".web_media_parser", "settings.json")
-        
-        # First try to load from main location
+        # Try to load from main location
         if os.path.exists(settings_path):
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                print(f"[SettingsDialog] Loaded settings from {settings_path}")
+                logger.info(f"Loaded settings from {settings_path}")
                 return settings
             except Exception as e:
-                print(f"[SettingsDialog] Error loading settings from {settings_path}: {str(e)}")
+                logger.error(f"Error loading settings from {settings_path}: {str(e)}")
         
-        # Then try old location for backward compatibility
-        if os.path.exists(old_settings_path):
-            try:
-                with open(old_settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-                print(f"[SettingsDialog] Loaded settings from old location {old_settings_path}")
-                # Save to new location for future use
-                try:
-                    with open(settings_path, "w", encoding="utf-8") as f:
-                        json.dump(settings, f, indent=4)
-                    print(f"[SettingsDialog] Migrated settings to new location {settings_path}")
-                except Exception as e:
-                    print(f"[SettingsDialog] Error migrating settings: {str(e)}")
-                return settings
-            except Exception as e:
-                print(f"[SettingsDialog] Error loading settings from old location: {str(e)}")
-        
-        # If no settings file exists anywhere, create default one
+        # If no settings file exists, return defaults
+        logger.info(f"Settings file not found at {settings_path}, using defaults.")
         default_settings = self.default_settings.copy()
         
-        # Set default min_video_size to 1000 to ensure video filtering works
-        default_settings["min_video_size"] = 1000
-        
-        # Save default settings
-        try:
-            with open(settings_path, "w", encoding="utf-8") as f:
-                json.dump(default_settings, f, indent=4)
-            print(f"[SettingsDialog] Created new settings file with defaults at {settings_path}")
-        except Exception as e:
-            print(f"[SettingsDialog] Error creating default settings: {str(e)}")
-        
+        # Ensure some critical defaults are set
+        if "min_video_size" not in default_settings:
+            default_settings["min_video_size"] = 1000
+            
         return default_settings
 
     def get_last_download_dir(self):

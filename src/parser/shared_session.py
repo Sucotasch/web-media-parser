@@ -60,23 +60,26 @@ class AsyncClientManager:
     def _get_default_headers(self) -> Dict[str, str]:
         """
         Get default request headers with browser simulation.
+        Modern headers (Chrome 130+) to better emulate real users.
         """
         return {
             "User-Agent": self.settings.get(
                 "user_agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             ),
-            "Accept-Language": self.settings.get("accept_language", "en-US,en;q=0.9"),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-            # Let aiohttp handle Accept-Encoding based on installed libraries (like brotli)
-            # "Accept-Encoding": "gzip, deflate, br" if HAS_BROTLI else "gzip, deflate",
+            "Accept-Language": self.settings.get("accept_language", "en-US,en;q=0.9,ru;q=0.8"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Cache-Control": "max-age=0",
+            "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
-            "DNT": "1", # Do Not Track
+            "DNT": "1",
+            "Connection": "keep-alive",
         }
 
     async def get_session(self) -> aiohttp.ClientSession:

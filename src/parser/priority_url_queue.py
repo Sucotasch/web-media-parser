@@ -38,9 +38,19 @@ class PriorityURLQueue:
         self._url_scores: Dict[str, float] = {}
         self._domain_scores: Dict[str, float] = {}
         self._url_patterns: Dict[str, int] = {}
+        # NOTE: _lock and _not_empty are asyncio primitives.
+        # They are created lazily in reset() which is called from
+        # ParserManager.start_parsing() after the event loop is running.
+        self._lock = None
+        self._not_empty = None
+        self._waiters = []
+
+    def reset_async_primitives(self):
+        """(Re)create asyncio primitives. Must be called from within a running event loop."""
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
         self._waiters = []
+        self._queue.clear()
 
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL"""

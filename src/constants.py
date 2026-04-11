@@ -70,6 +70,12 @@ LOG_CLEAR_HISTORY_ON_START = False # If true, clears log window every time app s
 # Max items to process from quarantine queue in one go
 QUARANTINE_BATCH_PROCESS_SIZE = 10
 
+# Maximum number of times a single item can cycle through quarantine before being dropped
+QUARANTINE_MAX_ITEM_RETRIES = 1
+
+# Seconds of full queue inactivity before auto-completing the parsing task
+IDLE_COMPLETION_TIMEOUT_SECONDS = 5
+
 # Max threads for multi-threaded download of a single file (hard cap)
 MAX_THREADS_PER_FILE_CAP = 8
 
