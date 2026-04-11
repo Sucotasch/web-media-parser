@@ -22,48 +22,35 @@ logger = logging.getLogger(__name__)
 # WRITE_BUFFER_SIZE is now in K.WRITE_BUFFER_SIZE
 
 
-class _NullCookieJar(RequestsCookieJar):
-    """Cookie jar that silently discards all Set-Cookie headers from responses.
-
-    Used with the shared download session to prevent cross-domain cookie
-    contamination when the same session is reused across many different sites.
-    All cookies sent by remote servers are dropped; none are stored or re-sent.
-    """
-    def set_cookie(self, cookie): pass   # Discard all incoming cookies
-    def update(self, other): pass        # Prevent any external cookie merge
-
-
 def create_shared_downloader_session(settings: dict) -> requests.Session:
     """Create a single shared requests.Session for all MediaDownloader instances.
 
-    One session enables TCP/TLS keep-alive connection reuse across file downloads
-    and eliminates the per-file HTTPAdapter/Retry allocation overhead.
-    Per-file headers (Accept, Referer) are passed per-request, not at session
-    level, to avoid cross-file contamination.
-    A _NullCookieJar prevents cross-domain cookie leakage.
+    One session enables TCP/TLS keep-alive connection reuse across file downloads.
+    INTERNAL RETRIES ARE DISABLED (total=0) to ensure the application Stop button
+    works immediately by preventing urllib3 from hanging in long retry loops.
     """
     session = requests.Session()
-    session.cookies = _NullCookieJar()  # Prevent cross-domain cookie leakage
+    # Use standard cookie jar instead of _NullCookieJar to allow site-specific cookies (e.g. Age Verification)
+    # Standard CookieJar handles domain scoping automatically.
+    # Disable internal retries to allow immediate shutdown per worker check
     retry = Retry(
-        total=settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT),
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"],
+        total=0,
+        connect=None,
+        read=None,
+        redirect=None,
+        status=None
     )
     # Larger pool to support many concurrent download workers
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     # Only stable, file-invariant headers are set at session level.
-    # Accept and Referer vary per file and are sent per-request instead.
     session.headers.update({
         "User-Agent": settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
         "Accept-Language": settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
     })
     logger.info(
-        "Shared downloader session created "
-        f"(pool_connections=20, pool_maxsize=50, "
-        f"retries={settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)})."
+        "Shared downloader session created with 0 internal retries (Immediate-Stop enabled)."
     )
     return session
 

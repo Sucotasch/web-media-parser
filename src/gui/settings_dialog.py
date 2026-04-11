@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import logging
+import src.constants as K
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,21 @@ class SettingsDialog(QDialog):
             "Automatically follow JavaScript redirects by analyzing page content"
         )
         parser_grid.addWidget(self.bypass_js_redirects_check, 10, 1)
+
+        # Gateway & Visibility Bypass
+        parser_grid.addWidget(QLabel("Filter Hidden Links:"), 11, 0)
+        self.filter_hidden_links_check = QCheckBox()
+        self.filter_hidden_links_check.setToolTip(
+            "Ignore invisible links to avoid bot-traps and honeypots"
+        )
+        parser_grid.addWidget(self.filter_hidden_links_check, 11, 1)
+
+        parser_grid.addWidget(QLabel("Bypass Content Gateways:"), 12, 0)
+        self.bypass_gateways_check = QCheckBox()
+        self.bypass_gateways_check.setToolTip(
+            "Automatically click 'I Agree' or '18+' on confirmation pages and overlays"
+        )
+        parser_grid.addWidget(self.bypass_gateways_check, 12, 1)
 
         parser_layout.addWidget(parser_group)
 
@@ -474,18 +490,32 @@ class SettingsDialog(QDialog):
         self.stay_in_domain_check.setChecked(self.settings.get("stay_in_domain", True))
         self.process_js_check.setChecked(self.settings.get("process_js", True))
         self.process_dynamic_check.setChecked(
-            self.settings.get("process_dynamic", True)
+            self.settings.get(K.SETTING_PROCESS_DYNAMIC, True)
+        )
+        self.bypass_cookie_consent_check.setChecked(
+            self.settings.get(
+                K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT
+            )
+        )
+        self.bypass_js_redirects_check.setChecked(
+            self.settings.get(
+                K.SETTING_BYPASS_JS_REDIRECTS, K.DEFAULT_BYPASS_JS_REDIRECTS
+            )
+        )
+        self.use_patterns_check.setChecked(
+            self.settings.get(K.SETTING_USE_PATTERNS, K.DEFAULT_USE_PATTERNS)
+        )
+        self.filter_hidden_links_check.setChecked(
+            self.settings.get(K.SETTING_FILTER_HIDDEN_LINKS, K.DEFAULT_FILTER_HIDDEN_LINKS)
+        )
+        self.bypass_gateways_check.setChecked(
+            self.settings.get(K.SETTING_BYPASS_GATEWAYS, K.DEFAULT_BYPASS_GATEWAYS)
         )
         
         # Pattern settings
-        self.use_patterns_check.setChecked(self.settings.get("use_patterns", True))
-        custom_pattern_path = self.settings.get("custom_pattern_path", "")
+        custom_pattern_path = self.settings.get(K.SETTING_CUSTOM_PATTERN_PATH, "")
         if custom_pattern_path:
             self.custom_pattern_edit.setText(custom_pattern_path)
-            
-        # Bypass settings
-        self.bypass_cookie_consent_check.setChecked(self.settings.get("bypass_cookie_consent", True))
-        self.bypass_js_redirects_check.setChecked(self.settings.get("bypass_js_redirects", True))
             
         # Update pattern info
         self.update_pattern_info(custom_pattern_path)
@@ -521,26 +551,20 @@ class SettingsDialog(QDialog):
         Get settings from UI elements
         """
         settings = {}
-
+        
         # Parser settings
         settings["search_depth"] = self.search_depth_spin.value()
         settings["page_limit"] = self.page_limit_spin.value()
         settings["page_timeout"] = self.page_timeout_spin.value()
         settings["stay_in_domain"] = self.stay_in_domain_check.isChecked()
-        settings["process_js"] = self.process_js_check.isChecked()
-        settings["process_dynamic"] = self.process_dynamic_check.isChecked()
-        
-        # Pattern settings
-        settings["use_patterns"] = self.use_patterns_check.isChecked()
-        custom_pattern_path = self.custom_pattern_edit.text().strip()
-        if custom_pattern_path:
-            settings["custom_pattern_path"] = custom_pattern_path
-        else:
-            settings["custom_pattern_path"] = None
-            
-        # Bypass settings
-        settings["bypass_cookie_consent"] = self.bypass_cookie_consent_check.isChecked()
-        settings["bypass_js_redirects"] = self.bypass_js_redirects_check.isChecked()
+        settings[K.SETTING_PROCESS_JS] = self.process_js_check.isChecked()
+        settings[K.SETTING_PROCESS_DYNAMIC] = self.process_dynamic_check.isChecked()
+        settings[K.SETTING_BYPASS_COOKIE_CONSENT] = self.bypass_cookie_consent_check.isChecked()
+        settings[K.SETTING_BYPASS_JS_REDIRECTS] = self.bypass_js_redirects_check.isChecked()
+        settings[K.SETTING_USE_PATTERNS] = self.use_patterns_check.isChecked()
+        settings[K.SETTING_FILTER_HIDDEN_LINKS] = self.filter_hidden_links_check.isChecked()
+        settings[K.SETTING_BYPASS_GATEWAYS] = self.bypass_gateways_check.isChecked()
+        settings[K.SETTING_CUSTOM_PATTERN_PATH] = self.custom_pattern_edit.text() if self.custom_pattern_edit.text() else ""
 
         # Filters
         settings["min_image_width"] = self.min_image_width_spin.value()

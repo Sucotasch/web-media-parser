@@ -22,7 +22,7 @@ try:
 except ImportError:
     HAS_BROTLI = False
 
-from src.parser.utils import is_image_url, is_media_url, is_valid_url, get_domain, is_same_domain
+from src.parser.utils import is_image_url, is_media_url, is_valid_url, get_domain, is_same_domain, normalize_url
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
 
@@ -95,6 +95,8 @@ class WebpageParser:
         self.media_files: List[Tuple[str, str, Dict[str, Any]]] = []
         self._mime_type: Optional[str] = None
         self.js_redirect_count = 0 
+        self._sync_session = None # Lazy-loaded persistent session for fallback
+        self._bypass_attempts = 0 # Track bypass attempts to prevent loops
 
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
@@ -128,13 +130,14 @@ class WebpageParser:
                 
                 cookies = {}
                 if self.settings.get(K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT):
-                    if attempt > 0:
-                        consent_cookies = { 
-                            'cookieconsent_status': 'dismiss', 'gdpr_accepted': 'true', 
-                            'cookies_accepted': 'true', 'euconsent': 'true', 'CookieConsent': 'true',
-                            'cc_cookie_accept': '1', 'cookie_consent': 'true', 'privacy_policy_accepted': 'true'
-                        }
-                        cookies.update(consent_cookies)
+                    consent_cookies = { 
+                        'cookieconsent_status': 'dismiss', 'gdpr_accepted': 'true', 
+                        'cookies_accepted': 'true', 'euconsent': 'true', 'CookieConsent': 'true',
+                        'cc_cookie_accept': '1', 'cookie_consent': 'true', 'privacy_policy_accepted': 'true',
+                        # Pre-emptive strike for age gates and gateways
+                        'age_verified': '1', 'vantage': '1', 'over18': '1', 'nw': '1', 'nsfw': '1', 'terms': '1'
+                    }
+                    cookies.update(consent_cookies)
                 
                 page_timeout_val = self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT)
                 # VERY Aggressive connect timeout (5 secs max), so we don't hang queues
@@ -178,14 +181,17 @@ class WebpageParser:
                 logger.info(f"Using sync fallback (requests) for {self.url}")
                 loop = asyncio.get_event_loop()
                 
+                # Capture headers to pass into the synchronous call
+                fb_headers = {"User-Agent": K.DEFAULT_USER_AGENT}
+                if request_specific_headers.get("Referer"):
+                    fb_headers["Referer"] = request_specific_headers["Referer"]
+                
                 def _sync_fetch():
-                    import requests
-                    fb_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"}
-                    if request_specific_headers.get("Referer"):
-                        fb_headers["Referer"] = request_specific_headers["Referer"]
+                    session = self._get_sync_session()
                     # Aggressive timeout for sync to prevent blocking thread pool
-                    fb_timeout = min(5, self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT))
-                    return requests.get(self.url, headers=fb_headers, timeout=fb_timeout)
+                    fb_timeout = 10 
+                    resp = session.get(self.url, headers=fb_headers, timeout=fb_timeout, allow_redirects=True, verify=False)
+                    return resp
 
                 resp = await loop.run_in_executor(None, _sync_fetch)
                 http_status = resp.status_code
@@ -193,6 +199,7 @@ class WebpageParser:
                     return None, K.PARSER_HTTP_ERROR_4XX if http_status < 500 else K.PARSER_HTTP_ERROR_5XX, f"HTTP {http_status} via fallback", http_status
                 content_bytes = resp.content
             except Exception as fb_err:
+                logger.error(f"Fallback failed for {self.url}: {fb_err}")
                 return None, K.PARSER_NETWORK_ERROR, f"Fallback failed: {str(fb_err)}", http_status
 
         if not content_bytes:
@@ -248,6 +255,69 @@ class WebpageParser:
     def _is_cdn_url(self, url: str, media_type: str) -> bool:
         patterns = self.CDN_PATTERNS.get(media_type, [])
         return any(re.search(pattern, url, re.IGNORECASE) for pattern in patterns)
+
+    def _get_sync_session(self):
+        """Lazy-loader for a persistent sync session to maintain cookies during bypass"""
+        if self._sync_session is None:
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            
+            self._sync_session = requests.Session()
+            # Disable internal retries to allow immediate termination via UI Stop button 
+            adapter = HTTPAdapter(max_retries=Retry(total=0, connect=None, read=None, redirect=None, status=None))
+            self._sync_session.mount("http://", adapter)
+            self._sync_session.mount("https://", adapter)
+            # Pre-set standard headers
+            self._sync_session.headers.update({"User-Agent": K.DEFAULT_USER_AGENT})
+            
+            # Explicitly pre-set cookies for known major sites to reduce friction
+            if "livejournal.com" in self.domain:
+                self._sync_session.cookies.set("adult_explicit", "1", domain=".livejournal.com", path="/")
+                self._sync_session.cookies.set("adult_view", "1", domain=".livejournal.com", path="/")
+                logger.debug("Pre-injected adult cookies for LiveJournal")
+
+        return self._sync_session
+
+    async def _execute_bypass(self, action: Dict[str, Any]) -> bool:
+        """Universal utility to 'click' a gateway button, supporting GET/POST and Referer"""
+        target_url = action.get('url')
+        if not target_url: return False
+        
+        # Ensure absolute URL
+        if not target_url.startswith(("http://", "https://")):
+            target_url = urljoin(self.url, target_url)
+
+        method = action.get('method', 'GET').upper()
+        form_tag = action.get('form_tag')
+        
+        # Prepare headers (Crucial: Include Referer to satisfy security checks)
+        headers = {"User-Agent": K.DEFAULT_USER_AGENT, "Referer": self.url}
+        
+        # Collect data if it's a form
+        data = {}
+        if form_tag:
+            for inp in form_tag.find_all('input'):
+                name = inp.get('name')
+                val = inp.get('value', '')
+                if name: data[name] = val
+        
+        logger.info(f"Executing bypass ({method}): {target_url} (Referer: {self.url})")
+        
+        try:
+            loop = asyncio.get_event_loop()
+            def _sync_bypass():
+                session = self._get_sync_session()
+                if method == 'POST':
+                    resp = session.post(target_url, data=data, headers=headers, timeout=10, verify=False, allow_redirects=True)
+                else:
+                    resp = session.get(target_url, headers=headers, timeout=10, verify=False, allow_redirects=True)
+                return resp.status_code < 400
+            
+            return await loop.run_in_executor(None, _sync_bypass)
+        except Exception as e:
+            logger.debug(f"Universal bypass execution failed: {e}")
+            return False
 
     def _get_video_platform(self, url: str) -> Optional[str]:
         parsed_url = urlparse(url.lower()); domain = parsed_url.netloc; path = parsed_url.path
@@ -446,9 +516,14 @@ class WebpageParser:
 
     async def _extract_links(self, soup: BeautifulSoup) -> None: 
         found = 0
+        filter_hidden = self.settings.get(K.SETTING_FILTER_HIDDEN_LINKS, K.DEFAULT_FILTER_HIDDEN_LINKS)
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
             if not href or href.startswith(("javascript:", "#", "mailto:", "tel:")): continue
+            
+            # Bot-trap defense
+            if filter_hidden and not self._is_element_visible(a_tag):
+                continue
             abs_url = urljoin(self.url, href)
             if abs_url.startswith(("http://", "https://")):
                 self.links[abs_url] = {'from_image': False, 'element': 'a', 'text': a_tag.get_text(strip=True, separator=" ")[:100]} 
@@ -462,33 +537,211 @@ class WebpageParser:
                 found += 1
         logger.info(f"Found {found} valid links on {self.url}")
 
-    async def parse(self) -> Tuple[Dict[str, Dict[str, Any]], List[Tuple[str, str, Dict[str, Any]]], Optional[str], str, Optional[int]]:
+    def _is_element_visible(self, element: Any) -> bool:
+        """Heuristic to check if an element is hidden via CSS (honeypot/bot-trap)"""
+        hidden_keywords = K.VISIBILITY_HIDDEN_KEYWORDS
+        hidden_classes = K.VISIBILITY_HIDDEN_CLASSES
+        
+        # Check attributes
+        if element.get("hidden") is not None or element.get("aria-hidden") == "true":
+            return False
+            
+        tags_to_check = [element]
+        if element.parent:
+            tags_to_check.append(element.parent)
+            
+        for tag in tags_to_check:
+            # Check classes
+            classes = tag.get("class", [])
+            if isinstance(classes, list):
+                if any(c in hidden_classes for c in classes):
+                    return False
+            elif isinstance(classes, str): # sometimes class is a string
+                if any(c in classes for c in hidden_classes):
+                    return False
+            
+            # Check inline styles
+            style = str(tag.get("style", "")).lower()
+            if style and any(kw in style for kw in hidden_keywords):
+                return False
+                
+        return True
+
+    def _is_significant_media(self, media_type: str, url: str, attrs: Dict[str, Any]) -> bool:
+        """Heuristic to filter out icons, avatars, and UI elements"""
+        url_lower = url.lower()
+        
+        # 1. Filter by extension
+        if url_lower.endswith(('.svg', '.ico', '.cur')):
+            return False
+            
+        # 2. Filter by common noise patterns in URL
+        ignore_patterns = K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS
+        if any(p in url_lower for p in ignore_patterns):
+            return False
+            
+        # 3. Filter by explicit dimensions if present in HTML
+        try:
+            width = int(attrs.get("width", 1000))
+            height = int(attrs.get("height", 1000))
+            if width < K.SIGNIFICANT_MEDIA_MIN_DIMENSION or height < K.SIGNIFICANT_MEDIA_MIN_DIMENSION:
+                return False
+        except (ValueError, TypeError):
+            pass
+            
+        return True
+
+    async def _handle_gateways(self, soup) -> Optional[Dict[str, Any]]:
+        """Detect and return structured gateway bypass action (link or form)"""
+        # Detection trigger logic:
+        # A page is suspicious if it has < 5 images AND contains gateway keywords or overlays
+        
+        text_content = soup.get_text().lower()
+        overlay_keywords = [
+            "confirm your age", "18 years old", "adult content", "войти", "подтвердите", "18 лет",
+            "proceed", "leave", "enter", "over 18", "agree", "confirm", "i agree"
+        ]
+        is_suspicious = len(self.media_files) < 5 or any(kw in text_content for kw in overlay_keywords)
+        
+        if not is_suspicious:
+            return None
+            
+        logger.debug(f"Potential gateway detected on: {self.url} (Media count: {len(self.media_files)})")
+            
+        patterns = [p.lower() for p in K.GATEWAY_TEXT_PATTERNS]
+        keyword_patterns = ["agree", "confirm", "enter", "over18", "accept", "continue", "verify", "18"]
+        blacklist_patterns = ["legal", "terms", "tos", "policy", "agreement", "rules", "copyright", "privacy", "help", "about"]
+        
+        # Search for buttons or links
+        candidates = []
+        for tag in soup.find_all(['a', 'button', 'input']):
+            if tag.name == 'input' and tag.get('type') != 'submit':
+                continue
+                
+            text = tag.get_text(separator=" ", strip=True).lower()
+            if not text and tag.get('value'):
+                text = str(tag.get('value')).lower()
+                
+            tag_id = str(tag.get('id', '')).lower()
+            tag_classes = " ".join(tag.get('class', [])).lower() if isinstance(tag.get('class'), list) else str(tag.get('class', '')).lower()
+            
+            # Check 1: Text content match
+            text_match = any(p in text for p in patterns)
+            
+            # Check 2: ID or Class keyword match
+            attr_match = any(kw in tag_id or kw in tag_classes for kw in keyword_patterns)
+            
+            if text_match or attr_match:
+                href = None
+                method = "GET"
+                form_tag = None
+                
+                if tag.name == 'a' and tag.get('href'):
+                    href = tag.get('href')
+                else:
+                    # Check for form parent
+                    parent_form = tag.find_parent('form')
+                    if parent_form:
+                        href = parent_form.get('action') or self.url
+                        method = parent_form.get('method', 'GET').upper()
+                        form_tag = parent_form
+                
+                # Check for JS onClick if still no href
+                if not href and tag.get('onclick'):
+                    onclick = tag.get('onclick')
+                    url_match = re.search(r"['\"](?P<url>/[^'\"]+|https?://[^'\"]+)['\"]", onclick)
+                    if url_match: href = url_match.group("url")
+
+                if href:
+                    href_lower = href.lower()
+                    # Check against blacklist (ignore TOS/Legal pages)
+                    is_blacklisted = any(bp in text or bp in href_lower for bp in blacklist_patterns)
+                    
+                    if is_blacklisted:
+                        continue
+
+                    score = 0
+                    if any(p == text for p in patterns if len(p) > 5): score += 100
+                    elif text_match: score += 20
+                    if attr_match: score += 10
+                    
+                    candidates.append({
+                        "score": score,
+                        "url": href,
+                        "method": method,
+                        "form_tag": form_tag,
+                        "text": text[:30]
+                    })
+
+        if candidates:
+            # Sort by score descending and return the best one
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            best = candidates[0]
+            logger.info(f"SUCCESS: Selecting gateway {best['method']} action (Score {best['score']}): {best['url']}")
+            return best
+            
+        return None
+
+    async def parse(self) -> Tuple[Dict[str, Dict[str, Any]], List[Tuple[str, str, Dict[str, Any]]], Optional[str], str, Optional[int], Optional[Dict[str, str]]]:
         """
         Parse webpage and extract media files and links.
-        Returns: (links, media_files, error_status, error_message, http_status_code)
+        Returns: (links, media_files, error_status, error_message, http_status_code, cookies)
         """
-        self.js_redirect_count = 0 
+        if not hasattr(self, '_bypass_attempts'):
+            self._bypass_attempts = 0 
+
         content, error_status, error_message, http_status_code = await self._get_content()
 
         if error_status: 
-            return {}, [], error_status, error_message, http_status_code
+            return {}, [], error_status, error_message, http_status_code, None
         
         if not content: 
-            return {}, [], K.PARSER_UNKNOWN_ERROR, "No content fetched and no specific error reported.", http_status_code
+            return {}, [], K.PARSER_UNKNOWN_ERROR, "No content fetched and no specific error reported.", http_status_code, None
 
         try:
             soup = BeautifulSoup(content, "lxml")
-            await self._extract_images(soup) 
-            await self._extract_videos(soup)
-            await self._extract_links(soup)
-            if self.process_js: # Changed from self.process_dynamic
-                await self._handle_dynamic_content(soup)
             
-            return self.links, self.media_files, K.PARSER_SUCCESS, "Successfully parsed.", http_status_code
+            # 1. Image extraction
+            await self._extract_images(soup) 
+            
+            # 2. Video extraction
+            await self._extract_videos(soup)
+
+            # 3. Gateway handling (Dynamic Bypass)
+            # Prevent infinite loops: only 3 attempts per URL
+            if self._bypass_attempts < 3:
+                gateway_action = await self._handle_gateways(soup)
+                if gateway_action:
+                    self._bypass_attempts += 1
+                    logger.info(f"Gateway Detected. Bypassing attempt {self._bypass_attempts} via: {gateway_action['url']}")
+                    
+                    success = await self._execute_bypass(gateway_action)
+                    if success:
+                        logger.info(f"Cookies updated. RE-FETCHING original content: {self.url}")
+                        # Reset discovered content before re-fetching
+                        self.media_files.clear()
+                        self.links.clear()
+                        # Re-parse the same URL with updated session cookies
+                        return await self.parse()
+            elif self._bypass_attempts >= 3:
+                logger.warning(f"Maximum bypass attempts reached for {self.url}. Proceeding with current content.")
+
+            # 4. Link extraction
+            await self._extract_links(soup)
+            
+            if self.process_js: 
+                await self._handle_dynamic_content(soup)
+
+            # 5. Extract cookies for the downloader (if any were set during bypass/fallback)
+            cookies = None
+            if self._sync_session:
+                cookies = self._sync_session.cookies.get_dict()
+
+            return self.links, self.media_files, K.PARSER_SUCCESS, "Successfully parsed.", http_status_code, cookies
         except Exception as e:
             msg = f"Error during parsing HTML content of {self.url}: {str(e)}"
-            logger.error(msg, exc_info=True)
-            return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code
+            logger.error(msg, exc_info=False)
+            return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code, None
 
 
     async def _handle_dynamic_content(self, soup: BeautifulSoup) -> None:

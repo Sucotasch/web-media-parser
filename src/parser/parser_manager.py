@@ -359,14 +359,20 @@ class ParserManager(QObject):
             p = WebpageParser(
                 url=url, settings=self.settings,
                 process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
-                # process_dynamic argument removed
                 external_session=session, pattern_manager=self.pattern_manager
             )
             parse_result = await p.parse()
-            links_found = parse_result[0]  # links dict
-            media_files_found = parse_result[1]  # media files list
-            # parse_result[2] is error_status, parse_result[3] is error_message, parse_result[4] is http_status_code
-            if parse_result[2] != K.PARSER_SUCCESS:  # If there's an error status
+            links_found = parse_result[0]
+            media_files_found = parse_result[1]
+            
+            # Extract and sync cookies to the shared downloader session
+            cookies = parse_result[5]
+            if cookies and self._shared_downloader_session:
+                logger.debug(f"Syncing {len(cookies)} cookies from parser to shared downloader session")
+                for name, value in cookies.items():
+                    self._shared_downloader_session.cookies.set(name, value)
+
+            if parse_result[2] != K.PARSER_SUCCESS:
                 logger.error(f"Error parsing {url}: {parse_result[3]}")
         return links_found, media_files_found
 
@@ -569,22 +575,31 @@ class ParserManager(QObject):
         self._stop_event.set()
         self._pause_event.set()  # Unblock workers waiting on pause
         try:
-            while not self.download_queue.empty():
-                self.download_queue.get_nowait()
-            while not self.quarantine_queue.empty():
-                self.quarantine_queue.get_nowait()
-            # Clear PriorityURLQueue safely WITHOUT replacing the object reference.
-            # Replacing would abandon workers blocked in url_queue.get() -> _not_empty.wait()
-            # on the OLD Event, leaving them as orphaned coroutines indefinitely.
-            # Instead: clear the heap in-place and signal the Event to wake all waiters.
+            # Drain Download Queue
+            try:
+                while not self.download_queue.empty():
+                    self.download_queue.get_nowait()
+                    self.download_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError, Exception): pass
+
+            # Drain Quarantine Queue
+            try:
+                while not self.quarantine_queue.empty():
+                    self.quarantine_queue.get_nowait()
+                    self.quarantine_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError, Exception): pass
+
+            # Clear PriorityURLQueue safely
             if hasattr(self.url_queue, '_queue'):
                 self.url_queue._queue.clear()
             if hasattr(self.url_queue, '_not_empty'):
                 self.url_queue._not_empty.set()  # Wake blocked workers so they can exit
-            logger.info("Queues cleared safely.")
+                
+            # Signal parser manager itself
+            logger.info("Queues cleared and workers signaled for exit.")
         except Exception as e:
-            logger.error(f"Error clearing queues: {str(e)}", exc_info=True)
-        logger.info("Parsing stop procedure initiated. Tasks will shut down.")
+            logger.error(f"Error during stop cleanup: {str(e)}", exc_info=True)
+        logger.info("Parsing stop procedure initiated.")
 
     def _monitor_progress(self) -> None:
         while self.is_running and not self._stop_event.is_set():

@@ -57,6 +57,45 @@ DEFAULT_STOP_WORDS = [
     "login", "register", "cart", "checkout", "about_us", "contact", "privacy_policy", "terms_of_service", "careers"
 ]
 
+# Gateway & Visibility Filtering
+DEFAULT_FILTER_HIDDEN_LINKS = True
+DEFAULT_BYPASS_GATEWAYS = True
+GATEWAY_MIN_MEDIA_THRESHOLD = 2
+
+# CSS and attribute values that typically hide elements (bot-traps)
+VISIBILITY_HIDDEN_KEYWORDS = [
+    "display: none", "display:none", "visibility: hidden", "visibility:hidden", 
+    "opacity: 0", "opacity:0", "left: -999", "top: -999", "width: 0", "height: 0"
+]
+VISIBILITY_HIDDEN_CLASSES = [
+    "hidden", "sr-only", "visually-hidden", "bot-trap", "honeypot", "invisible", "d-none"
+]
+
+# Common texts on Gateway (Age Verification / Consent) buttons and links
+GATEWAY_TEXT_PATTERNS = [
+    # English
+    "i agree", "agree", "confirm", "continue", "yes", "i am 18", "enter", "accept", 
+    "i am over 18", "enter site", "verify", "continue to", "i confirm", "agree and enter",
+    "enter the site", "yes, enter", "yes, i am",
+    # Russian
+    "согласен", "подтверждаю", "да", "да, мне есть 18", "старше 18", "старше 18 лет",
+    "продолжить", "войти", "принимаю", "войти на сайт", "да, я старше 18 лет",
+    "подтверждаю возраст", "принимаю условия"
+]
+GATEWAY_OVERLAY_SELECTORS = [
+    ".age-gate", ".age-warning", "#consent-modal", ".overlay-consent", 
+    ".popup-wrapper", "#agreement", ".modal-content", "#disclaimer",
+    ".agreement-overlay", ".overlay-wrapper"
+]
+
+# Patterns for 'noise' media that shouldn't be counted as main content
+SIGNIFICANT_MEDIA_IGNORE_PATTERNS = [
+    "icon", "logo", "avatar", "social-", "button-", "placeholder", "nav-",
+    "banner-", "advert", "ad-", "pixel", "tracker", "facebook", "twitter",
+    "instagram", "linkedin", "youtube", "telegram", "vk.com", "yandex"
+]
+SIGNIFICANT_MEDIA_MIN_DIMENSION = 100 # Minimum width/height if specified in HTML
+
 # Session state filename
 SESSION_STATE_FILENAME = "last_session.pkl"
 SESSION_STATE_SUBDIR = "sessions"
@@ -112,11 +151,16 @@ SETTING_REFERRER_POLICY = "referrer" # "auto", "origin", "none"
 SETTING_STAY_IN_DOMAIN = "stay_in_domain"
 SETTING_USE_PATTERNS = "use_patterns"
 SETTING_CUSTOM_PATTERN_PATH = "custom_pattern_path"
-SETTING_PROCESS_JS = "process_js" # This now controls all advanced content extraction
-# SETTING_PROCESS_DYNAMIC = "process_dynamic" # Removed
+SETTING_PROCESS_JS = "process_js"
+SETTING_PROCESS_DYNAMIC = "process_dynamic"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
-SETTING_STOP_WORDS = "stop_words" # List of strings
+SETTING_USE_PATTERNS = "use_patterns"
+SETTING_FILTER_HIDDEN_LINKS = "filter_hidden_links"
+SETTING_BYPASS_GATEWAYS = "bypass_gateways"
+SETTING_STOP_WORDS = "stop_words"
+
+# Filter settings keys
 SETTING_MAX_DOWNLOAD_SPEED = "max_download_speed" # in KB/s, 0 for unlimited
 SETTING_PAGE_TIMEOUT = "page_timeout" # Timeout for page loading/parsing
 
