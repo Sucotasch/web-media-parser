@@ -80,8 +80,11 @@ class ParserManager(QObject):
         self.pattern_manager = None
         if self.settings.get(K.SETTING_USE_PATTERNS, K.DEFAULT_USE_PATTERNS):
             custom_pattern_path = self.settings.get(K.SETTING_CUSTOM_PATTERN_PATH, K.DEFAULT_SETTINGS_VALUES[K.SETTING_CUSTOM_PATTERN_PATH])
+            imagus_sieve_path = self.settings.get(K.SETTING_IMAGUS_SIEVE_PATH, K.DEFAULT_SETTINGS_VALUES[K.SETTING_IMAGUS_SIEVE_PATH])
             self.pattern_manager = SitePatternManager(
-                enable_built_in=True, custom_pattern_path=custom_pattern_path
+                enable_built_in=True, 
+                custom_pattern_path=custom_pattern_path,
+                imagus_sieve_path=imagus_sieve_path
             )
             logger.info("Using SitePatternManager for pattern transformations")
 
@@ -180,6 +183,7 @@ class ParserManager(QObject):
         self._pause_event.set()  # Unpaused by default
         self.download_queue = asyncio.Queue()
         self.quarantine_queue = asyncio.Queue()
+        self._processed_lock = asyncio.Lock()  # Initialize lock for thread-safe registry access
         self._completed_naturally = False
         self._last_activity_time = time.time()
 
@@ -318,6 +322,7 @@ class ParserManager(QObject):
                     # Drop items that have exhausted their retry budget (prevents infinite loop)
                     if item.get("quarantine_retries", 0) >= K.QUARANTINE_MAX_ITEM_RETRIES:
                         logger.debug(f"Dropping quarantined URL after max retries: {item['url']}")
+                        self.stats["files_skipped"] += 1  # Correctly increment skip counter for progress calculation
                         self.quarantine_queue.task_done()
                         continue
                     item["quarantine_retries"] = item.get("quarantine_retries", 0) + 1
@@ -437,9 +442,10 @@ class ParserManager(QObject):
                 if not current_url.startswith(("http://", "https://")):
                     current_url = urljoin(source_page_url or self.start_url, current_url)
                 current_url = normalize_url(current_url)
-                if current_url in self.processed_urls:
-                    self.url_queue.task_done(); continue
-                self.processed_urls.add(current_url)
+                async with self._processed_lock:
+                    if current_url in self.processed_urls:
+                        self.url_queue.task_done(); continue
+                    self.processed_urls.add(current_url)
                 is_json = self._determine_parser_type(current_url)
                 links_found, media_files_found = await self._invoke_parser(current_url, session, is_json, context)
                 await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
@@ -460,7 +466,9 @@ class ParserManager(QObject):
             try:
                 abs_url = urljoin(source_url, url) if not (url.startswith("http://") or url.startswith("https://")) else url
                 abs_url = normalize_url(abs_url)
-                if abs_url in self.downloaded_files: continue 
+                async with self._processed_lock:
+                    if abs_url in self.downloaded_files: continue 
+                    self.downloaded_files.add(abs_url) 
                     
                 if is_webpage_url(abs_url) and not is_media_url(abs_url):
                     logger.debug(f"Treating as webpage rather than media: {abs_url}")
@@ -675,13 +683,14 @@ class ParserManager(QObject):
         download_queue_items.extend(temp_dq_holder) 
         for item in temp_dq_holder: await self.download_queue.put(item) 
 
-        state = {
-            "url_queue_items": url_queue_items, "download_queue_items": download_queue_items,
-            "processed_urls": list(self.processed_urls), "downloaded_files": list(self.downloaded_files),
-            "stats": self.stats, "settings": self.settings, "start_url": self.start_url,
-            "download_path": self.download_path, 
-            "domain_health": self.domain_health, "quarantined_domains": list(self.quarantined_domains)
-        }
+        async with self._processed_lock:
+            state = {
+                "url_queue_items": url_queue_items, "download_queue_items": download_queue_items,
+                "processed_urls": list(self.processed_urls), "downloaded_files": list(self.downloaded_files),
+                "stats": self.stats, "settings": self.settings, "start_url": self.start_url,
+                "download_path": self.download_path, 
+                "domain_health": self.domain_health, "quarantined_domains": list(self.quarantined_domains)
+            }
         
         session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR) 
         os.makedirs(session_dir, exist_ok=True)

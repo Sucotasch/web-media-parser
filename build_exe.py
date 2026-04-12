@@ -27,7 +27,13 @@ def build_exe():
     # Clean build directories
     for dir_name in ["build", "dist"]:
         if os.path.exists(dir_name):
-            shutil.rmtree(dir_name)
+            print(f"Cleaning {dir_name}...")
+            try:
+                shutil.rmtree(dir_name)
+            except PermissionError:
+                print(f"Warning: Could not remove {dir_name} (in use). Trying to continue anyway...")
+            except Exception as e:
+                print(f"Warning: Error cleaning {dir_name}: {e}")
 
     # Build executable
     print("Building executable...")
@@ -72,6 +78,16 @@ def build_exe():
     )
 
     print("Build completed!")
+    
+    # Copy external data files
+    print("Copying external data files...")
+    for filename in os.listdir("."):
+        if filename.startswith("Imagus_sieve") and filename.endswith(".json"):
+            src_path = filename
+            dst_path = os.path.join("dist", filename)
+            shutil.copy2(src_path, dst_path)
+            print(f"Copied {src_path} to dist/")
+
     print(f"Executable path: {os.path.abspath('dist/WebMediaParser.exe')}")
 
 

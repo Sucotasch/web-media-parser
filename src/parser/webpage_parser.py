@@ -348,7 +348,7 @@ class WebpageParser:
             if srcset_val: candidates.extend(self._parse_srcset(srcset_val))
         for attr_name, value in element.attrs.items():
             if isinstance(value, str) and re.search(r"\.(jpg|jpeg|png|webp|gif|avif|tiff|bmp)", value.lower()):
-                priority = 100 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
+                priority = 999999 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
                 candidates.append({"url": value, "width": priority, "source": attr_name})
 
         width_str, height_str = element.get("width", ""), element.get("height", "")
@@ -374,13 +374,17 @@ class WebpageParser:
             best_url, best_attrs = filtered_candidates[0]["url"], attributes
             best_attrs["source"] = filtered_candidates[0]["source"]
             best_attrs["original_width"] = filtered_candidates[0]["width"]
+            
             if self.pattern_manager and best_url:
-                transformed_url = self.pattern_manager.transform_image_url(best_url, self.url)
-                if transformed_url != best_url:
-                    best_attrs["original_url"] = best_url; best_attrs["transformed"] = True
-                    best_url = transformed_url
-            return best_url, best_attrs
-        return None, attributes
+                transformed_results = self.pattern_manager.transform_image_url(best_url, self.url)
+                # transform_image_url now always returns a list of at least one item
+                if transformed_results and (len(transformed_results) > 1 or transformed_results[0] != best_url):
+                    best_attrs["original_url"] = best_url
+                    best_attrs["transformed"] = True
+                    return transformed_results, best_attrs
+            
+            return [best_url], best_attrs
+        return [], attributes
 
     def _parse_srcset(self, srcset: str) -> List[Dict[str, Any]]:
         candidates = []
@@ -431,28 +435,46 @@ class WebpageParser:
             for source_data in self._extract_picture_sources(picture):
                 url = source_data.get("url")
                 if not url: continue
-                abs_url = urljoin(self.url, url)
-                if abs_url.startswith(("http://", "https://")):
-                    attrs = {"width": source_data.get("width"), "media": source_data.get("media"), "type": source_data.get("type"), "source": source_data.get("source"), "is_cdn": self._is_cdn_url(abs_url, "img")}
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                # Handle possible list of URLs from transformation
+                urls_to_process = url if isinstance(url, list) else [url]
+                for u in urls_to_process:
+                    abs_url = urljoin(self.url, u)
+                    if abs_url.startswith(("http://", "https://")):
+                        attrs = {
+                            "width": source_data.get("width"), 
+                            "media": source_data.get("media"), 
+                            "type": source_data.get("type"), 
+                            "source": source_data.get("source"), 
+                            "is_cdn": self._is_cdn_url(abs_url, "img")
+                        }
+                        if self._is_significant_media("image", abs_url, attrs):
+                            self.media_files.append(("image", abs_url, attrs))
+                            found += 1
         
         for img in soup.find_all("img"):
-            url, attrs = self._get_best_image_url(img)
-            if url:
+            urls, attrs = self._get_best_image_url(img)
+            for url in urls:
+                if not url: continue
                 abs_url = urljoin(self.url, url)
                 if abs_url.startswith(("http://", "https://")):
-                    attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                    # Create a copy of attrs for each variant to avoid shared state mutations
+                    variant_attrs = attrs.copy()
+                    variant_attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
+                    if self._is_significant_media("image", abs_url, variant_attrs):
+                        self.media_files.append(("image", abs_url, variant_attrs))
+                        found += 1
                     parent_a = img.find_parent('a', href=True)
                     if parent_a and parent_a.get('href'):
                         link_url, link_abs_url = parent_a.get('href'), urljoin(self.url, parent_a.get('href'))
                         if link_abs_url.startswith(("http://", "https://")):
                             if is_image_url(link_abs_url):
                                 link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
-                                self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                if self._is_significant_media("image", link_abs_url, link_attrs):
+                                    self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                             elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
                                 link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
-                                self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                if self._is_significant_media("image", link_abs_url, link_attrs):
+                                    self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                             else: 
                                 self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'potential_media_container': True, 'priority': 15.0}
         
@@ -764,7 +786,8 @@ class WebpageParser:
                         abs_url = urljoin(self.url, url_val)
                         attrs = {"source": f"lazy-data-{data_attr_pattern}"}
                         media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
-                        self.media_files.append((media_type, abs_url, attrs))
+                        if self._is_significant_media(media_type, abs_url, attrs):
+                            self.media_files.append((media_type, abs_url, attrs))
         except Exception as e:
             logger.error(f"Error in static JS/dynamic content analysis for {self.url}: {str(e)}", exc_info=True)
 
@@ -778,7 +801,8 @@ class WebpageParser:
                         if url and url.startswith(("http://", "https://", "/")) and is_media_url(url):
                             abs_url = urljoin(self.url, url)
                             attrs = {"source": f"js-static-{pattern_type}"}
-                            self.media_files.append((media_hint, abs_url, attrs))
+                            if self._is_significant_media(media_hint, abs_url, attrs):
+                                self.media_files.append((media_hint, abs_url, attrs))
 
     def _process_framework_element(self, elem: Any, framework: str) -> None:
         attrs = {"source": f"framework-{framework}"}
@@ -789,7 +813,8 @@ class WebpageParser:
         if src_val and is_media_url(src_val):
             abs_url = urljoin(self.url, src_val)
             media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
-            self.media_files.append((media_type, abs_url, attrs))
+            if self._is_significant_media(media_type, abs_url, attrs):
+                self.media_files.append((media_type, abs_url, attrs))
 
     def _process_data_attribute(self, elem: Any, attr_name: str) -> None:
         value = elem.get(attr_name, "").strip()
@@ -803,12 +828,14 @@ class WebpageParser:
                             abs_url = urljoin(self.url, v_val)
                             attrs = {"source": f"data-json-{attr_name}-{k}"}
                             media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
-                            self.media_files.append((media_type, abs_url, attrs))
+                            if self._is_significant_media(media_type, abs_url, attrs):
+                                self.media_files.append((media_type, abs_url, attrs))
             except json.JSONDecodeError: pass 
         elif is_media_url(value): 
             abs_url = urljoin(self.url, value)
             attrs = {"source": f"data-direct-{attr_name}"}
             media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
-            self.media_files.append((media_type, abs_url, attrs))
+            if self._is_significant_media(media_type, abs_url, attrs):
+                self.media_files.append((media_type, abs_url, attrs))
 
     def get_media_files(self) -> List[Tuple[str, str, Dict[str, Any]]]: return self.media_files

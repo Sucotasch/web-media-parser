@@ -57,6 +57,7 @@ class SettingsDialog(QDialog):
             # Pattern settings
             "use_patterns": True,  # Enable image patterns by default
             "custom_pattern_path": None,  # Path to custom pattern file
+            "imagus_sieve_path": None,  # Path to Imagus sieve file
             # Bypass settings
             "bypass_cookie_consent": True,  # Enable cookie consent bypass
             "bypass_js_redirects": True,  # Enable JavaScript redirect bypass
@@ -199,36 +200,48 @@ class SettingsDialog(QDialog):
         self.pattern_info_label = QLabel("No patterns loaded")
         self.pattern_info_label.setWordWrap(True)
         parser_grid.addWidget(self.pattern_info_label, 8, 1)
+
+        # Imagus Sieve file
+        parser_grid.addWidget(QLabel("Imagus Sieve File:"), 9, 0)
+        imagus_layout = QHBoxLayout()
+        self.imagus_sieve_edit = QLineEdit()
+        self.imagus_sieve_edit.setPlaceholderText("Path to Imagus sieve file (optional)")
+        self.imagus_sieve_edit.setToolTip("Path to Imagus-style sieve file in JSON format")
+        self.imagus_sieve_browse = QPushButton("Browse")
+        self.imagus_sieve_browse.clicked.connect(self.browse_imagus_file)
+        imagus_layout.addWidget(self.imagus_sieve_edit)
+        imagus_layout.addWidget(self.imagus_sieve_browse)
+        parser_grid.addLayout(imagus_layout, 9, 1)
         
         # Bypass options
-        parser_grid.addWidget(QLabel("Bypass Cookie Consent:"), 9, 0)
+        parser_grid.addWidget(QLabel("Bypass Cookie Consent:"), 10, 0)
         self.bypass_cookie_consent_check = QCheckBox()
         self.bypass_cookie_consent_check.setToolTip(
             "Automatically bypass cookie consent prompts by setting common cookie values"
         )
-        parser_grid.addWidget(self.bypass_cookie_consent_check, 9, 1)
+        parser_grid.addWidget(self.bypass_cookie_consent_check, 10, 1)
         
-        parser_grid.addWidget(QLabel("Bypass JS Redirects:"), 10, 0)
+        parser_grid.addWidget(QLabel("Bypass JS Redirects:"), 11, 0)
         self.bypass_js_redirects_check = QCheckBox()
         self.bypass_js_redirects_check.setToolTip(
             "Automatically follow JavaScript redirects by analyzing page content"
         )
-        parser_grid.addWidget(self.bypass_js_redirects_check, 10, 1)
+        parser_grid.addWidget(self.bypass_js_redirects_check, 11, 1)
 
         # Gateway & Visibility Bypass
-        parser_grid.addWidget(QLabel("Filter Hidden Links:"), 11, 0)
+        parser_grid.addWidget(QLabel("Filter Hidden Links:"), 12, 0)
         self.filter_hidden_links_check = QCheckBox()
         self.filter_hidden_links_check.setToolTip(
             "Ignore invisible links to avoid bot-traps and honeypots"
         )
-        parser_grid.addWidget(self.filter_hidden_links_check, 11, 1)
+        parser_grid.addWidget(self.filter_hidden_links_check, 12, 1)
 
-        parser_grid.addWidget(QLabel("Bypass Content Gateways:"), 12, 0)
+        parser_grid.addWidget(QLabel("Bypass Content Gateways:"), 13, 0)
         self.bypass_gateways_check = QCheckBox()
         self.bypass_gateways_check.setToolTip(
             "Automatically click 'I Agree' or '18+' on confirmation pages and overlays"
         )
-        parser_grid.addWidget(self.bypass_gateways_check, 12, 1)
+        parser_grid.addWidget(self.bypass_gateways_check, 13, 1)
 
         parser_layout.addWidget(parser_group)
 
@@ -427,6 +440,20 @@ class SettingsDialog(QDialog):
             self.custom_pattern_edit.setText(file_path)
             self.update_pattern_info(file_path)
     
+    def browse_imagus_file(self):
+        """
+        Open file dialog to select Imagus sieve file
+        """
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Imagus Sieve File",
+            os.path.expanduser("~"),
+            "JSON Files (*.json)",
+        )
+        
+        if file_path:
+            self.imagus_sieve_edit.setText(file_path)
+
     def update_pattern_info(self, pattern_path=None):
         """
         Update pattern info label with count of available patterns
@@ -517,6 +544,10 @@ class SettingsDialog(QDialog):
         if custom_pattern_path:
             self.custom_pattern_edit.setText(custom_pattern_path)
             
+        imagus_sieve_path = self.settings.get(K.SETTING_IMAGUS_SIEVE_PATH, "")
+        if imagus_sieve_path:
+            self.imagus_sieve_edit.setText(imagus_sieve_path)
+            
         # Update pattern info
         self.update_pattern_info(custom_pattern_path)
 
@@ -565,6 +596,7 @@ class SettingsDialog(QDialog):
         settings[K.SETTING_FILTER_HIDDEN_LINKS] = self.filter_hidden_links_check.isChecked()
         settings[K.SETTING_BYPASS_GATEWAYS] = self.bypass_gateways_check.isChecked()
         settings[K.SETTING_CUSTOM_PATTERN_PATH] = self.custom_pattern_edit.text() if self.custom_pattern_edit.text() else ""
+        settings[K.SETTING_IMAGUS_SIEVE_PATH] = self.imagus_sieve_edit.text() if self.imagus_sieve_edit.text() else ""
 
         # Filters
         settings["min_image_width"] = self.min_image_width_spin.value()

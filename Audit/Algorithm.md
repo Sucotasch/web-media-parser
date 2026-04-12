@@ -1,11 +1,7 @@
 > **🤖 Prompt Generation Metadata**
 > - **Model:** gemini-3.1-pro-preview
-> - **Target Repository:** https://github.com/Sucotasch/web-media-parser
-> - **Auto-generated RAG Query:** "codebase_architecture_diagram, core_algorithm_pseudocode, data_flow_visualization, function_signatures_analysis, class_inheritance_hierarchy, API_endpoint_documentation, database_schema_reverse_engineering, error_handling_mechanisms, performance_bottleneck_identification, module_interdependencies, security_vulnerability_scanning, unit_test_coverage_report, configuration_file_parsing, build_system_dependencies, memory_management_patterns"
-> - **Agentic RAG Requested Files:** (3/3 fetched)
->   - `main.py`
->   - `src/parser/parser_manager.py`
->   - `src/parser/webpage_parser.py`
+> - **Target Repository:** https://github.com/Sucotasch/web-media-parser/tree/fix/web-parser-stability-and-persistence
+> - **Auto-generated RAG Query:** "codebase_architecture_diagram,core_algorithm_pseudocode,function_signatures,module_interdependencies,API_endpoints,data_flow_graph,state_machine_transitions,error_handling_mechanisms,thread_safety_annotations,performance_bottlenecks,unit_test_coverage,integration_test_scenarios,configuration_management,build_system_dependencies,static_code_analysis_results,codebase_entry_points,algorithm_time_complexity,concurrency_models,external_dependency_versions"
 > 
 > <details><summary><b>Task Instructions</b></summary>
 > 
@@ -16,59 +12,66 @@
 
 ---
 
-
-
 # Web Media Parser - Technical Documentation
 
 ## 1. Real Capabilities of the Program
 
-The **Web Media Parser** is a highly concurrent, intelligent desktop application designed to deeply crawl websites and APIs to extract and download media files (images, videos). Its capabilities go far beyond basic web scraping:
+The **Web Media Parser** is a highly concurrent, intelligent desktop application designed to deeply crawl websites to extract and download media files (images, videos, etc.). Going significantly beyond a simple web scraper, a deep analysis of its codebase reveals a robust, production-ready extraction engine. Its real capabilities include:
 
-*   **Intelligent Media Discovery:** Scans standard HTML elements (`<img>`, `<video>`, `<picture>`, `<iframe>`), inline CSS background images, and parses JSON API responses for media URLs.
-*   **High-Resolution & Original Priority:** It does not blindly download thumbnails. It applies heuristic analysis on attributes like `data-original`, `data-src`, `data-fullsize`, `srcset`, and specific CSS classes to actively prefer the highest quality, original media files.
-*   **Dynamic Content & JS Framework Support:** Attempts to bypass dynamically rendered limitations by inspecting inline JavaScript code and framework-specific lazy-loading attributes (e.g., React's `className="lazy-load"`, Vue's `v-lazy`, Angular's `[lazyLoad]`). It also tracks and executes simple JavaScript-based HTTP redirects.
-*   **Extensible Site Patterns:** Incorporates a `SitePatternManager` that loads custom JSON-based regex rules. This allows for site-specific optimizations, such as rewriting CDN URLs or bypassing specific hotlink protections.
-*   **Advanced Link Following & Filtering:** Traverses websites recursively up to a user-defined search depth limit. It supports domain restrictions (staying within the start URL's domain), blocklists, and skipping URLs that contain specific "stop words".
-*   **Resilience & Domain Quarantining:** Actively monitors the health of external domains. If a specific CDN or domain repeatedly fails or times out, the application places that domain in a "quarantine queue", ensuring the entire scraper is not bottlenecked by a single dead server.
-*   **Session Management & Persistence:** Supports pausing and resuming tasks. The application can serialize its exact state (queues, processed URLs, statistics) to disk using Python's `pickle`, allowing users to resume interrupted scraping sessions at a later time.
-*   **Concurrency & Performance:** Built heavily upon Python's `asyncio` and `aiohttp`, utilizing separate pools of asynchronous workers for HTML parsing and media downloading.
-*   **Modern GUI:** Provides a seamless user experience using PySide6 (Qt6), featuring a dark theme, real-time logging with color-coding based on log severity, live progress bars, and granular configuration dialogs.
+*   **Hybrid Concurrency Model (Qt + Asyncio):** It seamlessly integrates a `PySide6` graphical user interface with an underlying `asyncio` engine. It manages heavy network I/O without blocking the UI thread by offloading the `ParserManager` to an isolated `QThread`, which in turn manages its own `asyncio` event loops, workers, and tasks.
+*   **Intelligent Prioritization & URL Queuing:** Instead of a standard FIFO web crawler, it uses a custom `PriorityURLQueue`. This component mathematically ranks queued URLs to ensure that direct media links or highly probable media containers are processed and downloaded *before* standard navigation links. 
+*   **Site-Specific Pattern Transformations:** Through the `SitePatternManager`, the program dynamically injects custom parsing rules and regex pattern transformations. This is specifically used to upgrade thumbnails to full-size images, resolve indirect media links, and bypass lightweight obfuscation common in modern web galleries.
+*   **Domain Health Monitoring & Quarantining:** The parser is resilient against network instability. It tracks `domain_health` continuously. If a specific domain repeatedly fails or times out, it is dynamically added to a `quarantined_domains` set and managed via a `quarantine_queue`. This prevents the entire pipeline from halting due to a single dead external CDN.
+*   **State Persistence and Session Recovery:** It incorporates granular pause, resume, and recovery mechanics. State is serialized and saved asynchronously (e.g., `last_session.pkl`). If the application crashes or is closed, it can reload the previous state, resuming exactly where it left off, avoiding redundant downloads by leveraging a `downloaded_files` registry.
+*   **Optimized Network Pooling:** Implements shared session management (`shared_session.py`). It utilizes `aiohttp` for non-blocking asynchronous parsing and creates shared `requests.Session` objects strictly bound to the lifecycle of the downloader threads to optimize TCP keep-alive, reduce SSL handshake overhead, and respect concurrency limits.
 
 ---
 
 ## 2. Algorithm of Operation and Architecture
 
-The application is built on a multi-stage, non-blocking asynchronous pipeline orchestrated by the `ParserManager`. The architecture is split between the UI thread, a background asynchronous event loop, and a dedicated progress monitoring thread.
+The architecture relies on a multi-stage processing pipeline that acts as a Producer-Consumer network. The "Producers" are the HTML parsing workers discovering links, and the "Consumers" are the downloader workers grabbing the binary data.
 
-### 2.1. Initialization and GUI Flow
-1. **Startup (`main.py`):** The application begins by applying low-level compatibility patches for `lxml` and `brotli` to ensure standard parsing doesn't crash. It then configures global logging, loads the PySide6 Qt application, applies a custom dark stylesheet (`dark_theme.qss`), and renders the `MainWindow`.
-2. **User Configuration:** The user enters a target URL and a target directory. Through the `SettingsDialog`, they dictate the number of asynchronous parsing threads, downloading threads, search depth limits, timeouts, and file size constraints.
-3. **Execution Trigger:** Pressing the "Start" button instantiates the `ParserManager` and spins up a dedicated background thread (`AsyncEventLoopThread`) to run the asyncio loop, ensuring the GUI remains entirely responsive.
+Here is the detailed, step-by-step description of the core algorithm and data flow:
 
-### 2.2. The Parsing Pipeline (`ParserManager`)
-The `ParserManager` controls the flow of data using two primary async queues: `url_queue` (a highly specialized `PriorityURLQueue` that scores and prioritizes media-rich URLs) and `download_queue` (a queue for finalized media dictionaries ready for disk writing).
+### Phase 1: Initialization and UI Bootstrapping
+1. **User Interaction (`main_window.py`):** The user provides a target URL, selects a download directory, and configures settings (parser threads, downloader threads, search depth). 
+2. **Session Recovery Evaluation:** Upon clicking "Start", the `MainWindow` checks for an existing `last_session.pkl`. If found, it dispatches an asynchronous task (`_load_previous_state`) to re-populate internal queues and registries before initiating new network requests.
+3. **Thread Delegation:** The application instantiates `ParserManager`. To prevent the UI from freezing, `ParserManager.moveToThread(self.parser_thread)` is invoked. A Qt Signal triggers `start_parsing` within this dedicated thread.
 
-1. **Worker Spawning:** The manager spins up two distinct sets of asyncio tasks: `_parser_worker` (based on `SETTING_PARSER_THREADS`) and `_downloader_worker` (based on `SETTING_DOWNLOADER_THREADS`).
-2. **URL Retrieval:** Parser workers continually attempt to pop the highest-priority URL from the `url_queue`.
-3. **Parser Selection:** The worker evaluates the URL. If the URL contains `/api/`, `/json/`, or query parameters requesting JSON, it passes the URL to `JSONWebpageParser`. Otherwise, it utilizes the standard `WebpageParser`.
-4. **Webpage Parsing (`WebpageParser.parse`):**
-   *   **Fetching:** Utilizes `aiohttp.ClientSession` with randomized headers and automatic injection of bypass cookies (e.g., `cookieconsent_status=dismiss`). It resolves potential Javascript redirects and handles character encoding fallbacks via `chardet`.
-   *   **HTML Parsing:** The decoded HTML string is fed into `BeautifulSoup4`.
-   *   **Media Extraction:** The parser runs specialized methods (`_extract_images`, `_extract_videos`). It uses a scoring system based on attributes—e.g., adding +100 priority if `data-high-res` is present, or calculating potential area if `width` and `height` attributes exist.
-   *   **Dynamic JS Extraction:** It parses `<script>` block contents using regex (`JS_PATTERNS`) to find hidden direct links to `.mp4` and `.jpg` files, circumventing the need for a headless browser like Selenium.
-   *   **Link Discovery:** Discovers outgoing `<a>` tags and Canonical links, resolving them to absolute URLs.
-5. **Result Evaluation:** 
-   *   Discovered links are checked against the domain blocklist, same-domain constraints, and stop-words array. Valid links are pushed into the `url_queue` with `current_depth + 1`.
-   *   Discovered media files are sorted by their priority scores and pushed into the `download_queue`.
+### Phase 2: Engine Initialization (`parser_manager.py`)
+1. **Event Loop Creation:** The `ParserManager` creates a fresh `asyncio` event loop.
+2. **Primitive Instantiation:** Asynchronous control primitives (`_pause_event`, `_stop_event`, `download_queue`, `quarantine_queue`) are dynamically generated inside the running event loop to prevent context runtime errors.
+3. **Queue Seeding:** The `PriorityURLQueue` resets its internal locks and seeds the `start_url` into the queue with highest priority, marking it with metadata: `{"is_start_url": True}`.
+4. **Session Bootstrapping:** A shared downloading session (`_shared_downloader_session`) is created, explicitly scoped to live only as long as the `_main_task`.
 
-### 2.3. The Downloading Pipeline
-1. **Queue Consumption:** A `_downloader_worker` retrieves a media dictionary from the `download_queue`.
-2. **Health Check & Quarantine:** The worker checks the `domain_health` dictionary mapping for the media's host.
-   *   If the domain has failed too many times, it is placed into a "probation" state, receiving tighter timeouts.
-   *   If it exceeds `QUARANTINE_FAILURE_THRESHOLD`, the URL is dumped into the `quarantine_queue` and skipped for now. The manager will revisit the quarantine queue only when the main queues are entirely empty.
-3. **File Creation:** Calculates a sanitized, collision-free filename (using MD5 hashes if the URL lacks a valid filename) and constructs a nested directory tree based on the source URL's path components.
-4. **Downloading:** The `MediaDownloader` instances execute the actual byte-transfer in a ThreadPoolExecutor to prevent blocking the async loop, handling partial chunking and retry-backoffs.
+### Phase 3: The `_main_task` Coordinator
+The core loop of the application is managed by `_main_task()`.
+1. It reads user settings to determine thread allocation (e.g., `K.SETTING_PARSER_THREADS`, `K.SETTING_DOWNLOADER_THREADS`).
+2. It spawns an array of `_parser_worker` tasks (Producers).
+3. It spawns an array of `_downloader_worker` tasks (Consumers).
+4. Both arrays run concurrently. The `_main_task` uses `asyncio.gather` to wait for all workers to finish while continually monitoring for `_stop_event` toggles.
 
-### 2.4. Telemetry, Monitoring, and Shutdown
-*   **Progress Monitor:** A lightweight daemon thread (`_monitor_progress`) runs on a sleep loop, calculating the ratio of `files_downloaded / (images_found + videos_found)`. It emits thread-safe Qt Signals (`total_progress_updated`, `current_progress_updated`) to animate the GUI bars.
-*   **Graceful Shutdown:** If the user issues a Stop command, an `asyncio.Event()` named `_stop_event` is fired. The queues are instantly flushed. If configured, the `ParserManager` will dump the remaining state to `SESSION_STATE_FILENAME` via `pickle` before terminating the asyncio workers, allowing for exact continuation in the future.
+### Phase 4: The Parser Workers (Producers)
+Each `_parser_worker` runs an infinite asynchronous loop until the queue is depleted or a stop signal is received:
+1. **Fetch:** Awaits a URL from the `PriorityURLQueue`. 
+2. **Pause Check:** Awaits the `_pause_event.wait()` if the user has paused the app.
+3. **Network Request:** Uses `aiohttp` to fetch the webpage. If it fails, the domain's health score degrades; if it hits the threshold, the URL is shifted to the `quarantine_queue`.
+4. **HTML / JS Analysis:** Passes the raw payload to the HTML parser (BeautifulSoup/lxml). It scans for `<img>`, `<video>`, `<source>`, and `<a>` tags.
+5. **Pattern Application:** Discovered URLs are passed through `SitePatternManager`. If an image matches a known "thumbnail" pattern, the regex engine automatically mutates the URL string to target the full-resolution asset.
+6. **Classification & Routing:**
+    *   **Media URLs** (images, videos) are pushed to the `download_queue`.
+    *   **Navigation URLs** (internal links up to the configured `max_depth`) are ranked and pushed back into the `PriorityURLQueue`.
+7. **Deduplication:** URLs are hashed or tracked in `processed_urls` to ensure cyclic links do not cause infinite loops.
+
+### Phase 5: The Downloader Workers (Consumers)
+Each `_downloader_worker` runs concurrently alongside the parsers:
+1. **Consume:** Awaits a URL from the `download_queue`.
+2. **Verification:** Checks the `downloaded_files` set. If the file is already downloaded, it skips the network request.
+3. **Binary Fetching:** Uses the synchronous/asynchronous shared session to pull the binary stream of the file. By using a shared session, it benefits from connection pooling.
+4. **File I/O:** Saves the binary stream to disk chunk-by-chunk using `aiofiles` to prevent memory bloat on large video files.
+5. **Progress Emission:** Emits Qt Signals (`current_progress_updated`, `total_progress_updated`) back to the main thread. The Qt event loop receives these signals and safely updates the UI progress bars and text logs.
+
+### Phase 6: Graceful Termination and Persistence
+1. **Completion Detection:** When the `PriorityURLQueue` and `download_queue` report themselves as empty, and no active workers are processing data, the event loop initiates teardown.
+2. **Session Persistence:** If the user manually clicks "Stop" or closes the app, `main_window.save_and_stop()` triggers an asynchronous save. `ParserManager` dumps the state of `processed_urls`, `downloaded_files`, and the current queue to `last_session.pkl`.
+3. **Resource Cleanup:** The `_shared_downloader_session` is safely closed, `aiohttp` client managers are terminated, the Qt thread is quit, and a final statistical summary is dispatched to the UI's logging window.
