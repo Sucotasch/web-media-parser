@@ -22,7 +22,10 @@ try:
 except ImportError:
     HAS_BROTLI = False
 
-from src.parser.utils import is_image_url, is_media_url, is_valid_url, get_domain, is_same_domain, normalize_url
+from src.parser.utils import (
+    is_image_url, is_media_url, is_valid_url, get_domain, 
+    is_same_domain, normalize_url, is_trash_media
+)
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
 
@@ -79,12 +82,14 @@ class WebpageParser:
         process_js: bool, # This will now control all advanced content extraction
         external_session: aiohttp.ClientSession, 
         pattern_manager: Optional[SitePatternManager] = None,
+        context: Optional[Dict[str, Any]] = None
     ):
         self.url = url
         self.settings = settings 
         self.process_js = process_js 
         # self.process_dynamic = process_dynamic # Removed, covered by process_js
         self.domain = get_domain(url)
+        self.context = context or {}
         
         if external_session is None:
             raise ValueError("WebpageParser requires an external_session (aiohttp.ClientSession).")
@@ -452,6 +457,11 @@ class WebpageParser:
                             found += 1
         
         for img in soup.find_all("img"):
+            # 1. Primary Visibility Check (Bot-Trap Defense)
+            if not self._is_element_visible(img):
+                logger.debug(f"Skipping hidden img element (bot-trap defense) in {self.url}")
+                continue
+
             urls, attrs = self._get_best_image_url(img)
             for url in urls:
                 if not url: continue
@@ -460,21 +470,55 @@ class WebpageParser:
                     # Create a copy of attrs for each variant to avoid shared state mutations
                     variant_attrs = attrs.copy()
                     variant_attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
-                    if self._is_significant_media("image", abs_url, variant_attrs):
+                    
+                    # 2. Extract media only if significant (not trash)
+                    is_interstitial_retry = self.context.get("interstitial_retry", False)
+                    
+                    # Safety: In interstitial recovery mode, NEVER allow the page to refer to itself as media
+                    # to prevent infinite HTML-to-HTML loops.
+                    if is_interstitial_retry and abs_url == self.url:
+                        logger.debug(f"Skipping self-referencing media during interstitial recovery: {abs_url}")
+                        continue
+
+                    # If this is a recovery pass, we relax significance rules to find the hidden target
+                    significant = self._is_significant_media("image", abs_url, variant_attrs)
+                    if is_interstitial_retry and not significant:
+                        # Loosen rules: if it looks like a real image but failed standard significance (e.g. metadata/classes),
+                        # we take it anyway because this page is explicitly a media landing page.
+                        if not is_trash_media(abs_url):
+                             logger.debug(f"Loosening significance rules for interstitial recovery: {abs_url}")
+                             significant = True
+
+                    if significant and not is_trash_media(abs_url):
                         self.media_files.append(("image", abs_url, variant_attrs))
                         found += 1
+                    
+                    # 3. Always attempt to follow parent link (don't miss content behind junk media)
                     parent_a = img.find_parent('a', href=True)
-                    if parent_a and parent_a.get('href'):
+                    if parent_a and parent_a.get('href') and self._is_element_visible(parent_a):
                         link_url, link_abs_url = parent_a.get('href'), urljoin(self.url, parent_a.get('href'))
                         if link_abs_url.startswith(("http://", "https://")):
+                            is_interstitial_retry = self.context.get("interstitial_retry", False)
+                            
+                            if is_interstitial_retry and link_abs_url == self.url:
+                                continue # Skip self-links in recovery mode
+
                             if is_image_url(link_abs_url):
-                                link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
-                                if self._is_significant_media("image", link_abs_url, link_attrs):
-                                    self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                # If the link itself points to trash, we still follow it but don't download
+                                if not is_trash_media(link_abs_url):
+                                    link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
+                                    if self._is_significant_media("image", link_abs_url, link_attrs):
+                                        self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                else:
+                                    # Even if it's trash-media link, it might be a gateway; add to links for crawl
+                                    self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
                             elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
-                                link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
-                                if self._is_significant_media("image", link_abs_url, link_attrs):
-                                    self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                if not is_trash_media(link_abs_url):
+                                    link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
+                                    if self._is_significant_media("image", link_abs_url, link_attrs):
+                                        self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
+                                else:
+                                    self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
                             else: 
                                 self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'potential_media_container': True, 'priority': 15.0}
         
@@ -591,11 +635,11 @@ class WebpageParser:
 
     def _is_significant_media(self, media_type: str, url: str, attrs: Dict[str, Any]) -> bool:
         """Heuristic to filter out icons, avatars, and UI elements"""
-        url_lower = url.lower()
-        
-        # 1. Filter by extension
-        if url_lower.endswith(('.svg', '.ico', '.cur')):
+        # 1. Filter by extension (centralized)
+        if is_trash_media(url):
             return False
+            
+        url_lower = url.lower()
             
         # 2. Filter by common noise patterns in URL
         ignore_patterns = K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS

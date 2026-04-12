@@ -6,7 +6,9 @@ Utility functions for parser module
 """
 
 import re
+import os
 from urllib.parse import urlparse, urljoin
+from src import constants as K
 
 
 def is_valid_url(url):
@@ -27,24 +29,35 @@ def is_image_url(url):
     """
     Check if URL is likely to be a direct image file based on extension or pattern
     """
-    image_extensions = [
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif"
-    ]
     url_lower = url.lower()
     
     # Parse URL to handle query parameters properly
     parsed_url = urlparse(url_lower)
     path = parsed_url.path
     
-    # Basic extension check
-    if (any(path.endswith(ext) for ext in image_extensions) or 
-        any(f"{ext}?" in path for ext in image_extensions)):
+    # Basic extension check using centralized constants
+    if (any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS) or 
+        any(f"{ext}?" in path for ext in K.IMAGE_EXTENSIONS)):
         return True
         
     # Advanced pattern matching based on RipUtils.java
     image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|gif|png|webp|avif)(\?.*)?)", re.IGNORECASE)
     
     return bool(image_pattern.match(url_lower))
+
+
+def is_trash_media(url):
+    """
+    Check if URL is a known junk/trash format (.ico, .svg, .gif, .cur)
+    """
+    if not url:
+        return False
+        
+    url_lower = url.lower()
+    parsed_url = urlparse(url_lower)
+    path = parsed_url.path
+    
+    return any(path.endswith(ext) for ext in K.TRASH_MEDIA_EXTENSIONS)
 
 
 def get_domain(url):
@@ -123,15 +136,14 @@ def is_media_url(url):
     Check if URL is likely to be a media file based on extension, pattern, or path
     """
     url_lower = url.lower()
+    parsed_url = urlparse(url_lower)
+    path = parsed_url.path
     
-    # Check for standard media file extensions
-    media_extensions = [
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".avif",
-        ".mp4", ".webm", ".ogg", ".mov", ".mp3", ".wav", ".pdf"
-    ]
+    # Check for standard media file extensions from constants
+    media_extensions = K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS
     
-    # Direct extension check - most reliable method
-    if any(url_lower.endswith(ext) for ext in media_extensions):
+    # Direct extension check - most reliable method (handles query params via path)
+    if any(path.endswith(ext) for ext in media_extensions):
         return True
     
     # Check for fullsize pattern combined with media extension - common across many sites

@@ -14,6 +14,7 @@ from heapq import heappush, heappop
 from dataclasses import dataclass, field
 from datetime import datetime
 from src.parser.utils import is_media_url
+from src import constants as K
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,12 @@ class PrioritizedURL:
 class PriorityURLQueue:
     """Intelligent URL queue with priority-based processing"""
 
-    def __init__(self):
+    def __init__(self, settings: Dict[str, Any] = None):
         self._queue = []
         self._url_scores: Dict[str, float] = {}
         self._domain_scores: Dict[str, float] = {}
         self._url_patterns: Dict[str, int] = {}
+        self.settings = settings or {}
         # NOTE: _lock and _not_empty are asyncio primitives.
         # They are created lazily in reset() which is called from
         # ParserManager.start_parsing() after the event loop is running.
@@ -59,19 +61,27 @@ class PriorityURLQueue:
         except:
             return ""
             
-    def _is_downward_url(self, url: str, source_url: str) -> bool:
+    def _is_downward_url(self, url: str, source_url: str, context: dict = None) -> bool:
         """
-        Check if the URL is a subpath of the source URL or is at a deeper level.
-        This is used to enforce downward-only crawling from the initial URL.
+        Check if target URL is downward/related from source URL.
         """
-        if not source_url:
-            return True  # No source URL to compare with
+        context = context or {}
+        # 0. Bypass: If this is an interstitial recovery task, ALWAYS allow it
+        if context.get("interstitial_retry"):
+            logger.debug(f"Allowing out-of-domain URL for interstitial recovery: {url}")
+            return True
             
-        # Parse URLs
+        # 1. Global Bypass: if STAY_IN_DOMAIN is disabled, allow everything
+        stay_in_domain = self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN)
+        if not stay_in_domain:
+            return True
+
+        if not source_url:
+            return True
+        
         url_parsed = urlparse(url)
         source_parsed = urlparse(source_url)
         
-        # Domain comparison with subdomain handling
         url_domain = url_parsed.netloc.lower()
         source_domain = source_parsed.netloc.lower()
         
@@ -239,7 +249,7 @@ class PriorityURLQueue:
         """
         # Check if this is a downward URL from the source
         # If not, give it zero priority which will effectively skip it
-        if source_url and not self._is_downward_url(url, source_url):
+        if source_url and not self._is_downward_url(url, source_url, context):
             logger.debug(f"Skipping URL: {url} (not considered related to {source_url})")
             return 0.0
             
@@ -269,6 +279,10 @@ class PriorityURLQueue:
         # Explicit priority (if provided in context)
         if 'priority' in context:
             base_priority *= context['priority']
+            
+        # Interstitial retry boost
+        if context.get("interstitial_retry"):
+            base_priority *= 30.0 # Extreme boost to resolve immediately
             
         # Media context factor (high priority boost)
         # If this URL was found in an image context (e.g., inside <a> containing <img>)

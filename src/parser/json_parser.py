@@ -13,7 +13,8 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 from urllib.parse import urlparse, urljoin
 
 from src.parser.webpage_parser import WebpageParser, HAS_BROTLI
-from src.parser.utils import is_image_url, is_media_url, normalize_url
+from src.parser.utils import is_image_url, is_media_url, normalize_url, is_trash_media
+from src import constants as K
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,10 @@ class JSONWebpageParser:
                 # Make absolute URL
                 abs_url = urljoin(self.url, value)
                 # Determine media type
-                if is_image_url(abs_url):
+                if is_trash_media(abs_url):
+                    # Skip trash media but keep as link
+                    self.links.add(abs_url)
+                elif is_image_url(abs_url):
                     self.media_files.append(("image", abs_url, {"source": f"json-{path}", "path": path}))
                 elif is_media_url(abs_url):
                     # Try to determine media type from URL
@@ -186,12 +190,14 @@ class JSONWebpageParser:
                     url_value = item["url"]
                     if isinstance(url_value, str) and self._looks_like_url(url_value):
                         abs_url = urljoin(self.url, url_value)
-                        if is_media_url(abs_url):
+                        if is_media_url(abs_url) and not is_trash_media(abs_url):
                             media_type = self._guess_media_type(abs_url)
                             attrs = {k: v for k, v in item.items() if k != "url"}
                             attrs["source"] = f"json-{path}"
                             attrs["path"] = path
                             self.media_files.append((media_type, abs_url, attrs))
+                        else:
+                            self.links.add(abs_url)
 
     def _extract_links_from_json(self, data: Any, path: str = "") -> None:
         """
@@ -242,31 +248,26 @@ class JSONWebpageParser:
 
     def _guess_media_type(self, url: str) -> str:
         """
-        Guess the media type from the URL
-
-        Args:
-            url: URL to analyze
-
-        Returns:
-            Media type ("image", "video", or "file")
+        Guess the media type from the URL using centralized constants
         """
         url_lower = url.lower()
+        parsed_url = urlparse(url_lower)
+        path = parsed_url.path
         
-        # Check for image extensions
-        if any(ext in url_lower for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif"]):
+        # Check for image extensions from constants
+        if any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS):
             return "image"
             
-        # Check for video extensions
-        if any(ext in url_lower for ext in [".mp4", ".webm", ".ogg", ".mov", ".avi", ".wmv", ".flv", ".mkv", ".m4v", ".ts"]):
+        # Check for video extensions from constants
+        if any(path.endswith(ext) for ext in K.VIDEO_EXTENSIONS):
             return "video"
             
-        # Check for audio extensions
-        if any(ext in url_lower for ext in [".mp3", ".wav", ".aac", ".flac"]):
+        # Check for audio extensions from constants
+        if any(path.endswith(ext) for ext in K.AUDIO_EXTENSIONS):
             return "audio"
             
-        # Check for known video platforms
-        video_platforms = ["youtube", "vimeo", "dailymotion", "twitch", "streamable", "redgifs"]
-        if any(platform in url_lower for platform in video_platforms):
+        # Check for known video platforms from constants
+        if any(platform in url_lower for platform in K.VIDEO_PLATFORM_INDICATORS):
             return "video"
             
         # Default to generic file

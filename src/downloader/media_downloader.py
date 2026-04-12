@@ -12,6 +12,7 @@ import threading
 from urllib.parse import urlparse
 import logging
 import requests
+from src.parser.utils import is_trash_media
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from requests.cookies import RequestsCookieJar
@@ -179,9 +180,18 @@ class MediaDownloader:
     def _do_download(self, custom_timeout=None):
         try:
             self.filepath = self._ensure_unique_filepath_at_destination(self.filepath)
+            
+            # 1. Final Safety Check: Filter out trash media formats
+            if is_trash_media(self.url):
+                return {"success": False, "error": "Filtered as trash media (GIF/ICO/SVG)"}
+
+            # 2. Blacklist check for non-media webpage extensions
             non_media_extensions = [ ".html", ".htm", ".php", ".asp", ".aspx", ".js", ".css", ".json", ".xml"]
             url_lower = self.url.lower()
-            if any(url_lower.endswith(ext) or f"{ext}?" in url_lower or f"{ext}#" in url_lower for ext in non_media_extensions):
+            parsed_url = urlparse(url_lower)
+            path = parsed_url.path
+            
+            if any(path.endswith(ext) for ext in non_media_extensions):
                 return {"success": False, "error": "Non-media file based on URL extension"}
             
             timeout_to_use = custom_timeout if custom_timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)

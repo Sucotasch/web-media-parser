@@ -88,7 +88,7 @@ class ParserManager(QObject):
             )
             logger.info("Using SitePatternManager for pattern transformations")
 
-        self.url_queue = PriorityURLQueue()
+        self.url_queue = PriorityURLQueue(settings=self.settings)
         self.download_queue = None  # Created in start_parsing on the correct loop
         self.processed_urls = set()
         self.downloaded_files = set() # Stores URLs of media marked for download to avoid re-processing
@@ -99,6 +99,8 @@ class ParserManager(QObject):
         }
         self._completed_naturally = False  # True only when parsing finished by itself, not user Stop
         self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
+        self._active_tasks = 0
+        self._active_tasks_lock = threading.Lock()
         
         self.loop = asyncio.new_event_loop()
         self.async_client_manager: AsyncClientManager = AsyncClientManager(self.settings)
@@ -107,6 +109,29 @@ class ParserManager(QObject):
         self.parser_tasks = []
         self.downloader_tasks = []
         self.blocked_domains: Set[str] = self._load_domain_blocklist()
+
+    def reset(self) -> None:
+        """Reset the manager state for a new parsing task"""
+        # Ensure we're in the right event loop if called during start
+        self.url_queue = PriorityURLQueue(settings=self.settings)
+        self.url_queue.reset_async_primitives()
+        self.download_queue = asyncio.Queue()
+        self.quarantine_queue = asyncio.Queue()
+        self._active_tasks = 0
+        self.processed_urls.clear()
+        self.downloaded_files.clear()
+        self.stats = {
+            "images_found": 0, "videos_found": 0, "files_downloaded": 0,
+            "files_skipped": 0, "pages_processed": 0, "bytes_downloaded": 0
+        }
+        self.domain_health.clear()
+        self.quarantined_domains.clear()
+        self._stop_event.clear()
+        self._pause_event.set()
+        self.is_running = False
+        self.is_paused = False
+        self._completed_naturally = False
+        self._last_activity_time = time.time()
 
     def _load_domain_blocklist(self, blocklist_file_name: str = K.DOMAIN_BLOCKLIST_FILENAME) -> Set[str]:
         blocked_domains: Set[str] = set()
@@ -181,8 +206,11 @@ class ParserManager(QObject):
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Unpaused by default
+        self.url_queue = PriorityURLQueue(settings=self.settings)
         self.download_queue = asyncio.Queue()
         self.quarantine_queue = asyncio.Queue()
+        self._active_tasks = 0
+        self._active_tasks_lock = threading.Lock()
         self._processed_lock = asyncio.Lock()  # Initialize lock for thread-safe registry access
         self._completed_naturally = False
         self._last_activity_time = time.time()
@@ -297,6 +325,14 @@ class ParserManager(QObject):
                 self.quarantine_queue.empty()
             )
             if all_empty:
+                # Check if any tasks are still in-flight
+                with self._active_tasks_lock:
+                    active = self._active_tasks
+                
+                if active > 0:
+                    self._last_activity_time = time.time() # Reset idle timer if things are in-flight
+                    continue
+
                 idle_duration = time.time() - self._last_activity_time
                 if idle_duration >= K.IDLE_COMPLETION_TIMEOUT_SECONDS:
                     logger.info(
@@ -364,7 +400,8 @@ class ParserManager(QObject):
             p = WebpageParser(
                 url=url, settings=self.settings,
                 process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
-                external_session=session, pattern_manager=self.pattern_manager
+                external_session=session, pattern_manager=self.pattern_manager,
+                context=context
             )
             parse_result = await p.parse()
             links_found = parse_result[0]
@@ -436,6 +473,10 @@ class ParserManager(QObject):
             if not url_data:
                 await asyncio.sleep(0.1) 
                 continue
+            
+            with self._active_tasks_lock:
+                self._active_tasks += 1
+
             current_url, depth, source_page_url, context = url_data
             logger.debug(f"Parser worker got URL: {current_url} (depth={depth})")
             try:
@@ -453,6 +494,8 @@ class ParserManager(QObject):
                 logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
                 if current_url not in self.processed_urls: self.processed_urls.add(current_url)
             finally:
+                with self._active_tasks_lock:
+                    self._active_tasks -= 1
                 self.url_queue.task_done()
         logger.info(f"Parser worker {threading.get_ident()} finished.")
 
@@ -517,6 +560,10 @@ class ParserManager(QObject):
             except asyncio.TimeoutError: continue
             if not media_item:
                 self.download_queue.task_done(); continue
+            
+            with self._active_tasks_lock:
+                self._active_tasks += 1
+
             try:
                 url = media_item["url"]
                 filepath_from_queue = media_item["filepath"] 
@@ -555,19 +602,43 @@ class ParserManager(QObject):
                     err_msg = str(result.get('error', ''))
                     logger.warning(f"Failed to download file: {url} - {err_msg}")
                     
-                    # Only penalize domain health for genuine network/server errors
+                    # 1. Feedback Loop: If we expected media but got HTML, feed it back to WebpageParser (limit 1 attempt)
+                    if "webpage/script content" in err_msg.lower():
+                        attrs = media_item.get("attrs", {})
+                        if not attrs.get("interstitial_retry"):
+                            logger.info(f"Targeting photo-host landing page for discovery: {url} (Retrying as webpage)")
+                            # Track that this URL is being retried as a potential interstitial landing page
+                            ctx = {
+                                "source_url": media_item.get("source_url"),
+                                "start_url": self.start_url,
+                                "interstitial_retry": True, # Prevents infinite loops
+                                "original_media_type": media_item.get("media_type", "image"),
+                                "original_target_name": os.path.basename(media_item.get("filepath", "")),
+                                "priority": 15.0 # High priority to resolve quickly
+                            }
+                            # Send back to url_queue at depth 1 to ensure it gets processed
+                            await self.url_queue.put(url, 1, self.start_url, ctx)
+                        else:
+                            logger.warning(f"Interstitial recovery failed to find binary media for: {url}")
+                    
+                    # 2. Domain Health: Only penalize health for genuine network/server errors
                     is_content_skip = any(skip_reason in err_msg.lower() for skip_reason in [
-                        "file too small", "already exists", "invalid extension", "unsupported"
+                        "file too small", "already exists", "invalid extension", "unsupported", 
+                        "webpage/script content", "trash media"
                     ])
                     
                     if not is_content_skip:
                         domain_state["failures"] += 1
                         if domain_state["failures"] >= K.DEFAULT_QUARANTINE_FAILURE_THRESHOLD:
-                            self.quarantined_domains.add(domain)
-                            logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} network failures.")
+                            # Race Condition Protection: Only log and add if not already quarantined
+                            if domain not in self.quarantined_domains:
+                                self.quarantined_domains.add(domain)
+                                logger.warning(f"Domain {domain} quarantined after {domain_state['failures']} network failures.")
             except Exception as err:
                 logger.error(f"Error in downloader_worker for {media_item.get('url', 'Unknown URL')}: {str(err)}", exc_info=True)
             finally:
+                with self._active_tasks_lock:
+                    self._active_tasks -= 1
                 self.download_queue.task_done()
         logger.info(f"Downloader worker {threading.get_ident()} finished.")
 

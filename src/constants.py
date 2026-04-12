@@ -233,6 +233,9 @@ AUDIO_EXTENSIONS = [
     ".mp3", ".wav", ".aac", ".flac", ".ogg", ".opus", ".m4a"
 ]
 
+# Trash Media Extensions - Should be skipped for downloading but followed as triggers/links
+TRASH_MEDIA_EXTENSIONS = [".gif", ".ico", ".svg", ".cur"]
+
 KNOWN_FILE_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS + AUDIO_EXTENSIONS + [
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", 
     ".zip", ".rar", ".tar.gz", ".7z",
