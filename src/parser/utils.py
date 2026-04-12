@@ -11,6 +11,25 @@ from urllib.parse import urlparse, urljoin
 from src import constants as K
 
 
+def format_proxy_url(proxy_str):
+    """
+    Normalize proxy string to include scheme if missing.
+    e.g. '127.0.0.1:8080' -> 'http://127.0.0.1:8080'
+    """
+    if not proxy_str or not isinstance(proxy_str, str):
+        return None
+    proxy_str = proxy_str.strip()
+    if not proxy_str:
+        return None
+    
+    # If it already has a scheme, leave it
+    if "://" in proxy_str:
+        return proxy_str
+    
+    # Default to http:// for simple host:port strings
+    return f"http://{proxy_str}"
+
+
 def is_valid_url(url):
     """
     Check if URL is valid

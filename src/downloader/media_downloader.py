@@ -12,7 +12,7 @@ import threading
 from urllib.parse import urlparse
 import logging
 import requests
-from src.parser.utils import is_trash_media
+from src.parser.utils import is_trash_media, format_proxy_url
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from requests.cookies import RequestsCookieJar
@@ -50,6 +50,15 @@ def create_shared_downloader_session(settings: dict) -> requests.Session:
         "User-Agent": settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
         "Accept-Language": settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
     })
+    
+    # Configure proxy if specified
+    proxy_url = format_proxy_url(settings.get(K.SETTING_PROXY))
+    if proxy_url:
+        session.proxies = {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+        logger.info(f"Shared downloader session configured with proxy: {proxy_url}")
     logger.info(
         "Shared downloader session created with 0 internal retries (Immediate-Stop enabled)."
     )

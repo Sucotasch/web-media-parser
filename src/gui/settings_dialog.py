@@ -78,6 +78,7 @@ class SettingsDialog(QDialog):
             "accept_language": "en-US,en;q=0.9",
             "timeout": 30,
             "retry_count": 3,
+            "proxy": "",
             # Stop words
             "stop_words": [
                 "login",
@@ -394,6 +395,13 @@ class SettingsDialog(QDialog):
         self.retry_count_spin.setToolTip("Number of retries for failed requests")
         http_grid.addWidget(self.retry_count_spin, 4, 1)
 
+        # Proxy server
+        http_grid.addWidget(QLabel("Proxy Server:"), 5, 0)
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("e.g. 127.0.0.1:8080")
+        self.proxy_edit.setToolTip("Proxy server (host:port). Prepend http:// if needed.")
+        http_grid.addWidget(self.proxy_edit, 5, 1)
+
         http_layout.addWidget(http_group)
 
         # Add all tabs
@@ -576,6 +584,7 @@ class SettingsDialog(QDialog):
         self.accept_language_edit.setText(self.settings.get("accept_language", ""))
         self.timeout_spin.setValue(self.settings.get("timeout", 30))
         self.retry_count_spin.setValue(self.settings.get("retry_count", 3))
+        self.proxy_edit.setText(self.settings.get("proxy", ""))
 
     def get_settings_from_ui(self):
         """
@@ -625,6 +634,7 @@ class SettingsDialog(QDialog):
         settings["accept_language"] = self.accept_language_edit.text()
         settings["timeout"] = self.timeout_spin.value()
         settings["retry_count"] = self.retry_count_spin.value()
+        settings["proxy"] = self.proxy_edit.text().strip()
 
         return settings
 

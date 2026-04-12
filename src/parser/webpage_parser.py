@@ -24,7 +24,7 @@ except ImportError:
 
 from src.parser.utils import (
     is_image_url, is_media_url, is_valid_url, get_domain, 
-    is_same_domain, normalize_url, is_trash_media
+    is_same_domain, normalize_url, is_trash_media, format_proxy_url
 )
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
@@ -156,7 +156,8 @@ class WebpageParser:
                     logger.info(f"Retrying fetch of {self.url} via aiohttp (Attempt {attempt+1}/{max_retries+1})...")
                     await asyncio.sleep(0.5 * attempt) # Fast backoff
 
-                async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config) as response:
+                proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
+                async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config, proxy=proxy_url) as response:
                     http_status = response.status
                     if 400 <= http_status < 500:
                         msg = f"Client HTTP error {http_status} for {self.url}"

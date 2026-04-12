@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 from urllib.parse import urlparse, urljoin
 
 from src.parser.webpage_parser import WebpageParser, HAS_BROTLI
-from src.parser.utils import is_image_url, is_media_url, normalize_url, is_trash_media
+from src.parser.utils import is_image_url, is_media_url, normalize_url, is_trash_media, format_proxy_url
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,8 @@ class JSONWebpageParser:
                  "X-Requested-With": "XMLHttpRequest",
             }
 
-            async with self.session.get(self.url, headers=request_specific_headers) as response:
+            proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
+            async with self.session.get(self.url, headers=request_specific_headers, proxy=proxy_url) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch JSON from {self.url}: {response.status}")
                     return None
