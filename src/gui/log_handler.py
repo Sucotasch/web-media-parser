@@ -59,6 +59,7 @@ class GUILogHandler(QObject, logging.Handler):
 
         # Store filtered messages for reapplying filters
         self.message_history = []
+        self.max_history = 5000
 
     def emit(self, record):
         """
@@ -67,7 +68,9 @@ class GUILogHandler(QObject, logging.Handler):
         """
         try:
             msg = self.format(record)
-            # Store message in history
+            # Store message in history (cap at max_history)
+            if len(self.message_history) >= self.max_history:
+                self.message_history.pop(0)
             self.message_history.append((record.levelname, msg))
             # Only display if the level is enabled
             if self.log_filter.is_enabled(record.levelname):

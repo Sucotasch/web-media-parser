@@ -766,7 +766,8 @@ class WebpageParser:
             return {}, [], K.PARSER_UNKNOWN_ERROR, "No content fetched and no specific error reported.", http_status_code, None
 
         try:
-            soup = BeautifulSoup(content, "lxml")
+            loop = asyncio.get_running_loop()
+            soup = await loop.run_in_executor(None, BeautifulSoup, content, "lxml")
             
             # 1. Image extraction
             await self._extract_images(soup) 
@@ -803,9 +804,17 @@ class WebpageParser:
             cookies = None
             if self._sync_session:
                 cookies = self._sync_session.cookies.get_dict()
+                self._sync_session.close()
+                self._sync_session = None
 
             return self.links, self.media_files, K.PARSER_SUCCESS, "Successfully parsed.", http_status_code, cookies
         except Exception as e:
+            if self._sync_session:
+                try:
+                    self._sync_session.close()
+                except Exception:
+                    pass
+                self._sync_session = None
             msg = f"Error during parsing HTML content of {self.url}: {str(e)}"
             logger.error(msg, exc_info=False)
             return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code, None

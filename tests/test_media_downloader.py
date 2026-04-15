@@ -33,7 +33,7 @@ def test_downloader_filters_webpage_files():
     
     # Verify the result
     assert result["success"] is False
-    assert "Webpage files should not be downloaded" in result["error"]
+    assert "Non-media file based on URL extension" in result["error"]
 
 
 def test_downloader_filters_js_files():
@@ -54,7 +54,7 @@ def test_downloader_filters_js_files():
     
     # Verify the result
     assert result["success"] is False
-    assert "Webpage files should not be downloaded" in result["error"]
+    assert "Non-media file based on URL extension" in result["error"]
 
 
 def test_downloader_filters_by_content_type():
@@ -81,4 +81,4 @@ def test_downloader_filters_by_content_type():
     
     # Verify the result
     assert result["success"] is False
-    assert "Webpage/script content should not be downloaded" in result["error"]
+    assert "Webpage/script content" in result["error"]

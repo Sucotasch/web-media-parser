@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 # WRITE_BUFFER_SIZE is now in K.WRITE_BUFFER_SIZE
 
+# Module-level lock to prevent race conditions when multiple downloaders
+# simultaneously check and reserve unique filenames.
+_filename_lock = threading.Lock()
+
 
 def create_shared_downloader_session(settings: dict) -> requests.Session:
     """Create a single shared requests.Session for all MediaDownloader instances.
@@ -174,17 +178,18 @@ class MediaDownloader:
             return {"success": False, "error": str(e)}
 
     def _ensure_unique_filepath_at_destination(self, current_filepath: str) -> str:
-        if not os.path.exists(current_filepath):
-            return current_filepath
-        dir_path, original_basename = os.path.split(current_filepath)
-        base_name, ext = os.path.splitext(original_basename)
-        counter = 1
-        unique_filepath = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
-        while os.path.exists(unique_filepath):
-            counter += 1
+        with _filename_lock:
+            if not os.path.exists(current_filepath):
+                return current_filepath
+            dir_path, original_basename = os.path.split(current_filepath)
+            base_name, ext = os.path.splitext(original_basename)
+            counter = 1
             unique_filepath = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
-        logger.debug(f"Adjusted filepath from {current_filepath} to {unique_filepath} due to existing file.")
-        return unique_filepath
+            while os.path.exists(unique_filepath):
+                counter += 1
+                unique_filepath = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
+            logger.debug(f"Adjusted filepath from {current_filepath} to {unique_filepath} due to existing file.")
+            return unique_filepath
 
     def _do_download(self, custom_timeout=None):
         try:

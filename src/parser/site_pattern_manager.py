@@ -208,7 +208,7 @@ class SitePatternManager:
         if not isinstance(target, str): return target
         # Use a lambda for replacement to safely construct the \g<n> syntax
         # Limit to 1 digit ($1-$9) to avoid greedy matching with literal digits
-        return re.sub(r'(?<!\\)\$(\d)', lambda m: f'\\g<{m.group(1)}>', target)
+        return re.sub(r'(?<!\\)\$(\d+)', lambda m: f'\\g<{m.group(1)}>', target)
 
     def _extract_domain_from_regex(self, regex_str: str) -> Optional[str]:
         """Heuristically extract a plain domain from a regex like '^(media\\.admagazine\\.ru/'"""
@@ -222,28 +222,33 @@ class SitePatternManager:
         return None
 
     def _expand_variants(self, text: str) -> List[str]:
-        """Expand Imagus syntax like 'image.#jpg png#' into multiple strings"""
+        """Expand Imagus syntax like 'image.#jpg png#' into multiple strings.
+
+        Recursively handles multiple #...# blocks to generate all combinations,
+        e.g. '/#ext1 ext2#/#jpg png#/' → 4 variants.
+        """
         if not text: return []
-        
-        # Handle multiple lines
+
         lines = text.split('\n')
         all_variants = []
-        
+
+        def expand_line(l: str) -> List[str]:
+            match = re.search(r'#([^#]+)#', l)
+            if not match:
+                return [l]
+            prefix = l[:match.start()]
+            options = match.group(1).split()
+            suffix = l[match.end():]
+            res = []
+            for opt in options:
+                res.extend(expand_line(f"{prefix}{opt}{suffix}"))
+            return res
+
         for line in lines:
             line = line.strip()
-            if not line: continue
-            
-            # Handle #ext1 ext2# syntax
-            match = re.search(r'#([^#]+)#', line)
-            if match:
-                prefix = line[:match.start()]
-                options = match.group(1).split()
-                suffix = line[match.end():]
-                for opt in options:
-                    all_variants.append(f"{prefix}{opt}{suffix}")
-            else:
-                all_variants.append(line)
-        
+            if line:
+                all_variants.extend(expand_line(line))
+
         return all_variants
     
     def get_patterns_for_url(self, url: str) -> List[Tuple[str, Dict[str, Any]]]:

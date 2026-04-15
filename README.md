@@ -1,154 +1,265 @@
 # Web Media Parser
 
-A powerful application for parsing and downloading media files from websites with an intuitive GUI and intelligent URL prioritization.
+**Desktop-приложение для интеллектуального парсинга и загрузки медиафайлов с веб-сайтов.**
 
-## Features
+Автоматически обнаруживает изображения и видео, отличает полноразмерные версии от миниатюр, обходит защиты (cookie-consent, age-gate, JS-редиректы) и адаптируется к структуре конкретных сайтов через систему паттернов.
 
-- **Smart Media Discovery**: Automatically detects images, videos, and other media files on web pages
-- **Intelligent URL Prioritization**: Prioritizes media URLs over navigation links, ensuring complete media extraction from each page
-- **Full-size Image Detection**: Automatically discovers and downloads full-size versions of images (not just thumbnails)
-- **Multi-threaded Processing**: Concurrent parsing and downloading for optimal performance
-- **Site Pattern Support**: Extensible pattern system for site-specific optimizations
-- **Modern GUI**: Dark-themed user interface built with PySide6
-- **Download Management**: Progress tracking, pause/resume functionality, and duplicate detection
-- **Configurable Settings**: Customizable depth limits, thread counts, file filters, and more
+---
 
+## Возможности
 
-## Installation
+### Умное обнаружение медиа
+- **Full-size из thumbnails** — преобразует URL миниатюр в полноразмерные изображения через встроенные паттерны и правила Imagus
+- **Приоритизация URL** — медиа-ссылки обрабатываются первыми, навигационные — в последнюю очередь
+- **Фильтрация «мусора»** — автоматический пропуск иконок, баннеров, tracking-пикселей, SVG и GIF-анимаций
+- **Распознавание lazy-load** — извлекает изображения из `data-src`, `srcset`, inline-CSS и JavaScript-кода
 
-### Requirements
+### Обход защит и динамического контента
+- **Cookie-consent** — автоматическая установка согласий на использование cookies
+- **Age-gate / Gateway** — нажатие кнопок «Мне есть 18», «I agree» и аналогичных на страницах-шлюзах
+- **JS-редиректы** — обнаружение и переход по JavaScript-редиректам (`window.location`, `<meta refresh>`)
+- **Fallback aiohttp → requests** — если сервер блокирует асинхронные запросы, используется синхронный `requests` с TLS-сессией
 
-- Python 3.8 or higher
-- PySide6 (Qt6 for Python)
-- Required Python packages (see requirements.txt)
+### Система паттернов
+- **Встроенные паттерны** — готовые правила преобразования URL для популярных сайтов
+- **Custom patterns (JSON)** — собственные правила с `image_transformations` и `url_patterns`
+- **Imagus Sieve** — прямая загрузка файлов правил Imagus (`Imagus_sieve_*.json`) для преобразования thumbnail → fullsize
+- **Динамическая репутация доменов** — домены, с которых найдено много медиа, получают более высокий приоритет
 
-### Quick Setup
+### Загрузка
+- **Многопоточность** — настраиваемое число потоков парсера и загрузчика
+- **Multi-threaded download** — загрузка одного файла несколькими потоками (с поддержкой `Accept-Ranges`)
+- **Общая HTTP-сессия** — переиспользование TCP/TLS-соединений между скачиваниями
+- **Контроль скорости** — ограничение пропускной способности
+- **Дедупликация** — пропуск уже загруженных URL и файлов с одинаковыми именами
 
-1. Clone this repository:
+### Поддержка форматов
+- **Изображения:** JPEG, PNG, WebP, AVIF, BMP, TIFF
+- **Видео:** MP4, WebM, OGG, MOV, MKV, AVI, FLV, M4V
+- **Аудио:** MP3, WAV, AAC, FLAC, OPUS
+- **API-источники:** JSON-эндпоинты с автоматическим извлечением медиа из вложенных структур
+
+### Интерфейс
+- **PySide6 GUI** — тёмная тема, лог с фильтрацией по уровням
+- **Пауза / Продолжить / Стоп** — полный контроль над процессом
+- **Прогресс-бары** — общий прогресс и прогресс текущего файла
+- **Сохранение сессии** — при закрытии окна во время активного парсинга состояние (очереди, прогресс, статистика) сохраняется в `sessions/last_session.pkl` и восстанавливается при следующем запуске
+
+---
+
+## Установка
+
+### Системные требования
+- **Python** 3.8+
+- **ОС:** Windows 10/11 (поддержка Linux/macOS через кроссплатформенные зависимости)
+
+### Из исходников
+
 ```bash
-git clone https://github.com/yourusername/yourreponame.git
-cd yourreponame
-```
+# 1. Клонировать репозиторий
+git clone https://github.com/yourusername/web-media-parser.git
+cd web-media-parser
 
-2. Install dependencies:
-```bash
+# 2. Установить зависимости
 pip install -r requirements.txt
-```
 
-3. Run the application:
-```bash
+# 3. Запустить
 python main.py
 ```
 
-### Building Executable
-
-To create a standalone executable:
+### Сборка исполняемого файла
 
 ```bash
 python build_exe.py
 ```
 
-## Usage
+Результат: `dist/WebMediaParser.exe` — автономный `.exe`, не требующий установленного Python.
 
-1. **Launch the Application**: Run `python main.py`
-2. **Enter URL**: Paste the URL of the website you want to parse
-3. **Select Download Folder**: Choose where to save downloaded media
-4. **Configure Settings** (optional):
-   - Search depth (how many levels deep to follow links)
-   - Number of parser and downloader threads
-   - File type filters
-   - Minimum image dimensions
-5. **Start Parsing**: Click "Start" to begin media discovery and downloading
+> **Примечание:** Файлы `site_patterns.json`, `domain_blocklist.txt` и `Imagus_sieve_*.json` копируются рядом с `.exe` и могут редактироваться пользователем.
 
-### Advanced Features
+---
 
-- **Pattern Management**: Add custom site patterns for better media detection
-- **Stop Words**: Filter out unwanted URLs containing specific keywords
-- **Domain Restrictions**: Limit parsing to the same domain as the starting URL
-- **JavaScript Processing**: Enable dynamic content parsing for modern websites
+## Использование
 
-## Architecture
+1. **Запустите** приложение (`python main.py` или `WebMediaParser.exe`)
+2. **Вставьте URL** сайта, с которого нужно собрать медиа
+3. **Выберите папку** для сохранения файлов
+4. **Настройте параметры** через кнопку *Settings* (по умолчанию уже оптимальны)
+5. Нажмите **Start**
 
-The application uses a sophisticated multi-stage processing pipeline:
+### Структура загрузки
 
-1. **URL Queue Management**: Intelligent prioritization ensures media URLs are processed before navigation
-2. **Webpage Parsing**: HTML analysis to discover media files and follow relevant links
-3. **Media Classification**: Automatic detection of full-size images vs thumbnails
-4. **Download Optimization**: Concurrent downloading with progress tracking and error handling
+Для каждого запуска создаётся уникальная папка:
+```
+<download_dir>/
+└── example_com_20260412_1630/
+    ├── images/
+    │   └── photo_001.jpg
+    ├── videos/
+    │   └── clip_001.mp4
+    └── ...
+```
 
-### Key Components
+---
 
-- `src/parser/priority_url_queue.py`: Intelligent URL prioritization system
-- `src/parser/webpage_parser.py`: HTML parsing and media discovery
-- `src/parser/parser_manager.py`: Main coordination and workflow management
-- `src/downloader/media_downloader.py`: Multi-threaded file downloading
-- `src/gui/main_window.py`: User interface implementation
+## Настройки
 
-## Configuration
+### Parsing
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| Search Depth | 3 | Глубина перехода по ссылкам |
+| Page Timeout | 30 сек | Таймаут загрузки страницы |
+| Stay in Domain | ✓ | Не уходить на другие домены |
+| Process JavaScript | ✓ | Анализировать JS-контент и lazy-load |
+| Use Image Patterns | ✓ | Преобразовывать thumbnail → fullsize |
+| Custom Pattern File | — | Путь к пользовательскому `site_patterns.json` |
+| Imagus Sieve File | — | Путь к файлу Imagus-правил |
+| Bypass Cookie Consent | ✓ | Обходить баннеры cookies |
+| Bypass JS Redirects | ✓ | Переходить по JS-редиректам |
+| Filter Hidden Links | ✓ | Игнорировать скрытые ссылки (бот-ловушки) |
+| Bypass Content Gateways | ✓ | Нажимать «I agree» / «18+» на шлюзах |
 
-The application supports various configuration options:
+### Filters
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| Min. Image Width | 100 px | Минимальная ширина изображений |
+| Min. Image Height | 100 px | Минимальная высота изображений |
+| Min. Image Size | 40 KB | Минимальный размер файла изображения |
+| Min. Video Size | 1000 KB | Минимальный размер видео |
+| Stop Words | список | URL, содержащие эти слова, пропускаются |
 
-- **Search Depth**: Control how deep to follow links (default: 3 levels)
-- **Thread Counts**: Adjust parser and downloader thread counts for performance
-- **File Filters**: Set minimum dimensions and file type restrictions
-- **Custom Patterns**: Add site-specific parsing rules
+### Performance
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| Parser Threads | 2 | Потоки парсинга страниц |
+| Downloader Threads | 8 | Потоки загрузки файлов |
+| Threads per File | 1 | Потоков на загрузку одного файла (до 8) |
+| Max Speed | 0 (без лимита) | Ограничение скорости (KB/s) |
 
-## Contributing
+### HTTP
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| User-Agent | Chrome 91 | Строка User-Agent |
+| Referer | auto | Политика Referer (`auto` / `origin` / `none`) |
+| Timeout | 30 сек | Таймаут сетевого запроса |
+| Retry Count | 3 | Повторные попытки при ошибке |
+| Proxy | — | Прокси в формате `host:port` |
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+---
 
-### Development Setup
+## Архитектура
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
-3. Make your changes and add tests if applicable
-4. Commit your changes: `git commit -am 'Add some feature'`
-5. Push to the branch: `git push origin feature-name`
-6. Submit a pull request
+```
+main.py
+├── src/gui/
+│   ├── main_window.py       — главное окно PySide6, управление потоками
+│   ├── settings_dialog.py   — диалог настроек (4 вкладки)
+│   └── log_handler.py       — перехват logging в текстовое поле
+│
+├── src/parser/
+│   ├── parser_manager.py     — координация: очередь, воркеры, завершение
+│   ├── priority_url_queue.py — приоритетная очередь URL (heap-based)
+│   ├── webpage_parser.py     — парсинг HTML, lazy-load, JS-редиректы, bypass
+│   ├── json_parser.py        — парсинг JSON API (pagination, media keys)
+│   ├── site_pattern_manager.py — система паттернов + Imagus Sieve
+│   ├── shared_session.py     — aiohttp.ClientSession с куки-менеджером
+│   └── utils.py              — утилиты: is_media_url, normalize, proxy
+│
+├── src/downloader/
+│   └── media_downloader.py  — загрузка: single/multi-thread, resume, rate limit
+│
+├── src/
+│   ├── fix_lxml.py           — патч совместимости lxml.html.clean
+│   ├── fix_brotli.py         — патч поддержки Brotli для aiohttp
+│   └── constants.py          — централизованные константы и настройки
+│
+└── resources/
+    ├── dark_theme.qss                — stylesheet тёмной темы
+    ├── domain_blocklist.txt          — чёрный список доменов
+    ├── icon.ico                      — иконка приложения
+    └── patterns/
+        └── site_patterns.json       — встроенные паттерны сайтов
+```
 
-## License
+### Ключевые механизмы
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+**Приоритизация URL** — многофакторная система скоринга:
+1. Прямые медиа-URL получают ×25
+2. Ссылки из изображений (image-linked) — ×20
+3. Совпадение пути с начальной страницей — ×3+ за каждый общий компонент
+4. Репутация домена (сколько медиа уже найдено)
+5. Домашние страницы и навигация — понижение до ×0.005
 
-## Changelog
+**Система карантина** — проблемные домены временно помещаются в карантин и повторно проверяются ограниченное число раз.
 
-### Version 1.0.0
-- Initial release with core parsing and downloading functionality
-- Intelligent URL prioritization system
-- Full-size image detection
-- Multi-threaded processing
-- Modern GUI with dark theme
+**Natural completion** — парсинг автоматически завершается, когда все три очереди (URL, загрузка, карантин) пусты и нет активных задач более 5 секунд.
 
-## Troubleshooting
+---
 
-### Common Issues
+## Формат пользовательских паттернов
 
-**Media files are not being detected:**
-- Check if the website uses JavaScript to load content (enable dynamic processing)
-- Verify the URL is accessible and contains media
-- Check the application logs for parsing errors
+Файл `site_patterns.json`:
 
-**Download speeds are slow:**
-- Increase the number of downloader threads in settings
-- Check your internet connection
-- Some sites may have rate limiting
+```json
+{
+  "version": "1.0",
+  "patterns": [
+    {
+      "site": "Example Gallery",
+      "domains": ["example.com", "cdn.example.com"],
+      "url_patterns": ["/gallery/"],
+      "image_transformations": {
+        "replace_patterns": [
+          { "source": "/thumbs/", "target": "/full/" },
+          { "source": "_thumb\\.jpg", "target": "_original.jpg" }
+        ]
+      }
+    }
+  ]
+}
+```
 
-**Application crashes on startup:**
-- Ensure all dependencies are installed: `pip install -r requirements.txt`
-- Check Python version compatibility (3.8+ required)
-- Try running from command line to see error messages
+---
 
-## Support
+## Устранение проблем
 
-If you encounter any issues or have questions:
+### Медиа не обнаруживается
+- Включите **Process JavaScript** в настройках
+- Убедитесь, что URL доступен в браузере
+- Проверьте лог на наличие ошибок парсинга
+- Попробуйте добавить **Imagus Sieve** для конкретного сайта
 
-1. Check the [Issues](https://github.com/yourusername/yourreponame/issues) page
-2. Create a new issue with detailed information about the problem
-3. Include log files and screenshots if relevant
+### Низкая скорость загрузки
+- Увеличьте **Downloader Threads** до 16–32
+- Увеличьте **Threads per File** до 4–8 (для больших файлов)
+- Проверьте, не ограничивает ли сайт скорость (rate limiting)
 
-## Acknowledgments
+### Ошибки при запуске
+```bash
+pip install -r requirements.txt
+python main.py
+```
+- Убедитесь, что Python ≥ 3.8
+- На Windows может потребоваться `pip install brotli brotlicffi`
 
-- Built with PySide6 for the GUI framework
-- Uses aiohttp for asynchronous web requests
-- BeautifulSoup for HTML parsing
-- Thanks to all contributors and testers
+### Приложение «зависло»
+- Проверьте лог — возможно, обрабатываются URLs из карантина
+- Дождитесь **Idle completion** (5 секунд без активности)
+- Используйте кнопку **Stop** для принудительной остановки
+
+---
+
+## Лицензия
+
+[MIT License](LICENSE)
+
+---
+
+## Благодарности
+
+- **PySide6** — GUI-фреймворк
+- **aiohttp** — асинхронные HTTP-запросы
+- **BeautifulSoup 4** + **lxml** — парсинг HTML
+- **Pillow** + **filetype** — определение типов медиа
+- **requests** — fallback для TLS-блокировок
+- Разработчикам [Imagus](https://github.com/Imagus/imagus) за формат sieve-файлов

@@ -52,15 +52,18 @@ class ParserManager(QObject):
     current_progress_updated = Signal(int)
     parsing_finished = Signal()
     status_updated = Signal(str)
+    task_ended = Signal(str)  # "completed" | "stopped" | "failed"
 
     def __init__(
-        self, url: str, download_path: str, settings: Dict[str, Any], log_handler
+        self, url: str, download_path: str, settings: Dict[str, Any], log_handler,
+        task_id: str = None,
     ):
         super().__init__()
         self.start_url = url
-        self.download_path = download_path 
-        self.settings = settings 
+        self.download_path = download_path
+        self.settings = settings
         self.log = log_handler
+        self.task_id = task_id  # Used for isolated session state paths
 
         self.is_running = False
         self.is_paused = False
@@ -98,6 +101,7 @@ class ParserManager(QObject):
             "files_downloaded": 0, "files_skipped": 0,
         }
         self._completed_naturally = False  # True only when parsing finished by itself, not user Stop
+        self._had_critical_error = False
         self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
         self._active_tasks = 0
         self._active_tasks_lock = threading.Lock()
@@ -131,6 +135,7 @@ class ParserManager(QObject):
         self.is_running = False
         self.is_paused = False
         self._completed_naturally = False
+        self._had_critical_error = False
         self._last_activity_time = time.time()
 
     def _load_domain_blocklist(self, blocklist_file_name: str = K.DOMAIN_BLOCKLIST_FILENAME) -> Set[str]:
@@ -252,11 +257,20 @@ class ParserManager(QObject):
         # created inside a running event loop context.
         self.url_queue.reset_async_primitives()
 
-        # Seed the initial URL into the queue (must be done after reset)
-        await self.url_queue.put(
-            self.start_url, 0, self.start_url,
-            {"is_start_url": True, "start_url": self.start_url}
-        )
+        # Load saved state (processed_urls, downloaded_files, queue items)
+        # This runs in the correct event loop thread, unlike the dead
+        # run_coroutine_threadsafe(self.loop) call that was previously in
+        # MainWindow._launch_parser_for_task.
+        await self.load_state(self.download_path)
+
+        # Seed the initial URL ONLY for fresh sessions (no state loaded).
+        # When resuming, load_state already populated url_queue_items and
+        # processed_urls, so re-seeding would cause duplicate processing.
+        if len(self.processed_urls) == 0:
+            await self.url_queue.put(
+                self.start_url, 0, self.start_url,
+                {"is_start_url": True, "start_url": self.start_url}
+            )
 
         # Create the shared requests.Session here so its lifecycle is entirely
         # within _main_task: created before workers start, closed in finally
@@ -290,6 +304,7 @@ class ParserManager(QObject):
                     await asyncio.gather(*all_tasks, return_exceptions=True)
         except Exception as e:
             logger.error(f"Critical error in main task: {str(e)}", exc_info=True)
+            self._had_critical_error = True
         finally:
             logger.info("_main_task finished.")
             # Close shared session AFTER gather — all workers are stopped at this point
@@ -299,9 +314,16 @@ class ParserManager(QObject):
                 logger.info("Shared downloader session closed.")
             except Exception as e:
                 logger.error(f"Error closing shared downloader session: {e}", exc_info=True)
-            # Emit only when parsing completed naturally (not stopped by user)
+            # Emit parsing_finished for backwards compatibility (only natural completion)
             if self._completed_naturally:
                 self.parsing_finished.emit()
+            # Always emit task_ended so the queue manager knows the task finished
+            if getattr(self, "_had_critical_error", False):
+                self.task_ended.emit("failed")
+            elif self._completed_naturally:
+                self.task_ended.emit("completed")
+            else:
+                self.task_ended.emit("stopped")
 
     async def _completion_monitor(self) -> None:
         """Monitors queue emptiness and triggers natural completion when all work is done.
@@ -643,41 +665,56 @@ class ParserManager(QObject):
         logger.info(f"Downloader worker {threading.get_ident()} finished.")
 
     def pause_parsing(self) -> None:
-        self.is_paused = True; self._pause_event.clear(); logger.info("Parsing paused")
+        self.is_paused = True
+        logger.info("Parsing paused")
+        # Schedule _pause_event.clear() in the correct event loop thread
+        if self.loop and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._pause_event.clear)
+        elif self._pause_event is not None:
+            self._pause_event.clear()
 
     def resume_parsing(self) -> None:
-        self.is_paused = False; self._pause_event.set(); logger.info("Parsing resumed")
+        self.is_paused = False
+        logger.info("Parsing resumed")
+        # Schedule _pause_event.set() in the correct event loop thread
+        if self.loop and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._pause_event.set)
+        elif self._pause_event is not None:
+            self._pause_event.set()
+
+    def _drain_queues(self) -> None:
+        """Drain asyncio queues. Must run in the event loop thread."""
+        try:
+            while not self.download_queue.empty():
+                self.download_queue.get_nowait()
+                self.download_queue.task_done()
+        except Exception:
+            pass
+        try:
+            while not self.quarantine_queue.empty():
+                self.quarantine_queue.get_nowait()
+                self.quarantine_queue.task_done()
+        except Exception:
+            pass
+        if hasattr(self.url_queue, '_queue'):
+            self.url_queue._queue.clear()
+        if hasattr(self.url_queue, '_not_empty'):
+            self.url_queue._not_empty.set()  # Wake blocked workers so they can exit
 
     def stop_parsing(self) -> None:
         logger.info("Attempting to stop parsing...")
         self.is_running = False
-        self._stop_event.set()
-        self._pause_event.set()  # Unblock workers waiting on pause
-        try:
-            # Drain Download Queue
-            try:
-                while not self.download_queue.empty():
-                    self.download_queue.get_nowait()
-                    self.download_queue.task_done()
-            except (asyncio.QueueEmpty, ValueError, Exception): pass
-
-            # Drain Quarantine Queue
-            try:
-                while not self.quarantine_queue.empty():
-                    self.quarantine_queue.get_nowait()
-                    self.quarantine_queue.task_done()
-            except (asyncio.QueueEmpty, ValueError, Exception): pass
-
-            # Clear PriorityURLQueue safely
-            if hasattr(self.url_queue, '_queue'):
-                self.url_queue._queue.clear()
-            if hasattr(self.url_queue, '_not_empty'):
-                self.url_queue._not_empty.set()  # Wake blocked workers so they can exit
-                
-            # Signal parser manager itself
-            logger.info("Queues cleared and workers signaled for exit.")
-        except Exception as e:
-            logger.error(f"Error during stop cleanup: {str(e)}", exc_info=True)
+        # Thread-safe signaling to the event loop thread
+        if self.loop and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._stop_event.set)
+            self.loop.call_soon_threadsafe(self._pause_event.set)
+            self.loop.call_soon_threadsafe(self._drain_queues)
+        else:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._pause_event is not None:
+                self._pause_event.set()
+            self._drain_queues()
         logger.info("Parsing stop procedure initiated.")
 
     def _monitor_progress(self) -> None:
@@ -742,36 +779,64 @@ class ParserManager(QObject):
     def get_stats(self) -> Dict[str, int]: return self.stats.copy()
 
     async def save_state(self, task_download_path: str) -> None:
+        # Wait for in-flight tasks to finish (max 5 sec timeout to prevent deadlock)
+        timeout = 0
+        while self._active_tasks > 0 and timeout < 50:
+            await asyncio.sleep(0.1)
+            timeout += 1
+        if self._active_tasks > 0:
+            logger.warning(f"save_state: {self._active_tasks} in-flight tasks did not finish within 5s")
+
         url_queue_items = []
         if hasattr(self.url_queue, '_queue'):
-             url_queue_items = [item_tuple_with_priority[1] for item_tuple_with_priority in self.url_queue._queue]
-        
+            for item in self.url_queue._queue:
+                if hasattr(item, 'url'):
+                    url_queue_items.append(
+                        (item.url, item.depth, item.source_url, item.context)
+                    )
+                elif isinstance(item, tuple) and len(item) >= 4:
+                    url_queue_items.append(item)
+
         download_queue_items = []
-        temp_dq_holder = [] 
-        while not self.download_queue.empty():
-            try: item = self.download_queue.get_nowait(); temp_dq_holder.append(item)
-            except asyncio.QueueEmpty: break
-        download_queue_items.extend(temp_dq_holder) 
-        for item in temp_dq_holder: await self.download_queue.put(item) 
+        if hasattr(self.download_queue, '_queue'):
+            download_queue_items = list(self.download_queue._queue)
+
+        quarantine_queue_items = []
+        if hasattr(self.quarantine_queue, '_queue'):
+            quarantine_queue_items = list(self.quarantine_queue._queue)
 
         async with self._processed_lock:
             state = {
-                "url_queue_items": url_queue_items, "download_queue_items": download_queue_items,
-                "processed_urls": list(self.processed_urls), "downloaded_files": list(self.downloaded_files),
+                "url_queue_items": url_queue_items,
+                "download_queue_items": download_queue_items,
+                "quarantine_queue_items": quarantine_queue_items,
+                "processed_urls": list(self.processed_urls),
+                "downloaded_files": list(self.downloaded_files),
                 "stats": self.stats, "settings": self.settings, "start_url": self.start_url,
-                "download_path": self.download_path, 
+                "download_path": self.download_path,
                 "domain_health": self.domain_health, "quarantined_domains": list(self.quarantined_domains)
             }
-        
-        session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR) 
+
+        logger.info(f"save_state: {len(url_queue_items)} URL items, {len(download_queue_items)} download items, {len(self.downloaded_files)} downloaded files")
+
+        # Run pickle.dumps in a thread pool so it doesn't block the event loop.
+        loop = asyncio.get_running_loop()
+        pickled = await loop.run_in_executor(None, pickle.dumps, state)
+
+        session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR)
+        if self.task_id:
+            session_dir = os.path.join(session_dir, self.task_id)
         os.makedirs(session_dir, exist_ok=True)
         full_state_path = os.path.join(session_dir, K.SESSION_STATE_FILENAME)
 
-        async with aiofiles.open(full_state_path, "wb") as f: await f.write(pickle.dumps(state))
+        async with aiofiles.open(full_state_path, "wb") as f: await f.write(pickled)
         logger.info(f"Session state saved to {full_state_path}")
 
-    async def load_state(self, task_download_path: str) -> None: 
-        session_file_path = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR, K.SESSION_STATE_FILENAME)
+    async def load_state(self, task_download_path: str) -> None:
+        session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR)
+        if self.task_id:
+            session_dir = os.path.join(session_dir, self.task_id)
+        session_file_path = os.path.join(session_dir, K.SESSION_STATE_FILENAME)
         if not os.path.exists(session_file_path):
             logger.info(f"No session state file found at {session_file_path}. Starting fresh.")
             return
@@ -780,9 +845,12 @@ class ParserManager(QObject):
             async with aiofiles.open(session_file_path, "rb") as f: data = await f.read(); state = pickle.loads(data)
             
             for item_tuple in state.get("url_queue_items", []):
-                if len(item_tuple) == 4: # url, depth, source_url, context
+                if len(item_tuple) == 4:
                      await self.url_queue.put(item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3])
-            for item in state.get("download_queue_items", []): await self.download_queue.put(item)
+            for item in state.get("download_queue_items", []):
+                await self.download_queue.put(item)
+            for item in state.get("quarantine_queue_items", []):
+                await self.quarantine_queue.put(item)
 
             self.processed_urls = set(state.get("processed_urls", []))
             self.downloaded_files = set(state.get("downloaded_files", [])) 
