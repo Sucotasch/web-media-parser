@@ -481,7 +481,7 @@ class ParserManager(QObject):
         self.status_updated.emit(f"Processed: {url}")
 
     async def _parser_worker(self, session):
-        while not self._stop_event.is_set():
+        while self.is_running and not self._stop_event.is_set():
             if self.is_paused:
                 await self._pause_event.wait()
                 if self._stop_event.is_set(): break
@@ -502,6 +502,9 @@ class ParserManager(QObject):
             current_url, depth, source_page_url, context = url_data
             logger.debug(f"Parser worker got URL: {current_url} (depth={depth})")
             try:
+                # Check before expensive network call
+                if not self.is_running:
+                    self.url_queue.task_done(); break
                 if not current_url.startswith(("http://", "https://")):
                     current_url = urljoin(source_page_url or self.start_url, current_url)
                 current_url = normalize_url(current_url)
@@ -557,8 +560,6 @@ class ParserManager(QObject):
                     target_dir_path_final = os.path.join(self.download_path, subdirname)
 
                 full_filepath_for_downloader = os.path.join(target_dir_path_final, base_filename)
-                self.downloaded_files.add(abs_url) 
-
                 media_item = {
                     "url": abs_url, "source_url": source_url, "media_type": media_type,
                     "attrs": attrs, "filepath": full_filepath_for_downloader,
@@ -571,7 +572,7 @@ class ParserManager(QObject):
                 logger.error(f"Error processing media file {url}: {str(err)}", exc_info=True)
 
     async def _downloader_worker(self) -> None:
-        while not self._stop_event.is_set():
+        while self.is_running and not self._stop_event.is_set():
             try:
                 if self.is_paused:
                     await self._pause_event.wait()
@@ -587,6 +588,9 @@ class ParserManager(QObject):
                 self._active_tasks += 1
 
             try:
+                # Check before expensive download
+                if not self.is_running:
+                    self.download_queue.task_done(); break
                 url = media_item["url"]
                 filepath_from_queue = media_item["filepath"] 
                 domain = urlparse(url).netloc
@@ -667,19 +671,23 @@ class ParserManager(QObject):
     def pause_parsing(self) -> None:
         self.is_paused = True
         logger.info("Parsing paused")
+        if self._pause_event is None:
+            return
         # Schedule _pause_event.clear() in the correct event loop thread
         if self.loop and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self._pause_event.clear)
-        elif self._pause_event is not None:
+        else:
             self._pause_event.clear()
 
     def resume_parsing(self) -> None:
         self.is_paused = False
         logger.info("Parsing resumed")
+        if self._pause_event is None:
+            return
         # Schedule _pause_event.set() in the correct event loop thread
         if self.loop and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self._pause_event.set)
-        elif self._pause_event is not None:
+        else:
             self._pause_event.set()
 
     def _drain_queues(self) -> None:
@@ -705,7 +713,7 @@ class ParserManager(QObject):
         logger.info("Attempting to stop parsing...")
         self.is_running = False
         # Thread-safe signaling to the event loop thread
-        if self.loop and not self.loop.is_closed():
+        if self._stop_event is not None and self.loop and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self._stop_event.set)
             self.loop.call_soon_threadsafe(self._pause_event.set)
             self.loop.call_soon_threadsafe(self._drain_queues)
@@ -714,18 +722,19 @@ class ParserManager(QObject):
                 self._stop_event.set()
             if self._pause_event is not None:
                 self._pause_event.set()
-            self._drain_queues()
+            if self.download_queue is not None:
+                self._drain_queues()
         logger.info("Parsing stop procedure initiated.")
 
     def _monitor_progress(self) -> None:
         while self.is_running and not self._stop_event.is_set():
             try:
-                if self.is_paused and not self._pause_event.is_set(): time.sleep(0.5); continue
+                if self.is_paused and not self._pause_event.is_set(): time.sleep(0.2); continue
                 total_found = self.stats["images_found"] + self.stats["videos_found"]
                 total_proc = self.stats["files_downloaded"] + self.stats["files_skipped"]
                 if total_found > 0: self.total_progress_updated.emit(int((total_proc / total_found) * 100))
                 else: self.total_progress_updated.emit(0) 
-                time.sleep(0.5) 
+                time.sleep(0.2) 
             except Exception as e: logger.error(f"Error in progress monitor: {str(e)}", exc_info=True); time.sleep(1)
         logger.info("Progress monitor finished.")
 
@@ -828,9 +837,25 @@ class ParserManager(QObject):
             session_dir = os.path.join(session_dir, self.task_id)
         os.makedirs(session_dir, exist_ok=True)
         full_state_path = os.path.join(session_dir, K.SESSION_STATE_FILENAME)
+        tmp_path = full_state_path + ".tmp"
 
-        async with aiofiles.open(full_state_path, "wb") as f: await f.write(pickled)
-        logger.info(f"Session state saved to {full_state_path}")
+        # Atomic write: write to temp file → fsync → rename
+        # Prevents corruption if process is killed mid-write
+        try:
+            async with aiofiles.open(tmp_path, "wb") as f:
+                await f.write(pickled)
+                await f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, full_state_path)  # atomic on Windows/NTFS
+            logger.info(f"Session state saved to {full_state_path}")
+        except Exception as e:
+            logger.error(f"Error saving state: {e}")
+            # Cleanup temp file on failure
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     async def load_state(self, task_download_path: str) -> None:
         session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR)
@@ -844,20 +869,34 @@ class ParserManager(QObject):
         try:
             async with aiofiles.open(session_file_path, "rb") as f: data = await f.read(); state = pickle.loads(data)
             
-            for item_tuple in state.get("url_queue_items", []):
-                if len(item_tuple) == 4:
-                     await self.url_queue.put(item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3])
-            for item in state.get("download_queue_items", []):
-                await self.download_queue.put(item)
-            for item in state.get("quarantine_queue_items", []):
-                await self.quarantine_queue.put(item)
-
+            # Restore sets FIRST so we can filter download_queue
             self.processed_urls = set(state.get("processed_urls", []))
-            self.downloaded_files = set(state.get("downloaded_files", [])) 
+            self.downloaded_files = set(state.get("downloaded_files", []))
             self.stats = state.get("stats", self.stats)
             self.start_url = state.get("start_url", self.start_url)
             self.domain_health = state.get("domain_health", {})
             self.quarantined_domains = set(state.get("quarantined_domains", []))
+
+            for item_tuple in state.get("url_queue_items", []):
+                if len(item_tuple) == 4:
+                     # IMPORTANT: Use bypass_checks=True during restoration to ensure
+                     # all previously valid URLs are re-queued correctly.
+                     await self.url_queue.put(item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3], bypass_checks=True)
+
+            # Restore download_queue, but skip items whose URL was already downloaded.
+            # This prevents re-downloading files that completed before the previous pause.
+            skipped_downloads = 0
+            for item in state.get("download_queue_items", []):
+                if item.get("url") not in self.downloaded_files:
+                    await self.download_queue.put(item)
+                else:
+                    skipped_downloads += 1
+            if skipped_downloads:
+                logger.info(f"load_state: skipped {skipped_downloads} already-downloaded items from download_queue")
+
+            for item in state.get("quarantine_queue_items", []):
+                await self.quarantine_queue.put(item)
+
             logger.info(f"Successfully loaded state from {session_file_path}")
         except Exception as err:
             logger.error(f"Error loading state from {session_file_path}: {str(err)}", exc_info=True)

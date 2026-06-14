@@ -61,6 +61,7 @@ class SitePatternManager:
                 logger.info(f"Successfully loaded custom Imagus sieve from {self.imagus_sieve_path}")
 
         # If no custom patterns or custom patterns failed to load, use built-in patterns
+        search_dirs = []
         if not self.patterns and self.enable_built_in:
             # Check for patterns file in various locations
             
@@ -163,6 +164,8 @@ class SitePatternManager:
                 data = json.load(f)
             
             rules_count = 0
+            js_converted = 0
+            js_skipped = 0
             for rule_name, rule_data in data.items():
                 if not isinstance(rule_data, dict): continue
                 
@@ -170,13 +173,19 @@ class SitePatternManager:
                 to_rule = rule_data.get('to', '')
                 res_rule = rule_data.get('res', '')
                 
-                # Skip rules with JS (starts with :)
-                if (isinstance(to_rule, str) and to_rule.startswith(':')) or \
-                   (isinstance(res_rule, str) and res_rule.startswith(':')):
-                    continue
+                # Handle JS rules (starts with :)
+                if isinstance(to_rule, str) and to_rule.startswith(':'):
+                    # Try to convert JS rule to Python callable
+                    callable_fn = self._try_parse_imagus_js(to_rule)
+                    if callable_fn:
+                        rule_data['to_callable'] = callable_fn
+                        js_converted += 1
+                    else:
+                        js_skipped += 1
+                        continue  # Can't convert — skip entirely
                 
-                # If it has a 'to' field but no JS, it's a candidate for transform_image_url
-                if to_rule:
+                elif isinstance(to_rule, str) and to_rule:
+                    # Simple regex rule — existing logic
                     rule_data['to_python'] = self._sanitize_imagus_target(to_rule)
                 
                 # Indexing by domain from 'link' property
@@ -197,7 +206,12 @@ class SitePatternManager:
                 rules_count += 1
             
             self.loaded_files.append(file_path)
-            logger.info(f"Loaded {rules_count} Imagus sieve rules from {file_path}")
+            log_parts = [f"Loaded {rules_count} Imagus sieve rules from {file_path}"]
+            if js_converted:
+                log_parts.append(f"JS converted: {js_converted}")
+            if js_skipped:
+                log_parts.append(f"JS skipped (needs DOM): {js_skipped}")
+            logger.info(" | ".join(log_parts))
             return True
         except Exception as e:
             logger.error(f"Error loading Imagus sieve {file_path}: {str(e)}")
@@ -209,6 +223,238 @@ class SitePatternManager:
         # Use a lambda for replacement to safely construct the \g<n> syntax
         # Limit to 1 digit ($1-$9) to avoid greedy matching with literal digits
         return re.sub(r'(?<!\\)\$(\d+)', lambda m: f'\\g<{m.group(1)}>', target)
+
+    # --- JS rule conversion ---
+
+    # DOM keywords that indicate the rule needs browser context
+    _DOM_KEYWORDS = (
+        'this.node', 'this.TRG', 'this.find', 'this.set', 'this.prepare',
+        'this.getImages', 'document.', 'window.', 'location.',
+        'Port.send', 'XMLHttpRequest', 'fetch(', 'addEventListener',
+        'querySelector', 'getElementById', 'getElementsBy',
+        'createElement', 'appendChild', 'innerHTML', 'outerHTML',
+        'sessionStorage', 'localStorage',
+    )
+
+    def _needs_dom(self, js_code: str) -> bool:
+        """Check if JS code requires browser DOM/context to execute."""
+        return any(kw in js_code for kw in self._DOM_KEYWORDS)
+
+    def _try_parse_imagus_js(self, js_code: str):
+        """Try to convert an Imagus JS rule to a Python callable.
+
+        Returns a callable(match_object) -> str | None, or None if conversion fails.
+
+        Supports common patterns:
+        - return $[0], $[1], etc. (regex match groups)
+        - return 'prefix' + $[1] + 'suffix' (string concatenation)
+        - return $[2] ? expr1 : expr2 (ternary operator)
+        - $[1].replace(/pattern/, 'replacement') (regex replace)
+        - return `template ${$[1]}` (template literals)
+        - #ext1 ext2# expansion → multiple URLs separated by \\n
+        """
+        if not js_code.startswith(':'):
+            return None
+        js_code = js_code[1:].strip()  # Remove leading ':'
+
+        if self._needs_dom(js_code):
+            return None
+
+        # Extract the return expression
+        # Handle multi-line: find the last 'return' statement
+        return_match = re.search(r'return\s+(.+?)(?:;?\s*$)', js_code, re.MULTILINE | re.DOTALL)
+        if not return_match:
+            return None
+        expr = return_match.group(1).strip().rstrip(';').strip()
+
+        # Try to build a Python callable from the expression
+        return self._build_js_callable(expr, js_code)
+
+    def _build_js_callable(self, expr: str, full_js: str):
+        """Build a Python callable from a JS return expression."""
+        import re as _re
+
+        # Normalize $[n] → group(n) references for internal processing
+        # We'll compile a function that receives a match object
+
+        # Check for #ext# pattern (variant expansion)
+        has_ext_pattern = '#ext#' in expr or bool(_re.search(r"'#[^']+#'", expr))
+
+        # Convert JS expression to Python expression
+        py_expr = self._js_expr_to_python(expr)
+        if py_expr is None:
+            return None
+
+        # Build the function
+        func_src = f"""
+def _transform(m):
+    import re as _re
+    g = lambda n: m.group(n) if m.lastindex and n <= m.lastindex else ''
+    g0 = m.group(0)
+    try:
+        result = {py_expr}
+        if result is None or result is False:
+            return None
+        result = str(result)
+        # Expand #ext# patterns: '#jpg png#' → 'jpg', 'png'
+        ext_match = _re.search(r"'(#[^']+#)'", result)
+        if ext_match:
+            exts = ext_match.group(1).strip('#').split()
+            result = result[:ext_match.start(1)] + exts[0] + result[ext_match.end(1):]
+            variants = [result]
+            for ext in exts[1:]:
+                v = result[:ext_match.start(1)] + ext + result[ext_match.end(1):]
+                variants.append(v)
+            return '\\n'.join(variants)
+        return result
+    except Exception:
+        return None
+"""
+        try:
+            namespace = {}
+            exec(func_src, namespace)
+            return namespace['_transform']
+        except Exception:
+            return None
+
+    def _js_expr_to_python(self, expr: str) -> str | None:
+        """Convert a JS expression to a Python expression string.
+
+        Handles: $[n] refs, string concat, ternary, .replace(), template literals.
+        Returns None if the expression is too complex to convert.
+        """
+        import re as _re
+
+        # Template literal: `prefix${expr}suffix`
+        tl_match = _re.match(r'`(.+)`$', expr, _re.DOTALL)
+        if tl_match:
+            template = tl_match.group(1)
+            # Convert ${$[n]} → f'...{g(n)}...'
+            py_template = _re.sub(r'\$\{(\$?\[(\d+)\])\}', lambda m: '{g(' + m.group(2) + ')}', template)
+            py_template = _re.sub(r'\$\{([^}]+)\}', lambda m: '{' + m.group(1).replace('$[', 'g(').replace(']', ')') + '}', py_template)
+            return "f'" + py_template.replace("'", "\\'") + "'"
+
+        # Ternary: $[2] ? expr1 : expr2
+        ternary_match = _re.match(r'(.+?)\s*\?\s*(.+?)\s*:\s*(.+)$', expr)
+        if ternary_match:
+            cond, if_true, if_false = ternary_match.groups()
+            py_cond = self._js_expr_to_python(cond.strip())
+            py_true = self._js_expr_to_python(if_true.strip())
+            py_false = self._js_expr_to_python(if_false.strip())
+            if py_cond and py_true and py_false:
+                return f"({py_true} if {py_cond} else {py_false})"
+
+        # String concatenation: pieces joined with +
+        # Split by + but not inside strings or $[n]
+        parts = self._split_js_concat(expr)
+        if parts and len(parts) > 1:
+            py_parts = []
+            for part in parts:
+                py_part = self._js_expr_to_python_single(part.strip())
+                if py_part is None:
+                    return None
+                py_parts.append(py_part)
+            return ' + '.join(py_parts)
+
+        # Single expression
+        return self._js_expr_to_python_single(expr)
+
+    def _split_js_concat(self, expr: str) -> list[str]:
+        """Split a JS concatenation expression by +, respecting strings and $[n]."""
+        parts = []
+        current = ''
+        depth = 0
+        in_string = None
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if in_string:
+                current += ch
+                if ch == in_string and expr[i-1:i] != '\\':
+                    in_string = None
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_string = ch
+                current += ch
+                i += 1
+                continue
+            if ch == '[':
+                depth += 1
+                current += ch
+                i += 1
+                continue
+            if ch == ']':
+                depth -= 1
+                current += ch
+                i += 1
+                continue
+            if ch == '+' and depth == 0:
+                parts.append(current)
+                current = ''
+                i += 1
+                continue
+            current += ch
+            i += 1
+        if current.strip():
+            parts.append(current)
+        return parts
+
+    def _js_expr_to_python_single(self, expr: str) -> str | None:
+        """Convert a single JS expression (no concat, no ternary) to Python."""
+        import re as _re
+
+        expr = expr.strip()
+
+        # $[n] → g(n)
+        if _re.fullmatch(r'\$\[(\d+)\]', expr):
+            n = _re.search(r'\d+', expr).group()
+            return f'g({n})'
+
+        # String literal
+        if (expr.startswith('"') and expr.endswith('"')) or \
+           (expr.startswith("'") and expr.endswith("'")):
+            inner = expr[1:-1]
+            return "'" + inner.replace("'", "\\'") + "'"
+
+        # .replace(/pattern/, 'replacement')
+        replace_match = _re.match(r'(.+?)\.replace\s*\(\s*/(.+?)/([gimsuy]*)\s*,\s*(.+?)\s*\)\s*$', expr)
+        if replace_match:
+            target, pattern, flags, replacement = replace_match.groups()
+            py_target = self._js_expr_to_python_single(target)
+            py_repl = self._js_expr_to_python_single(replacement)
+            if py_target and py_repl:
+                flag_str = 're.IGNORECASE' if 'i' in flags else '0'
+                return f"_re.sub(r'{pattern}', {py_repl}, {py_target}, flags={flag_str})"
+
+        # Math operations: Math.ceil(...), Math.random()
+        if 'Math.' in expr:
+            # Convert Math.ceil(x) → int(math.ceil(x)), etc.
+            py_expr = expr
+            py_expr = _re.sub(r'Math\.ceil\((.+?)\)', r'int(__import__("math").ceil(\1))', py_expr)
+            py_expr = _re.sub(r'Math\.random\(\)', '__import__("math").random()', py_expr)
+            py_expr = _re.sub(r'Math\.floor\((.+?)\)', r'int(__import__("math").floor(\1))', py_expr)
+            if py_expr != expr:
+                return py_expr
+
+        # atob(...) → base64.b64decode(...).decode()
+        atob_match = _re.match(r'atob\((.+?)\)', expr)
+        if atob_match:
+            inner = atob_match.group(1)
+            py_inner = self._js_expr_to_python_single(inner)
+            if py_inner:
+                return f"__import__('base64').b64decode({py_inner}).decode()"
+
+        # decodeURIComponent(...)
+        dec_match = _re.match(r'decodeURIComponent\((.+?)\)', expr)
+        if dec_match:
+            inner = dec_match.group(1)
+            py_inner = self._js_expr_to_python_single(inner)
+            if py_inner:
+                return f"__import__('urllib.parse').unquote({py_inner})"
+
+        # Fallback: return None (can't convert)
+        return None
 
     def _extract_domain_from_regex(self, regex_str: str) -> Optional[str]:
         """Heuristically extract a plain domain from a regex like '^(media\\.admagazine\\.ru/'"""
@@ -374,30 +620,47 @@ class SitePatternManager:
                 for v_url in url_variations:
                     match = re.search(img_regex, v_url, re.I)
                     if match:
+                        # Check for JS-converted callable first
+                        to_callable = rule.get('to_callable')
+                        if to_callable:
+                            try:
+                                substituted = to_callable(match)
+                                if substituted and substituted != v_url:
+                                    # Handle newline-separated variants
+                                    for variant in substituted.split('\n'):
+                                        variant = variant.strip()
+                                        if variant and '://' not in variant:
+                                            scheme = results[0].split('://', 1)[0]
+                                            variant = f"{scheme}://{variant}"
+                                        if variant and variant != v_url:
+                                            sieve_results.append(variant)
+                                    transformed = True
+                                break
+                            except Exception as e:
+                                logger.debug(f"Imagus callable failed: {e}")
+                                break
+
+                        # Fallback: regex substitution
                         to_pattern = rule.get('to_python', '')
                         if not to_pattern: continue
                         
                         # Apply substitution on the variation that matched
-                        # Using a lambda for replacement is safer as it avoids re-parsing the replacement string
                         try:
                             substituted = re.sub(img_regex, lambda m, pat=to_pattern: m.expand(pat), v_url, flags=re.IGNORECASE)
                         except Exception as e:
                             logger.debug(f"re.sub failed with pattern {to_pattern}: {e}")
-                            # Fallback to simple sub if expand fails
                             substituted = re.sub(img_regex, to_pattern, v_url, flags=re.IGNORECASE)
                         
-                        # If we matched a variation without scheme, re-add the scheme
                         if v_url != results[0] and '://' not in substituted:
                             scheme = results[0].split('://', 1)[0]
                             substituted = f"{scheme}://{substituted}"
                             
                         if substituted != results[0]:
                             logger.debug(f"Imagus match found: {img_regex} -> {substituted}")
-                            # Expand variants (#ext# and \n)
                             variants = self._expand_variants(substituted)
                             sieve_results.extend(variants)
                             transformed = True
-                        break # Found a match for this rule, no need to check other variations
+                        break
             except Exception as e: 
                 logger.debug(f"Error in Imagus rule processing: {e}")
                 pass

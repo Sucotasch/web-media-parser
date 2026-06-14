@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QTableView,
     QHeaderView,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QEventLoop, QItemSelectionModel, QTimer, QMetaObject
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QItemSelectionModel, QTimer, QMetaObject
 from PySide6.QtGui import QIcon, QDesktopServices, QStandardItemModel, QStandardItem, QColor
 import asyncio
 from src.gui.settings_dialog import SettingsDialog
@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
 
         # Initialize logging system
         self.setup_logging()
+        self._apply_file_logging()
 
         # Connect queue signals
         self.task_queue.task_added.connect(self._refresh_task_table)
@@ -102,11 +103,46 @@ class MainWindow(QMainWindow):
         # Add handler to the root logger
         root_logger.addHandler(self.log_handler)
 
+        # File handler (disabled by default, enabled via settings)
+        self._file_handler = None
+
         # Log initial message
         logging.info("Application started")
         logging.info(
             f"Log level set to: {logging.getLevelName(root_logger.getEffectiveLevel())}"
         )
+
+    def _apply_file_logging(self):
+        """Enable or disable file logging based on current settings."""
+        root_logger = logging.getLogger()
+        settings = self.settings_dialog.get_settings()
+        log_to_file = settings.get("log_to_file", False)
+        log_file = settings.get("log_file_path", "web_media_parser.log")
+
+        # Remove existing file handler
+        if self._file_handler:
+            root_logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
+
+        # Add new file handler if enabled
+        if log_to_file:
+            try:
+                # Resolve path relative to app directory if not absolute
+                if not os.path.isabs(log_file):
+                    from src.app_paths import get_app_dir
+                    log_file = os.path.join(get_app_dir(), log_file)
+
+                self._file_handler = logging.FileHandler(log_file, encoding="utf-8")
+                self._file_handler.setLevel(logging.DEBUG)
+                formatter = logging.Formatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                )
+                self._file_handler.setFormatter(formatter)
+                root_logger.addHandler(self._file_handler)
+                logging.info(f"File logging enabled: {log_file}")
+            except Exception as e:
+                logging.error(f"Failed to enable file logging: {e}")
 
     def init_ui(self):
         """
@@ -210,10 +246,25 @@ class MainWindow(QMainWindow):
         self.remove_task_btn.setToolTip("Remove selected task from queue")
         self.remove_task_btn.clicked.connect(self._remove_selected_task)
 
+        self.clear_history_btn = QPushButton("Clear History")
+        self.clear_history_btn.setToolTip("Clear all tasks, session files and download history")
+        self.clear_history_btn.clicked.connect(self._clear_download_history)
+
+        self.export_csv_btn = QPushButton("Export CSV")
+        self.export_csv_btn.setToolTip("Export task queue to CSV file")
+        self.export_csv_btn.clicked.connect(self._export_history_csv)
+
+        self.import_csv_btn = QPushButton("Import CSV")
+        self.import_csv_btn.setToolTip("Import tasks from CSV file")
+        self.import_csv_btn.clicked.connect(self._import_history_csv)
+
         qctrl_layout.addWidget(self.move_up_btn)
         qctrl_layout.addWidget(self.move_down_btn)
         qctrl_layout.addStretch()
         qctrl_layout.addWidget(self.remove_task_btn)
+        qctrl_layout.addWidget(self.clear_history_btn)
+        qctrl_layout.addWidget(self.export_csv_btn)
+        qctrl_layout.addWidget(self.import_csv_btn)
         queue_layout.addLayout(qctrl_layout)
 
         main_layout.addWidget(queue_group)
@@ -426,7 +477,7 @@ class MainWindow(QMainWindow):
         text_color = QColor("#64B5F6") if is_paused else None
         status_color = QColor("#FFD54F") if is_paused else None
         cols = [
-            str(idx + 1),
+            (str(idx + 1), None),
             (task.url, text_color),
             (task.status.value.capitalize(), status_color),
             (f"{task.stats.get('files_downloaded', 0)}", None),
@@ -492,6 +543,164 @@ class MainWindow(QMainWindow):
             self._refresh_task_table()
             self.log_handler.info(f"Task removed from queue: {tid}")
 
+    def _clear_download_history(self):
+        """Clear all tasks, session files and download history."""
+        # Confirm with user
+        reply = QMessageBox.question(
+            self,
+            "Clear History",
+            "Remove all tasks, session files and download history?\n"
+            "Downloaded files will NOT be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Stop active task if any
+        if self.task_queue.active_task:
+            self.stop_parsing()
+
+        # Clear task queue
+        count = len(self.task_queue.queue)
+        self.task_queue._queue.clear()
+        self.task_queue._active_id = None
+        self._refresh_task_table()
+        self.update_ui_state(False)
+        self.log_handler.info(f"Cleared {count} tasks from queue")
+
+        # Delete task_queue.json
+        queue_path = os.path.join(self.download_dir, "task_queue.json")
+        try:
+            if os.path.exists(queue_path):
+                os.remove(queue_path)
+                self.log_handler.info("Deleted task_queue.json")
+        except OSError as e:
+            self.log_handler.error(f"Error deleting task_queue.json: {e}")
+
+        # Delete all session files
+        sessions_dir = os.path.join(self.download_dir, "sessions")
+        deleted = 0
+        if os.path.isdir(sessions_dir):
+            import shutil
+            try:
+                shutil.rmtree(sessions_dir)
+                deleted = 1
+                self.log_handler.info("Deleted all session files")
+            except OSError as e:
+                self.log_handler.error(f"Error deleting sessions: {e}")
+
+        self.status_bar.showMessage(f"History cleared ({count} tasks, {deleted} session dirs)")
+        self.log_handler.info("Download history cleared")
+
+    def _export_history_csv(self):
+        """Export task queue to CSV file."""
+        if not self.task_queue.queue:
+            QMessageBox.information(self, "Export CSV", "No tasks to export.")
+            return
+
+        default_name = f"download_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export History to CSV",
+            os.path.join(self.download_dir, default_name),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            import csv
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "#", "ID", "URL", "Status", "Downloaded", "Found",
+                    "Created", "Started", "Completed", "Path"
+                ])
+                for i, task in enumerate(self.task_queue.queue, 1):
+                    stats = task.stats
+                    found = stats.get("images_found", 0) + stats.get("videos_found", 0)
+                    writer.writerow([
+                        i,
+                        task.id,
+                        task.url,
+                        task.status.value,
+                        stats.get("files_downloaded", 0),
+                        found,
+                        task.created_at.strftime("%Y-%m-%d %H:%M:%S") if task.created_at else "",
+                        task.started_at.strftime("%Y-%m-%d %H:%M:%S") if task.started_at else "",
+                        task.completed_at.strftime("%Y-%m-%d %H:%M:%S") if task.completed_at else "",
+                        task.download_path,
+                    ])
+
+            self.log_handler.info(f"Exported {len(self.task_queue.queue)} tasks to {file_path}")
+            self.status_bar.showMessage(f"Exported to {os.path.basename(file_path)}")
+        except Exception as e:
+            self.log_handler.error(f"Error exporting CSV: {e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
+
+    def _import_history_csv(self):
+        """Import tasks from CSV file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Tasks from CSV",
+            self.download_dir,
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            import csv
+            added = 0
+            skipped = 0
+            restored = 0
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    url = (row.get("URL") or "").strip()
+                    if not url:
+                        skipped += 1
+                        continue
+
+                    csv_path = (row.get("Path") or "").strip()
+                    csv_status = (row.get("Status") or "").strip().lower()
+
+                    # If original path exists with files — restore as completed
+                    if csv_path and os.path.isdir(csv_path) and os.listdir(csv_path):
+                        settings = self.settings_dialog.get_settings()
+                        task = self.task_queue.add_task(url, settings, csv_path)
+                        task.mark_completed()
+                        restored += 1
+                        continue
+
+                    # Otherwise create new folder and queue for download
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    try:
+                        domain = url.split("/")[2].replace(".", "_")
+                    except IndexError:
+                        domain = "unknown"
+                    task_folder = f"{domain}_{timestamp}"
+                    download_path = os.path.join(self.download_dir, task_folder)
+                    os.makedirs(download_path, exist_ok=True)
+
+                    settings = self.settings_dialog.get_settings()
+                    self.task_queue.add_task(url, settings, download_path)
+                    added += 1
+
+            self._refresh_task_table()
+            parts = [f"{added} queued"]
+            if restored:
+                parts.append(f"{restored} restored")
+            if skipped:
+                parts.append(f"{skipped} skipped")
+            summary = ", ".join(parts)
+            self.log_handler.info(f"Imported from {os.path.basename(file_path)}: {summary}")
+            self.status_bar.showMessage(f"Imported: {summary}")
+        except Exception as e:
+            self.log_handler.error(f"Error importing CSV: {e}")
+            QMessageBox.critical(self, "Import Error", f"Failed to import: {e}")
+
     def show_settings(self):
         """
         Show settings dialog and update download directory if changed
@@ -503,6 +712,8 @@ class MainWindow(QMainWindow):
             if last_dir and last_dir != old_dir:
                 self.download_dir = last_dir
                 self.dir_input.setText(last_dir)
+            # Apply file logging setting
+            self._apply_file_logging()
 
     async def _load_previous_state(self, state_path: str):
         """Load previous session state"""
@@ -555,25 +766,19 @@ class MainWindow(QMainWindow):
         self.log_handler.info(f"Pausing active task {active.id} to switch...")
 
         # 1. Save State
-        state_path_base = active.download_path
         try:
             if pm.loop and not pm.loop.is_closed():
                 future = asyncio.run_coroutine_threadsafe(
-                    pm.save_state(state_path_base), pm.loop
+                    pm.save_state(active.download_path), pm.loop
                 )
                 future.result(timeout=15)
         except Exception as e:
             self.log_handler.error(f"Error saving state on switch: {e}")
 
-        # 2. Hard Stop
+        # 2. Signal stop (non-blocking)
         pm.stop_parsing()
 
-        # 3. Wait
-        if self.parser_thread and self.parser_thread.isRunning():
-            self.parser_thread.quit()
-            self.parser_thread.wait()
-
-        # 4. Mark Paused
+        # 3. Mark Paused
         active.mark_paused()
         self._update_task_row(active.id)
         self.task_queue.clear_active()
@@ -661,12 +866,11 @@ class MainWindow(QMainWindow):
         """Pause active task or Resume selected task."""
         selected = self._get_selected_task()
 
-        # Check if we are resuming a selected paused task
+        # Resume path
         if selected and selected.status == TaskStatus.PAUSED and not self.task_queue.active_task:
-            self._launch_task(selected)
+            self._launch_task_from_queue(selected.id)
             return
 
-        # Otherwise, pause the active task
         if not self.parser_manager:
             return
 
@@ -674,33 +878,29 @@ class MainWindow(QMainWindow):
         if not active:
             return
 
-        self.log_handler.info(f"Pausing task {active.id}...")
+        self.log_handler.info(f"Pausing task {active.id} ({active.url})...")
         self.status_bar.showMessage("Saving state before pausing...")
 
-        state_path_base = active.download_path
+        # 1. Mark Paused FIRST so other signals (like on_task_ended) know we're pausing
+        active.mark_paused()
+        self._update_task_row(active.id)
 
-        # 1. Save State
+        # 2. Save State
         try:
             if self.parser_manager.loop and not self.parser_manager.loop.is_closed():
                 future = asyncio.run_coroutine_threadsafe(
-                    self.parser_manager.save_state(state_path_base), self.parser_manager.loop
+                    self.parser_manager.save_state(active.download_path), self.parser_manager.loop
                 )
                 future.result(timeout=15)
                 self.log_handler.info(f"State saved for {active.id}")
         except Exception as e:
             self.log_handler.error(f"Error saving state on pause: {e}")
 
-        # 2. Hard Stop
+        # 3. Signal stop (non-blocking — sets _stop_event via call_soon_threadsafe)
         self.parser_manager.stop_parsing()
 
-        # 3. Wait for thread
-        if self.parser_thread and self.parser_thread.isRunning():
-            self.parser_thread.quit()
-            self.parser_thread.wait()
-
-        # 4. Mark Paused & Update UI
-        active.mark_paused()
-        self._update_task_row(active.id)
+        # 4. Update UI immediately — don't block on thread cleanup
+        #    on_task_ended() will handle parser_thread cleanup asynchronously
         self.task_queue.clear_active()
         self.update_ui_state(False)
         self.status_bar.showMessage("Task paused")
@@ -722,11 +922,6 @@ class MainWindow(QMainWindow):
             self.parser_manager.stop_parsing()
             self.status_bar.showMessage("Stopping task...")
             self.log_handler.info("Stopping task...")
-
-            # Wait for thread to finish
-            if self.parser_thread and self.parser_thread.isRunning():
-                self.parser_thread.quit()
-                self.parser_thread.wait()
 
             # Clean up: delete partial files and state for the stopped task
             active = self.task_queue.active_task
@@ -850,19 +1045,6 @@ class MainWindow(QMainWindow):
                     self._launch_parser_for_task(next_task)
                     self.status_bar.showMessage(f"Auto-started: {next_task.url}")
 
-    async def _save_session_async(self):
-        """
-        Async helper method to save session state
-        """
-        try:
-            state_dir = os.path.join(self.download_dir, "sessions")
-            os.makedirs(state_dir, exist_ok=True)
-            state_path = os.path.join(state_dir, "last_session.pkl")
-            await self.parser_manager.save_state(state_path)
-            self.log_handler.info(f"Session state saved to: {state_path}")
-        except Exception as e:
-            self.log_handler.error(f"Error saving session state: {str(e)}")
-
     def run_coroutine(self, coroutine):
         """Run a coroutine in the Qt event loop"""
         try:
@@ -892,27 +1074,26 @@ class MainWindow(QMainWindow):
 
         pm = self.parser_manager
         if pm and pm.is_running:
-            # If paused, state is already saved. If running, save then stop.
             if not pm.is_paused:
-                self.status_bar.showMessage("Stopping task and saving state…")
-                loop = QEventLoop()
+                # Save parser state before stopping
+                active = self.task_queue.active_task
+                if active and pm.loop and not pm.loop.is_closed():
+                    self.status_bar.showMessage("Saving state and stopping task...")
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(
+                            pm.save_state(active.download_path), pm.loop
+                        )
+                        future.result(timeout=5)
+                    except Exception as e:
+                        self.log_handler.error(f"Error saving state on close: {e}")
 
-                async def save_and_stop():
-                    await self._save_session_async()
-                    self.stop_parsing()
-                    loop.quit()
-
-                asyncio.ensure_future(save_and_stop())
-                loop.exec_()
-            else:
-                # Just stop the thread, DO NOT clean up state
-                self.status_bar.showMessage("Stopping task…")
-                pm.stop_parsing()
-                if self.parser_thread and self.parser_thread.isRunning():
-                    self.parser_thread.quit()
-                    self.parser_thread.wait()
-                self.task_queue.clear_active()
-                self.update_ui_state(False)
+            # Stop the task
+            pm.stop_parsing()
+            if self.parser_thread and self.parser_thread.isRunning():
+                self.parser_thread.quit()
+                self.parser_thread.wait()
+            self.task_queue.clear_active()
+            self.update_ui_state(False)
 
         event.accept()
 

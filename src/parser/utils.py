@@ -189,90 +189,10 @@ def is_media_url(url):
     if any(url_lower.endswith(ext) for ext in non_media_extensions):
         return False
         
-    # Check for common media file extensions
-    media_extensions = [
-        # Images
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".webp",
-        ".svg",
-        ".tiff",
-        ".ico",
-        ".avif",
-        # Videos
-        ".mp4",
-        ".webm",
-        ".ogg",
-        ".mov",
-        ".avi",
-        ".wmv",
-        ".flv",
-        ".mkv",
-        ".m4v",
-        ".ts",
-        ".mpd",
-        ".m3u8",  # HLS streaming format
-        # Audio
-        ".mp3",
-        ".wav",
-        ".aac",
-        ".flac",
-        # Other media
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".xls",
-        ".xlsx",
-        ".ppt",
-        ".pptx",
-    ]
-
-    # Check for content delivery networks
-    cdn_domains = [
-        "cloudfront.net",
-        "akamaihd.net",
-        "googleapis.com",
-        "cloudflare.com",
-        "cdninstagram.com",
-        "twimg.com",
-        "imgur.com",
-        "staticflickr.com",
-        "ytimg.com",
-        "fbcdn.net",
-        "ssl-images-amazon.com",
-        "pinimg.com",
-        "wp.com",
-        "media-amazon.com",
-        "media.tumblr.com",
-    ]
-
-    # Check for media-related paths
-    media_paths = [
-        "/images/",
-        "/img/",
-        "/photos/",
-        "/photo/",
-        "/pictures/",
-        "/pics/",
-        "/thumbnails/",
-        "/thumb/",
-        "/avatars/",
-        "/uploads/",
-        "/media/",
-        "/static/",
-        "/assets/",
-        "/files/",
-        "/download/",
-        "/gallery/",
-        "/videos/",
-        "/video/",
-        "/movie/",
-        "/movies/",
-        "/clip/",
-        "/clips/",
+    # Check for media file extensions (use constants + streaming/document formats)
+    media_extensions = K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS + [
+        ".mpd", ".m3u8",  # Streaming formats
+        ".pdf",  # Documents that should be downloaded, not parsed as HTML
     ]
 
     parsed_url = urlparse(url_lower)
@@ -282,47 +202,34 @@ def is_media_url(url):
     # Advanced regex patterns from RipUtils.java
     image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|gif|png|webp|avif|svg|tiff)(\?.*)?)", re.IGNORECASE)
     video_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(mp4|webm|ogg|mov|avi|wmv|flv|mkv|m4v|ts|m3u8)(\?.*)?)", re.IGNORECASE)
-    
-    # Check for streaming URL patterns (HLS, DASH, etc)
     streaming_pattern = re.compile(r"(https?://[^\s]+\.(m3u8|mpd)(\?[^\s]*)?|https?://[^\s]+/playlist\.m3u8|https?://[^\s]+/manifest\.mpd)", re.IGNORECASE)
-    
+
     if image_pattern.match(url_lower) or video_pattern.match(url_lower) or streaming_pattern.match(url_lower):
         return True
-        
+
     # Check for embedded video platforms
-    video_platform_domains = [
-        "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "twitch.tv",
-        "streamable.com", "soundcloud.com", "redgifs.com", "giphy.com",
-        "instagram.com/reel", "tiktok.com", "facebook.com/watch", "twitter.com/i/status",
-        "player.vimeo.com", "brightcove.net", "jwplatform.com", "cdn77-video"
-    ]
-    
-    for platform in video_platform_domains:
+    for platform in K.VIDEO_PLATFORM_INDICATORS:
         if platform in url_lower:
             return True
-    
+
     # Check extensions
     for ext in media_extensions:
         if url_lower.endswith(ext) or f"{ext}?" in url_lower or f"{ext}&" in url_lower:
             return True
 
     # Check CDN domains
-    for cdn in cdn_domains:
+    for cdn in K.CDN_MEDIA_DOMAINS:
         if cdn in domain:
             return True
 
     # Check paths
-    for media_path in media_paths:
+    for media_path in K.MEDIA_URL_PATHS:
         if media_path in path:
             return True
 
     # Check for media-related query parameters
     query = parsed_url.query.lower()
-    media_params = [
-        "image", "img", "photo", "pic", "video", "media", "file", "download",
-        "media_url", "source", "src", "thumb", "preview", "original"
-    ]
-    for param in media_params:
+    for param in K.MEDIA_URL_PARAMS:
         if f"{param}=" in query or f"{param}_id=" in query:
             return True
 
@@ -418,18 +325,23 @@ def is_same_domain(url1, url2):
 
 def normalize_url(url):
     """
-    Normalize URL by removing fragments and normalizing path
+    Normalize URL by removing fragments, normalizing path, and lowercase domain.
+    Ensures consistency across parser restarts.
     """
     try:
-        parsed_url = urlparse(url)
-
-        # Reconstruct URL without fragment
-        normalized = parsed_url._replace(fragment="").geturl()
-
-        # Remove trailing slash if present
-        if normalized.endswith("/"):
-            normalized = normalized[:-1]
-
+        if not url: return ""
+        parsed = urlparse(url)
+        # Lowercase scheme and domain (netloc)
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+        
+        # Remove fragment and normalize path
+        path = parsed.path
+        if path.endswith("/") and len(path) > 1:
+            path = path[:-1]
+        
+        # Reconstruct without fragment
+        normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path, fragment="").geturl()
         return normalized
     except Exception:
         return url

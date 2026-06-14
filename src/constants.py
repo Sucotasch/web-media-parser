@@ -257,3 +257,36 @@ VIDEO_PLATFORM_INDICATORS = [
     "bilibili.com", "b23.tv",
     "tiktok.com"
 ]
+
+# CDN domains that typically serve media files (used by is_media_url)
+CDN_MEDIA_DOMAINS = [
+    "cloudfront.net",
+    "akamaihd.net",
+    "googleapis.com",
+    "cloudflare.com",
+    "cdninstagram.com",
+    "twimg.com",
+    "imgur.com",
+    "staticflickr.com",
+    "ytimg.com",
+    "fbcdn.net",
+    "ssl-images-amazon.com",
+    "pinimg.com",
+    "wp.com",
+    "media-amazon.com",
+    "media.tumblr.com",
+]
+
+# URL path segments that indicate media content (used by is_media_url)
+MEDIA_URL_PATHS = [
+    "/images/", "/img/", "/photos/", "/photo/", "/pictures/", "/pics/",
+    "/thumbnails/", "/thumb/", "/avatars/", "/uploads/", "/media/",
+    "/static/", "/assets/", "/files/", "/download/", "/gallery/",
+    "/videos/", "/video/", "/movie/", "/movies/", "/clip/", "/clips/",
+]
+
+# Query parameter names that indicate media content (used by is_media_url)
+MEDIA_URL_PARAMS = [
+    "image", "img", "photo", "pic", "video", "media", "file", "download",
+    "media_url", "source", "src", "thumb", "preview", "original",
+]

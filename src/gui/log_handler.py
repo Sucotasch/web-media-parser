@@ -57,9 +57,9 @@ class GUILogHandler(QObject, logging.Handler):
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.setFormatter(formatter)
 
-        # Store filtered messages for reapplying filters
-        self.message_history = []
-        self.max_history = 5000
+        # Store filtered messages for reapplying filters (deque for O(1) popleft)
+        from collections import deque
+        self.message_history = deque(maxlen=5000)
 
     def emit(self, record):
         """
@@ -68,9 +68,7 @@ class GUILogHandler(QObject, logging.Handler):
         """
         try:
             msg = self.format(record)
-            # Store message in history (cap at max_history)
-            if len(self.message_history) >= self.max_history:
-                self.message_history.pop(0)
+            # Store message in history (deque auto-evicts oldest when full)
             self.message_history.append((record.levelname, msg))
             # Only display if the level is enabled
             if self.log_filter.is_enabled(record.levelname):

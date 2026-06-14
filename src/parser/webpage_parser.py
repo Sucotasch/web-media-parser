@@ -230,7 +230,7 @@ class WebpageParser:
             if redirect_url:
                 self.js_redirect_count += 1
                 logger.info(f"Detected JS redirect from {self.url} to {redirect_url} (Count: {self.js_redirect_count})")
-                abs_redirect_url = urljoin(self.url, redirect_url)
+                abs_redirect_url = normalize_url(urljoin(self.url, redirect_url))
                 self.url = abs_redirect_url 
                 return await self._get_content() 
         
@@ -717,7 +717,7 @@ class WebpageParser:
                 if not href and tag.get('onclick'):
                     onclick = tag.get('onclick')
                     url_match = re.search(r"['\"](?P<url>/[^'\"]+|https?://[^'\"]+)['\"]", onclick)
-                    if url_match: href = url_match.group("url")
+                    if url_match: href = normalize_url(url_match.group("url"))
 
                 if href:
                     href_lower = href.lower()

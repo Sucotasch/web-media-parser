@@ -14,6 +14,7 @@ import logging
 from src.fix_lxml import LXMLHTMLCleanFix
 from src.fix_brotli import BrotliSupportFix
 
+from src.app_paths import get_resource_dir
 from src.gui.main_window import MainWindow
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QCoreApplication, Qt
@@ -46,11 +47,8 @@ def main():
     # Create application
     app = QApplication(sys.argv)
 
-    # Set stylesheet
-    # Get base directory (works for both normal run and PyInstaller bundle)
-    base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    stylesheet_path = os.path.join(base_dir, "resources", "dark_theme.qss")
-    
+    # Set stylesheet from bundled resources
+    stylesheet_path = os.path.join(get_resource_dir(), "dark_theme.qss")
     if os.path.exists(stylesheet_path):
         with open(stylesheet_path, "r") as f:
             app.setStyleSheet(f.read())

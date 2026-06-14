@@ -52,7 +52,6 @@ class PriorityURLQueue:
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
         self._waiters = []
-        self._queue.clear()
 
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL"""
@@ -66,135 +65,69 @@ class PriorityURLQueue:
         Check if target URL is downward/related from source URL.
         """
         context = context or {}
-        # 0. Bypass: If this is an interstitial recovery task, ALWAYS allow it
         if context.get("interstitial_retry"):
-            logger.debug(f"Allowing out-of-domain URL for interstitial recovery: {url}")
             return True
-            
-        # 1. Global Bypass: if STAY_IN_DOMAIN is disabled, allow everything
+
         stay_in_domain = self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN)
         if not stay_in_domain:
             return True
 
         if not source_url:
             return True
-        
+
         url_parsed = urlparse(url)
         source_parsed = urlparse(source_url)
-        
         url_domain = url_parsed.netloc.lower()
         source_domain = source_parsed.netloc.lower()
-        
-        logger.debug(f"Comparing domains - Source: {source_domain}, Target: {url_domain}")
-        
-        # First check: exact domain match
-        exact_domain_match = (url_domain == source_domain)
-        if exact_domain_match:
-            logger.debug(f"Exact domain match between {source_domain} and {url_domain}")
-            # Exact domain match is always allowed to proceed to path checking
-            pass
-        else:
-            # If not exact match, check subdomain relationships
-            
-            # Check if target URL is a parent domain of the source URL
+
+        # Domain check
+        if url_domain != source_domain:
             if source_domain.endswith('.' + url_domain):
-                # Target is a parent domain of source - this is going UP, not allowed
-                logger.debug(f"Rejected: Target {url_domain} is parent domain of source {source_domain}")
                 return False
-                
-            # Allow subdomains of the original domain - these are considered "sideways" but valid
-            # Extract base domains for comparison
-            url_parts = url_domain.split('.')
-            source_parts = source_domain.split('.')
-            
-            # Get the main domain (usually last 2 parts, e.g. livejournal.com)
-            url_main_domain = '.'.join(url_parts[-2:]) if len(url_parts) >= 2 else url_domain
-            source_main_domain = '.'.join(source_parts[-2:]) if len(source_parts) >= 2 else source_domain
-            
-            # If main domains match, allow it - this allows subdomains of the same parent domain
-            if url_main_domain == source_main_domain:
-                logger.debug(f"Related domains (same parent domain) - allowing: {source_domain} and {url_domain}")
-                # Allow related domains to proceed to path checking
-                # This lets us crawl within the same site but different subdomains
-                # Example: from blog.example.com to images.example.com is OK
-                pass
-            else:
-                # Completely different domains - reject
-                logger.debug(f"Domains don't match and aren't related: {source_domain} vs {url_domain} - rejecting")
+            url_main = '.'.join(url_domain.split('.')[-2:]) if len(url_domain.split('.')) >= 2 else url_domain
+            source_main = '.'.join(source_domain.split('.')[-2:]) if len(source_domain.split('.')) >= 2 else source_domain
+            if url_main != source_main:
                 return False
-        
-        # Get normalized paths
+
         url_path = url_parsed.path.lower().strip('/')
         source_path = source_parsed.path.lower().strip('/')
-        
-        logger.debug(f"Comparing paths - Source: /{source_path}, Target: /{url_path}")
-        
-        # If source path is empty (homepage), all paths on same domain are downward
+
         if not source_path:
-            logger.debug(f"Source is homepage, target path is {'downward' if len(url_path) > 0 else 'not downward'}")
             return len(url_path) > 0
-            
-        # First, try exact path matching for subpaths
+
+        # Exact or deeper subpath
         if url_path.startswith(source_path):
-            # If it's the same path with query/fragment differences, that's fine
             if url_path == source_path:
-                logger.debug(f"Same path: /{url_path} - considering downward")
                 return True
-                
-            # Check if it's actually a deeper path (not just a partial string match)
             if len(url_path) > len(source_path):
-                # Either next char is '/' or source_path already ended with '/'
                 if url_path[len(source_path)] == '/' or source_path.endswith('/'):
-                    logger.debug(f"Deeper path: /{url_path} is a subpath of /{source_path} - considering downward")
                     return True
-                else:
-                    logger.debug(f"Partial match but not subpath: /{url_path} vs /{source_path} - still checking other criteria")
-        
-        # Check for common directories - if they share the first N path components
+
         source_components = [c for c in source_path.split('/') if c]
         url_components = [c for c in url_path.split('/') if c]
-        
-        # If at least one component matches, consider it related enough
-        if len(source_components) > 0 and len(url_components) > 0 and source_components[0] == url_components[0]:
-            logger.debug(f"URLs share common root directory: {source_components[0]} - considering related")
+
+        # Share root directory
+        if source_components and url_components and source_components[0] == url_components[0]:
             return True
-        
-        # Special cases: some content-pattern URLs might be considered downward even if not subpaths
-        
-        # Allow sibling content - if both paths contain numeric IDs in the same position, consider them related
+
+        # Sibling content with numeric IDs
         source_id_match = re.search(r'/(\d+)(?:/|$)', source_path)
         url_id_match = re.search(r'/(\d+)(?:/|$)', url_path)
-        
         if source_id_match and url_id_match:
-            # Check if the parts before the IDs match (they're in the same section)
-            source_prefix = source_path[:source_id_match.start(1) - 1]  # Path up to the ID
-            url_prefix = url_path[:url_id_match.start(1) - 1]  # Path up to the ID
-            
+            source_prefix = source_path[:source_id_match.start(1) - 1]
+            url_prefix = url_path[:url_id_match.start(1) - 1]
             if source_prefix == url_prefix:
-                logger.debug(f"Sibling content pages with IDs - considering related: {source_path} and {url_path}")
                 return True
-        
-        # Extract folder components from both paths
-        source_components = [c for c in source_path.split('/') if c]
-        url_components = [c for c in url_path.split('/') if c]
-        
-        # If they share at least the first component, consider them related
-        if len(source_components) > 0 and len(url_components) > 0 and source_components[0] == url_components[0]:
-            logger.debug(f"URLs share first path component: {source_components[0]} - considering related")
-            return True
-            
-        # If they're both in blog or content sections, allow it
+
+        # Both in content sections
         content_patterns = ['post', 'article', 'blog', 'entry', 'content', 'page', 'story', 'news']
-        if any(pattern in source_path for pattern in content_patterns) and any(pattern in url_path for pattern in content_patterns):
-            logger.debug(f"Both URLs appear to be content pages - considering related")
+        if any(p in source_path for p in content_patterns) and any(p in url_path for p in content_patterns):
             return True
-            
-        # Last chance check: both paths are quite short (both at root level or first level)
+
+        # Top-level directories
         if len(source_components) <= 1 and len(url_components) <= 2:
-            logger.debug(f"Both URLs are at top-level directories - allowing exploration")
             return True
-            
-        logger.debug(f"No relationship found between {source_url} and {url} - rejecting")
+
         return False
             
     def _is_likely_content_page(self, url: str) -> bool:
@@ -476,28 +409,35 @@ class PriorityURLQueue:
                         0, self._url_patterns[pattern] - 1
                     )
 
-    async def put(self, url: str, depth: int, source_url: str = "", context: dict = None):
-        """Add URL to the priority queue with context information"""
+    async def put(self, url: str, depth: int, source_url: str = "", context: dict = None, bypass_checks: bool = False):
+        """Add URL to the priority queue with context information.
+        bypass_checks: if True, skips priority calculation and relationship checks (used for state restoration).
+        """
         async with self._lock:
-            # Make sure we use the most appropriate source URL for downward path enforcement
-            effective_source_url = source_url
-            if context and 'start_url' in context:
-                # If context contains a start_url (the original URL the user specified),
-                # use that for downward path enforcement
-                logger.debug(f"Using start_url from context: {context['start_url']} instead of source_url: {source_url}")
-                effective_source_url = context['start_url']
+            if bypass_checks:
+                # Use a default or provided priority if bypassing
+                priority = context.get('priority', 1.0) if context else 1.0
+                effective_source_url = source_url
+            else:
+                # Make sure we use the most appropriate source URL for downward path enforcement
+                effective_source_url = source_url
+                if context and 'start_url' in context:
+                    # If context contains a start_url (the original URL the user specified),
+                    # use that for downward path enforcement
+                    logger.debug(f"Using start_url from context: {context['start_url']} instead of source_url: {source_url}")
+                    effective_source_url = context['start_url']
+                    
+                priority = self._calculate_url_priority(url, depth, effective_source_url, context)
                 
-            priority = self._calculate_url_priority(url, depth, effective_source_url, context)
-            
-            # If priority is zero, the URL didn't pass the relationship check - skip it
-            if priority <= 0.0:
-                logger.debug(f"Skipping URL with zero priority: {url}")
-                return
-                
-            # Ensure we never have extremely low priorities that might get stuck in the queue
-            if 0 < priority < 0.1:
-                logger.debug(f"Boosting low priority URL: {url} from {priority:.4f} to 0.1")
-                priority = 0.1
+                # If priority is zero, the URL didn't pass the relationship check - skip it
+                if priority <= 0.0:
+                    logger.debug(f"Skipping URL with zero priority: {url}")
+                    return
+                    
+                # Ensure we never have extremely low priorities that might get stuck in the queue
+                if 0 < priority < 0.1:
+                    logger.debug(f"Boosting low priority URL: {url} from {priority:.4f} to 0.1")
+                    priority = 0.1
             
             # Log high-value URLs and their priorities for debugging
             if context and context.get('from_image', False):

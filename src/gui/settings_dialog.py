@@ -31,6 +31,7 @@ import os
 import sys
 import logging
 import src.constants as K
+from src.app_paths import settings_path as _settings_path
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class SettingsDialog(QDialog):
             "max_download_speed": 0,
             "threads_per_file": 1,
             # Remember last used directory
-            "last_download_dir": os.path.expanduser("~"),  # HTTP settings
+            "last_download_dir": os.path.expanduser("~"),  # User-chosen, remembered in settings
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "referrer": "auto",
             "accept_language": "en-US,en;q=0.9",
@@ -107,6 +108,9 @@ class SettingsDialog(QDialog):
                 "terms",
                 "privacy",
             ],
+            # Logging
+            "log_to_file": False,
+            "log_file_path": "web_media_parser.log",
         }
 
         # Load settings from file or use defaults
@@ -404,11 +408,36 @@ class SettingsDialog(QDialog):
 
         http_layout.addWidget(http_group)
 
+        # Logging tab
+        logging_tab = QWidget()
+        logging_layout = QVBoxLayout(logging_tab)
+
+        logging_group = QGroupBox("Log to File")
+        logging_grid = QGridLayout(logging_group)
+
+        self.log_to_file_check = QCheckBox("Enable logging to file")
+        self.log_to_file_check.setToolTip("Save application log to a text file")
+        logging_grid.addWidget(self.log_to_file_check, 0, 0, 1, 2)
+
+        logging_grid.addWidget(QLabel("Log file:"), 1, 0)
+        self.log_file_edit = QLineEdit()
+        self.log_file_edit.setPlaceholderText("web_media_parser.log")
+        self.log_file_edit.setToolTip("Path to the log file (relative to app directory or absolute)")
+        logging_grid.addWidget(self.log_file_edit, 1, 1)
+
+        self.log_file_browse = QPushButton("Browse")
+        self.log_file_browse.clicked.connect(self.browse_log_file)
+        logging_grid.addWidget(self.log_file_browse, 1, 2)
+
+        logging_layout.addWidget(logging_group)
+        logging_layout.addStretch()
+
         # Add all tabs
         self.tab_widget.addTab(parser_tab, "Parsing")
         self.tab_widget.addTab(filters_tab, "Filters")
         self.tab_widget.addTab(performance_tab, "Performance")
         self.tab_widget.addTab(http_tab, "HTTP")
+        self.tab_widget.addTab(logging_tab, "Logging")
 
         main_layout.addWidget(self.tab_widget)
 
@@ -432,6 +461,17 @@ class SettingsDialog(QDialog):
             self.speed_value_label.setText("0 (unlimited)")
         else:
             self.speed_value_label.setText(f"{value}")
+
+    def browse_log_file(self):
+        """Open file dialog to select log file path."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select Log File",
+            self.log_file_edit.text() or "web_media_parser.log",
+            "Text Files (*.log *.txt);;All Files (*)",
+        )
+        if file_path:
+            self.log_file_edit.setText(file_path)
 
     def browse_pattern_file(self):
         """
@@ -586,6 +626,10 @@ class SettingsDialog(QDialog):
         self.retry_count_spin.setValue(self.settings.get("retry_count", 3))
         self.proxy_edit.setText(self.settings.get("proxy", ""))
 
+        # Logging
+        self.log_to_file_check.setChecked(self.settings.get("log_to_file", False))
+        self.log_file_edit.setText(self.settings.get("log_file_path", "web_media_parser.log"))
+
     def get_settings_from_ui(self):
         """
         Get settings from UI elements
@@ -636,22 +680,15 @@ class SettingsDialog(QDialog):
         settings["retry_count"] = self.retry_count_spin.value()
         settings["proxy"] = self.proxy_edit.text().strip()
 
+        # Logging
+        settings["log_to_file"] = self.log_to_file_check.isChecked()
+        settings["log_file_path"] = self.log_file_edit.text().strip() or "web_media_parser.log"
+
         return settings
 
     def _get_settings_path(self):
-        """
-        Get the persistent path for settings.json.
-        In frozen mode (EXE), returns the path next to the executable.
-        In dev mode, returns the path in the project root.
-        """
-        if getattr(sys, 'frozen', False):
-            # If frozen, save next to the actual .exe file, not in temp _MEIPASS
-            base_dir = os.path.dirname(sys.executable)
-        else:
-            # If in dev, save in the project root (3 levels up from this file)
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            
-        return os.path.join(base_dir, "settings.json")
+        """Get the persistent path for settings.json (always next to the exe)."""
+        return _settings_path()
 
     def save_settings(self):
         """

@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
+import aiohttp
 from src.parser.shared_session import AsyncClientManager
 from src import constants as K # For accessing default header constants
 
@@ -30,7 +31,10 @@ class TestAsyncClientManager(unittest.TestCase):
         """Test that ClientSession is called with default headers from K constants."""
         
         # Mock the session instance that will be created
-        mock_session_instance = AsyncMock()
+        mock_session_instance = MagicMock()
+        mock_session_instance.headers = {"Accept-Encoding": "gzip, deflate, br"}
+        mock_session_instance.closed = False
+        mock_session_instance.close = AsyncMock()
         mock_aiohttp_session_class.return_value = mock_session_instance
         
         settings = {
@@ -40,17 +44,22 @@ class TestAsyncClientManager(unittest.TestCase):
         }
         manager = AsyncClientManager(settings=settings)
 
+        # Headers must match what _get_default_headers() actually returns
         expected_headers = {
-            "User-Agent": K.DEFAULT_USER_AGENT,
-            "Accept-Language": K.DEFAULT_ACCEPT_LANGUAGE,
-            "Accept": K.DEFAULT_ACCEPT_HEADER, # As defined in AsyncClientManager._get_default_headers
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Cache-Control": "max-age=0",
+            "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
             "DNT": "1",
+            "Connection": "keep-alive",
         }
         
         expected_timeout_config = aiohttp.ClientTimeout(
@@ -76,14 +85,11 @@ class TestAsyncClientManager(unittest.TestCase):
             
             # Check timeout (aiohttp.ClientTimeout objects might not be directly comparable if defaults differ subtly)
             self.assertIn("timeout", kwargs)
-            actual_timeout: aiohttp.ClientTimeout = kwargs["timeout"]
+            actual_timeout = kwargs["timeout"]
             self.assertEqual(actual_timeout.total, expected_timeout_config.total)
             self.assertEqual(actual_timeout.connect, expected_timeout_config.connect)
             self.assertEqual(actual_timeout.sock_read, expected_timeout_config.sock_read)
 
-
-        # Need to import aiohttp for ClientTimeout comparison if not already done
-        import aiohttp # Moved import here for clarity on where ClientTimeout comes from
         asyncio.run(_test())
 
     def test_session_recreation_if_closed(self):
