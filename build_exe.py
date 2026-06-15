@@ -44,6 +44,7 @@ def build_exe():
         "--name=WebMediaParser",
         "--windowed",
         "--onedir",
+        "-y",
         "--icon=resources/icon.ico",
         # Bundle resources into the package
         "--add-data=resources/dark_theme.qss;resources",

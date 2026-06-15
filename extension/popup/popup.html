@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>Web Media Parser</h1>
+    <div id="status" class="status offline">Disconnected</div>
+  </div>
+
+  <div id="scan-section">
+    <button id="scan-btn" class="primary">Scan This Page</button>
+    <div id="page-info" class="hidden"></div>
+  </div>
+
+  <div id="results" class="hidden">
+    <div class="results-header">
+      <span id="count">0 items</span>
+      <label><input type="checkbox" id="select-all" checked> Select All</label>
+    </div>
+
+    <div id="media-list"></div>
+
+    <div class="actions">
+      <label><input type="checkbox" id="one-shot" checked> Page only</label>
+      <button id="download-btn" class="primary" disabled>
+        Download <span id="selected-count">0</span>
+      </button>
+    </div>
+  </div>
+
+  <div id="empty" class="hidden">
+    <p>No media found on this page.</p>
+  </div>
+
+  <div id="error" class="hidden error"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

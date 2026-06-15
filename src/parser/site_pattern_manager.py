@@ -587,11 +587,9 @@ def _transform(m):
         source_domain = get_domain(source_url)
         img_domain = get_domain(url)
         
-        # Check rules for both source page domain and image domain
         imagus_candidates = []
         if source_domain:
             imagus_candidates.extend(self.imagus_rules.get(source_domain, []))
-            # Also check base domain if applicable (e.g. www.site.com -> site.com)
             if source_domain.startswith('www.'):
                 base = source_domain[4:]
                 imagus_candidates.extend(self.imagus_rules.get(base, []))
@@ -601,7 +599,7 @@ def _transform(m):
             if img_domain.startswith('www.'):
                 base = img_domain[4:]
                 imagus_candidates.extend(self.imagus_rules.get(base, []))
-                
+                    
         imagus_candidates.extend(self.imagus_global_rules)
         
         sieve_results = []
@@ -616,7 +614,7 @@ def _transform(m):
             try:
                 img_regex = rule.get('img', '')
                 if not img_regex: continue
-                
+
                 for v_url in url_variations:
                     match = re.search(img_regex, v_url, re.I)
                     if match:

@@ -8,6 +8,7 @@ Main window of the application
 import os
 import time
 import logging
+import threading
 from datetime import datetime
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -36,6 +37,8 @@ from src.parser.parser_manager import ParserManager
 from src.gui.log_handler import GUILogHandler
 from src.core.task_queue_manager import TaskQueueManager
 from src.core.task_item import TaskStatus
+from src.server.http_server import ExtensionServer
+from src.parser.utils import normalize_url, is_media_url
 
 
 class MainWindow(QMainWindow):
@@ -67,6 +70,10 @@ class MainWindow(QMainWindow):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
+        # Extension API server
+        self.extension_server = ExtensionServer()
+        self._server_thread = None
+
         # Initialize UI
         self.init_ui()
 
@@ -87,6 +94,9 @@ class MainWindow(QMainWindow):
         # Set initial state
         self.update_ui_state(False)
         self._update_start_button_state()
+
+        # Start extension API server
+        self._start_extension_server()
 
     def setup_logging(self):
         """
@@ -800,6 +810,7 @@ class MainWindow(QMainWindow):
             log_handler=self.log_handler,
             task_id=task.id,
             one_shot=task.one_shot,
+            pending_downloads=getattr(task, '_pending_downloads', None),
         )
         self._connect_parser_signals()
 
@@ -1072,6 +1083,106 @@ class MainWindow(QMainWindow):
         except Exception as e:
             future.set_exception(e)
 
+    def _start_extension_server(self):
+        """Start the HTTP API server for browser extension communication."""
+        def add_tasks_from_extension(urls, one_shot=False):
+            """Callback: add tasks from extension to queue. Runs in HTTP thread."""
+            added = 0
+            settings = self.settings_dialog.get_settings()
+
+            if one_shot and urls:
+                source_page = urls[0].get("source", "") if urls else ""
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                try:
+                    domain = source_page.split("/")[2].replace(".", "_") if source_page else "extension"
+                except IndexError:
+                    domain = "extension"
+                task_folder = f"{domain}_{timestamp}"
+                download_path = os.path.join(self.download_dir, task_folder)
+                os.makedirs(download_path, exist_ok=True)
+
+                task = self.task_queue.add_task(source_page or urls[0]["url"], settings, download_path, one_shot=True)
+
+                items = []
+                for item in urls:
+                    url = item.get("url", "").strip()
+                    if not url or not url.startswith(("http://", "https://", "//")):
+                        continue
+                    if url.startswith("//"):
+                        url = "https:" + url
+                    url = normalize_url(url)
+                    media_type = item.get("type", "image" if is_media_url(url) else "image")
+                    basename = os.path.basename(url.split("?")[0])
+                    if not basename or "." not in basename:
+                        basename = f"media_{len(items)}.jpg"
+                    items.append({
+                        "url": url,
+                        "source_url": source_page,
+                        "media_type": media_type,
+                        "original_url": item.get("original_url"),
+                        "transformed": item.get("transformed", False),
+                        "attrs": {},
+                        "filepath": os.path.join(download_path, basename),
+                    })
+
+                task._pending_downloads = items
+                added = len(items)
+                self.log_handler.info(f"One-shot: {added} items -> {task_folder}")
+            else:
+                for item in urls:
+                    url = item.get("url", "").strip()
+                    if not url or not url.startswith(("http://", "https://")):
+                        continue
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    try:
+                        domain = url.split("/")[2].replace(".", "_")
+                    except IndexError:
+                        domain = "unknown"
+                    task_folder = f"{domain}_{timestamp}"
+                    download_path = os.path.join(self.download_dir, task_folder)
+                    os.makedirs(download_path, exist_ok=True)
+                    self.task_queue.add_task(url, settings, download_path)
+                    added += 1
+
+            # Update UI on GUI thread
+            def _do_update():
+                self._refresh_task_table()
+                if self.task_queue.queue:
+                    self.task_table.selectRow(0)
+                    self._update_start_button_state()
+            QTimer.singleShot(100, _do_update)
+            return {"added": added}
+
+        def get_status():
+            active = self.task_queue.active_task
+            return {
+                "active_task": active.id if active else None,
+                "queue_length": len(self.task_queue.queue),
+                "files_downloaded": active.stats.get("files_downloaded", 0) if active else 0,
+            }
+
+        self.extension_server.set_callbacks(add_tasks_from_extension, get_status)
+
+        def run_server():
+            """Run the server in a background thread."""
+            import asyncio as aio
+            loop = aio.new_event_loop()
+            aio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self.extension_server.start())
+                loop.run_forever()
+            except Exception as e:
+                logger.error(f"Extension server error: {e}")
+            finally:
+                try:
+                    loop.run_until_complete(self.extension_server.stop())
+                except Exception:
+                    pass
+                loop.close()
+
+        self._server_thread = threading.Thread(target=run_server, name="ExtensionServer", daemon=True)
+        self._server_thread.start()
+
     def closeEvent(self, event):
         """Handle window close event — save queue and active task state."""
         # Always save the queue state
@@ -1120,6 +1231,13 @@ class MainWindow(QMainWindow):
             self.log_handler.set_level_visibility(
                 level, state == Qt.CheckState.Checked.value
             )
+
+    def _updateUiFromExtension(self):
+        """Slot: update task table after extension adds tasks (called via QMetaObject)."""
+        self._refresh_task_table()
+        if self.task_queue.queue:
+            self.task_table.selectRow(0)
+            self._update_start_button_state()
 
     def clear_log(self):
         """

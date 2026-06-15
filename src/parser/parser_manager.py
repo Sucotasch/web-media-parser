@@ -56,7 +56,7 @@ class ParserManager(QObject):
 
     def __init__(
         self, url: str, download_path: str, settings: Dict[str, Any], log_handler,
-        task_id: str = None, one_shot: bool = False,
+        task_id: str = None, one_shot: bool = False, pending_downloads: list = None,
     ):
         super().__init__()
         self.start_url = url
@@ -65,6 +65,7 @@ class ParserManager(QObject):
         self.log = log_handler
         self.task_id = task_id  # Used for isolated session state paths
         self.one_shot = one_shot  # True = page only, no link following
+        self.pending_downloads = pending_downloads or []  # Pre-populated download items
 
         self.is_running = False
         self.is_paused = False
@@ -266,10 +267,20 @@ class ParserManager(QObject):
         # MainWindow._launch_parser_for_task.
         await self.load_state(self.download_path)
 
-        # Seed the initial URL ONLY for fresh sessions (no state loaded).
-        # When resuming, load_state already populated url_queue_items and
-        # processed_urls, so re-seeding would cause duplicate processing.
-        if len(self.processed_urls) == 0:
+        # If we have pre-populated download items (from extension one-shot),
+        # add them to download_queue — extension did full scanning, no parsing needed
+        if self.pending_downloads:
+            for item in self.pending_downloads:
+                await self.download_queue.put(item)
+                self.stats["images_found"] += 1
+            # Set pages_processed so completion monitor can trigger
+            self.stats["pages_processed"] = 1
+            logger.info(f"One-shot: {len(self.pending_downloads)} items added to download_queue")
+            self.pending_downloads = []
+            # Don't seed start_url — items are already in download_queue
+            # Skip to waiting for downloads to complete
+        elif len(self.processed_urls) == 0:
+            # Seed the initial URL ONLY for fresh sessions (no state loaded, no pending downloads)
             await self.url_queue.put(
                 self.start_url, 0, self.start_url,
                 {"is_start_url": True, "start_url": self.start_url}
