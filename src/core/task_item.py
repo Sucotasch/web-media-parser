@@ -29,6 +29,7 @@ class TaskItem:
     url: str
     settings: Dict[str, Any]
     download_path: str
+    one_shot: bool = False  # True = page only, no link following
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     status: TaskStatus = TaskStatus.QUEUED
@@ -51,6 +52,7 @@ class TaskItem:
             "url": self.url,
             "settings": self.settings,
             "download_path": self.download_path,
+            "one_shot": self.one_shot,
             "status": self.status.value,
             "stats": self.stats,
             "error_message": self.error_message,
@@ -67,6 +69,7 @@ class TaskItem:
             url=data["url"],
             settings=data.get("settings", {}),
             download_path=data.get("download_path", ""),
+            one_shot=data.get("one_shot", False),
             status=TaskStatus(data.get("status", "queued")),
             stats=data.get("stats", {}),
             error_message=data.get("error_message"),

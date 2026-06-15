@@ -169,8 +169,14 @@ class MainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #1B5E20; }"
         )
         self.add_task_button.clicked.connect(self.add_task_to_queue)
+
+        self.one_shot_check = QCheckBox("Page only")
+        self.one_shot_check.setToolTip("Download only media from this page, don't follow links")
+        self.one_shot_check.setMaximumWidth(80)
+
         url_layout.addWidget(url_label)
         url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.one_shot_check)
         url_layout.addWidget(self.add_task_button)
         main_layout.addLayout(url_layout)
 
@@ -391,11 +397,12 @@ class MainWindow(QMainWindow):
         # Snapshot settings NOW so queued tasks are not affected by later changes
         settings = self.settings_dialog.get_settings()
 
-        task = self.task_queue.add_task(url, settings, download_path)
-        self.log_handler.info(f"Task added to queue: {task.id}  {url}")
+        task = self.task_queue.add_task(url, settings, download_path, one_shot=self.one_shot_check.isChecked())
+        self.log_handler.info(f"Task added: {'[Page only] ' if task.one_shot else ''}{url}")
 
         self._refresh_task_table()
         self.url_input.clear()
+        self.one_shot_check.setChecked(False)  # Auto-reset after adding
 
     def _refresh_task_table(self, preserve_selection=True, selected_task_id=None):
         """Update the task table, preserving selection when possible."""
@@ -421,9 +428,10 @@ class MainWindow(QMainWindow):
 
         # Update items in-place (selection model stays valid)
         for i, task in enumerate(queue):
+            url_display = f"↗ {task.url}" if task.one_shot else task.url
             vals = [
                 str(i + 1),
-                task.url,
+                url_display,
                 task.status.value.capitalize(),
                 f"{task.stats.get('files_downloaded', 0)}",
                 f"{task.stats.get('images_found', 0) + task.stats.get('videos_found', 0)}",
@@ -791,6 +799,7 @@ class MainWindow(QMainWindow):
             settings=task.settings,
             log_handler=self.log_handler,
             task_id=task.id,
+            one_shot=task.one_shot,
         )
         self._connect_parser_signals()
 

@@ -56,7 +56,7 @@ class ParserManager(QObject):
 
     def __init__(
         self, url: str, download_path: str, settings: Dict[str, Any], log_handler,
-        task_id: str = None,
+        task_id: str = None, one_shot: bool = False,
     ):
         super().__init__()
         self.start_url = url
@@ -64,6 +64,7 @@ class ParserManager(QObject):
         self.settings = settings
         self.log = log_handler
         self.task_id = task_id  # Used for isolated session state paths
+        self.one_shot = one_shot  # True = page only, no link following
 
         self.is_running = False
         self.is_paused = False
@@ -75,6 +76,7 @@ class ParserManager(QObject):
         self._stop_event = None
 
         self.max_depth = self.settings.get(K.SETTING_SEARCH_DEPTH, K.DEFAULT_SEARCH_DEPTH)
+        self.page_limit = self.settings.get("page_limit", 1000)
         
         self.domain_health = {}
         self.quarantined_domains = set()
@@ -219,6 +221,7 @@ class ParserManager(QObject):
         self._processed_lock = asyncio.Lock()  # Initialize lock for thread-safe registry access
         self._completed_naturally = False
         self._last_activity_time = time.time()
+        self._domain_semaphores: Dict[str, asyncio.Semaphore] = {}
 
         # Reset the url_queue's asyncio primitives (Lock and Event).
         # This cannot be done here (GUI/QThread context) safely — it's done
@@ -446,6 +449,12 @@ class ParserManager(QObject):
         await self._process_media_files(media_files, url)
         await self._update_queue_priorities(url, media_files)
 
+        # In one-shot mode, skip link discovery — only process media from this page
+        if self.one_shot:
+            self.stats["pages_processed"] += 1
+            self._last_activity_time = time.time()
+            return
+
         if depth < self.max_depth:
             urls_to_queue = []
             if isinstance(links_data, dict): # From WebpageParser
@@ -480,12 +489,24 @@ class ParserManager(QObject):
         self._last_activity_time = time.time()  # Track last activity for idle detection
         self.status_updated.emit(f"Processed: {url}")
 
+    def _get_domain_semaphore(self, domain: str) -> asyncio.Semaphore:
+        """Get or create a semaphore limiting concurrent requests per domain."""
+        if domain not in self._domain_semaphores:
+            self._domain_semaphores[domain] = asyncio.Semaphore(K.DOMAIN_CONCURRENCY_LIMIT)
+        return self._domain_semaphores[domain]
+
     async def _parser_worker(self, session):
         while self.is_running and not self._stop_event.is_set():
             if self.is_paused:
                 await self._pause_event.wait()
                 if self._stop_event.is_set(): break
                 continue
+            # Page limit: stop when enough files downloaded (not just parsed)
+            if self.page_limit > 0 and self.stats["files_downloaded"] >= self.page_limit:
+                logger.info(f"Page limit reached: {self.stats['files_downloaded']} files downloaded >= {self.page_limit}")
+                self._completed_naturally = True
+                self._stop_event.set()
+                break
             continue_processing = await self._handle_empty_queues_and_quarantine()
             if not continue_processing:
                 # All work is done, but keep the worker alive until stop is requested
@@ -512,9 +533,18 @@ class ParserManager(QObject):
                     if current_url in self.processed_urls:
                         self.url_queue.task_done(); continue
                     self.processed_urls.add(current_url)
-                is_json = self._determine_parser_type(current_url)
-                links_found, media_files_found = await self._invoke_parser(current_url, session, is_json, context)
-                await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
+                # Per-domain concurrency limit
+                domain = get_domain(current_url)
+                if domain:
+                    sem = self._get_domain_semaphore(domain)
+                    await sem.acquire()
+                try:
+                    is_json = self._determine_parser_type(current_url)
+                    links_found, media_files_found = await self._invoke_parser(current_url, session, is_json, context)
+                    await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
+                finally:
+                    if domain:
+                        sem.release()
             except Exception as e:
                 logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
                 if current_url not in self.processed_urls: self.processed_urls.add(current_url)
@@ -604,19 +634,25 @@ class ParserManager(QObject):
                 timeout_val = K.DEFAULT_DOMAIN_PROBATION_TIMEOUT if is_probation else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
                 retries_val = K.DEFAULT_DOMAIN_PROBATION_RETRIES if is_probation else self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
                 
-                downloader = MediaDownloader(
-                    url=url, filepath=filepath_from_queue, settings=self.settings,
-                    media_type=media_item["media_type"], source_url=media_item["source_url"],
-                    shared_session=self._shared_downloader_session,  # Reuse shared session
-                    stop_event=self._stop_event
-                )
-                downloader.set_progress_callback(self._update_current_progress)
-                base_filename_for_status = os.path.basename(filepath_from_queue)
-                self.status_updated.emit(f"Downloading: {base_filename_for_status}")
-                
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: downloader.download(timeout=timeout_val, retries=retries_val)
-                )
+                # Per-domain concurrency limit
+                sem = self._get_domain_semaphore(domain)
+                await sem.acquire()
+                try:
+                    downloader = MediaDownloader(
+                        url=url, filepath=filepath_from_queue, settings=self.settings,
+                        media_type=media_item["media_type"], source_url=media_item["source_url"],
+                        shared_session=self._shared_downloader_session,
+                        stop_event=self._stop_event
+                    )
+                    downloader.set_progress_callback(self._update_current_progress)
+                    base_filename_for_status = os.path.basename(filepath_from_queue)
+                    self.status_updated.emit(f"Downloading: {base_filename_for_status}")
+                    
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: downloader.download(timeout=timeout_val, retries=retries_val)
+                    )
+                finally:
+                    sem.release()
                 
                 domain_state["total"] += 1
                 self._last_activity_time = time.time()  # Track last activity for idle detection

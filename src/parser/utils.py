@@ -351,27 +351,12 @@ def is_banner_or_ad(url, attrs):
     """
     Check if a media file is likely to be a banner or advertisement
     """
-    # Keywords that suggest banners or ads
+    # Keywords that suggest banners or ads (use word boundaries to avoid false positives)
     ad_keywords = [
-        "ad",
-        "ads",
-        "advert",
-        "advertisement",
-        "banner",
-        "promo",
-        "promotion",
-        "sponsor",
-        "tracking",
-        "pixel",
-        "analytics",
-        "marketing",
-        "campaign",
-        "popup",
-        "popover",
-        "popup",
-        "cta",
-        "calltoaction",
-        "call-to-action",
+        "ads", "advert", "advertisement",
+        "banner", "promo", "promotion", "sponsor",
+        "tracking", "pixel", "analytics", "marketing", "campaign",
+        "popup", "popover", "cta", "calltoaction", "call-to-action",
     ]
 
     url_lower = url.lower()

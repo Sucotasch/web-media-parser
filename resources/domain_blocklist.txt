@@ -2,10 +2,6 @@
 # Add domains to block here, one per line.
 # Lines starting with # are comments.
 
-# Example domains (uncomment to block)
-# ads.example.com
-# tracker.example.com
-
 # Well-known ad/tracking domains
 doubleclick.net
 google-analytics.com
@@ -16,3 +12,14 @@ zedo.com
 amazon-adsystem.com
 taboola.com
 outbrain.com
+
+# Social media — parser cannot extract media (auth walls, JS-rendered)
+facebook.com
+fbcdn.net
+fb.watch
+twitter.com
+x.com
+twimg.com
+pbs.twimg.com
+instagram.com
+cdninstagram.com

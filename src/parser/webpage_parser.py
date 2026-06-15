@@ -24,7 +24,8 @@ except ImportError:
 
 from src.parser.utils import (
     is_image_url, is_media_url, is_valid_url, get_domain, 
-    is_same_domain, normalize_url, is_trash_media, format_proxy_url
+    is_same_domain, normalize_url, is_trash_media, format_proxy_url,
+    is_banner_or_ad
 )
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
@@ -159,7 +160,17 @@ class WebpageParser:
                 proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
                 async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config, proxy=proxy_url) as response:
                     http_status = response.status
-                    if 400 <= http_status < 500:
+                    if http_status == 429:
+                        # Rate limited — backoff and retry
+                        retry_after = int(response.headers.get("Retry-After", 5))
+                        logger.warning(f"HTTP 429 Rate limited for {self.url}, retry after {retry_after}s")
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_after)
+                            continue
+                        msg = f"Rate limited (429) after {max_retries+1} attempts for {self.url}"
+                        logger.error(msg)
+                        return None, K.PARSER_HTTP_ERROR_4XX, msg, http_status
+                    elif 400 <= http_status < 500:
                         msg = f"Client HTTP error {http_status} for {self.url}"
                         logger.error(msg)
                         return None, K.PARSER_HTTP_ERROR_4XX, msg, http_status
@@ -268,14 +279,32 @@ class WebpageParser:
             import requests
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
+            from src.parser.utils import format_proxy_url
             
             self._sync_session = requests.Session()
             # Disable internal retries to allow immediate termination via UI Stop button 
             adapter = HTTPAdapter(max_retries=Retry(total=0, connect=None, read=None, redirect=None, status=None))
             self._sync_session.mount("http://", adapter)
             self._sync_session.mount("https://", adapter)
-            # Pre-set standard headers
-            self._sync_session.headers.update({"User-Agent": K.DEFAULT_USER_AGENT})
+            # Pre-set standard headers (match aiohttp session for consistent fingerprint)
+            self._sync_session.headers.update({
+                "User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
+                "Accept-Language": self.settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept": K.DEFAULT_ACCEPT_HEADER,
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+                "DNT": "1",
+            })
+            
+            # Apply proxy if configured
+            proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
+            if proxy_url:
+                self._sync_session.proxies = {"http": proxy_url, "https": proxy_url}
+                logger.debug(f"Sync session configured with proxy: {proxy_url}")
             
             # Explicitly pre-set cookies for known major sites to reduce friction
             if "livejournal.com" in self.domain:
@@ -536,7 +565,13 @@ class WebpageParser:
                 abs_url = urljoin(self.url, href)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"rel": link_tag.get("rel", []), "sizes": link_tag.get("sizes", ""), "type": link_tag.get("type", "")}
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                    # Filter small favicons (16x16, 32x32) but allow larger apple-touch-icons
+                    sizes = str(attrs.get("sizes", ""))
+                    is_small_icon = "apple-touch-icon" not in str(attrs.get("rel", [])) and (
+                        "16x16" in sizes or "32x32" in sizes or "48x48" in sizes or not sizes
+                    )
+                    if not is_small_icon or self._is_significant_media("image", abs_url, attrs):
+                        self.media_files.append(("image", abs_url, attrs)); found += 1
         
         for meta_tag in soup.find_all("meta", property=re.compile(r"og:image|twitter:image")):
             content = meta_tag.get("content")
@@ -624,7 +659,8 @@ class WebpageParser:
                 if any(c in hidden_classes for c in classes):
                     return False
             elif isinstance(classes, str): # sometimes class is a string
-                if any(c in classes for c in hidden_classes):
+                class_tokens = classes.split()
+                if any(c in hidden_classes for c in class_tokens):
                     return False
             
             # Check inline styles
@@ -642,12 +678,16 @@ class WebpageParser:
             
         url_lower = url.lower()
             
-        # 2. Filter by common noise patterns in URL
+        # 2. Filter by banner/ad/tracker patterns
+        if is_banner_or_ad(url, attrs):
+            return False
+            
+        # 3. Filter by common noise patterns in URL
         ignore_patterns = K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS
         if any(p in url_lower for p in ignore_patterns):
             return False
             
-        # 3. Filter by explicit dimensions if present in HTML
+        # 4. Filter by explicit dimensions if present in HTML
         try:
             width = int(attrs.get("width", 1000))
             height = int(attrs.get("height", 1000))

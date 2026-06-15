@@ -63,19 +63,30 @@ class TaskQueueManager(QObject):
 
     # --- CRUD ---
 
-    def add_task(self, url: str, settings: dict, download_path: str) -> TaskItem:
-        """Add a new task to the end of the queue.
+    def add_task(self, url: str, settings: dict, download_path: str, one_shot: bool = False) -> TaskItem:
+        """Add a new task to the queue.
 
-        Settings are **snapshotted** at add-time so later changes in
-        SettingsDialog do not affect already-queued tasks.
+        Inserts after the last non-completed task (active/queued/paused),
+        so new tasks appear above completed/stopped/failed ones.
+        Settings are **snapshotted** at add-time.
         """
         task = TaskItem(
             url=url,
             settings=dict(settings),       # shallow copy is enough
             download_path=download_path,
+            one_shot=one_shot,
         )
-        self._queue.append(task)
-        logger.info(f"Task added to queue: {task.id}  url={url}")
+        terminal = {TaskStatus.COMPLETED, TaskStatus.STOPPED, TaskStatus.FAILED}
+        insert_idx = len(self._queue)
+        for i in range(len(self._queue) - 1, -1, -1):
+            if self._queue[i].status not in terminal:
+                insert_idx = i + 1
+                break
+        else:
+            # All tasks are terminal or queue is empty — insert at start
+            insert_idx = 0
+        self._queue.insert(insert_idx, task)
+        logger.info(f"Task added to queue: {task.id}  url={url}  position={insert_idx}")
         self.task_added.emit(task.id)
         return task
 

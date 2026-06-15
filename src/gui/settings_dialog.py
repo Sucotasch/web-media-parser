@@ -53,7 +53,6 @@ class SettingsDialog(QDialog):
             "page_limit": 1000,
             "stay_in_domain": True,
             "process_js": True,  # Enable JavaScript processing by default
-            "process_dynamic": True,
             "page_timeout": 30,
             # Pattern settings
             "use_patterns": True,  # Enable image patterns by default
@@ -74,7 +73,7 @@ class SettingsDialog(QDialog):
             "threads_per_file": 1,
             # Remember last used directory
             "last_download_dir": os.path.expanduser("~"),  # User-chosen, remembered in settings
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "referrer": "auto",
             "accept_language": "en-US,en;q=0.9",
             "timeout": 30,
@@ -171,22 +170,14 @@ class SettingsDialog(QDialog):
         self.process_js_check = QCheckBox()
         self.process_js_check.setToolTip("Process JavaScript-generated content")
         parser_grid.addWidget(self.process_js_check, 4, 1)
-
-        # Process dynamic content
-        parser_grid.addWidget(QLabel("Process Dynamic Content:"), 5, 0)
-        self.process_dynamic_check = QCheckBox()
-        self.process_dynamic_check.setToolTip(
-            "Process dynamic content (lazy loading, infinite scroll)"
-        )
-        parser_grid.addWidget(self.process_dynamic_check, 5, 1)
         
         # Use image patterns
-        parser_grid.addWidget(QLabel("Use Image Patterns:"), 6, 0)
+        parser_grid.addWidget(QLabel("Use Image Patterns:"), 5, 0)
         self.use_patterns_check = QCheckBox()
         self.use_patterns_check.setToolTip(
             "Use site patterns for extracting fullsize images from thumbnails (improves image quality)"
         )
-        parser_grid.addWidget(self.use_patterns_check, 6, 1)
+        parser_grid.addWidget(self.use_patterns_check, 5, 1)
         
         # Custom pattern file
         parser_grid.addWidget(QLabel("Custom Pattern File:"), 7, 0)
@@ -240,13 +231,6 @@ class SettingsDialog(QDialog):
             "Ignore invisible links to avoid bot-traps and honeypots"
         )
         parser_grid.addWidget(self.filter_hidden_links_check, 12, 1)
-
-        parser_grid.addWidget(QLabel("Bypass Content Gateways:"), 13, 0)
-        self.bypass_gateways_check = QCheckBox()
-        self.bypass_gateways_check.setToolTip(
-            "Automatically click 'I Agree' or '18+' on confirmation pages and overlays"
-        )
-        parser_grid.addWidget(self.bypass_gateways_check, 13, 1)
 
         parser_layout.addWidget(parser_group)
 
@@ -564,9 +548,6 @@ class SettingsDialog(QDialog):
         self.page_timeout_spin.setValue(self.settings.get("page_timeout", 30))
         self.stay_in_domain_check.setChecked(self.settings.get("stay_in_domain", True))
         self.process_js_check.setChecked(self.settings.get("process_js", True))
-        self.process_dynamic_check.setChecked(
-            self.settings.get(K.SETTING_PROCESS_DYNAMIC, True)
-        )
         self.bypass_cookie_consent_check.setChecked(
             self.settings.get(
                 K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT
@@ -582,9 +563,6 @@ class SettingsDialog(QDialog):
         )
         self.filter_hidden_links_check.setChecked(
             self.settings.get(K.SETTING_FILTER_HIDDEN_LINKS, K.DEFAULT_FILTER_HIDDEN_LINKS)
-        )
-        self.bypass_gateways_check.setChecked(
-            self.settings.get(K.SETTING_BYPASS_GATEWAYS, K.DEFAULT_BYPASS_GATEWAYS)
         )
         
         # Pattern settings
@@ -642,12 +620,10 @@ class SettingsDialog(QDialog):
         settings["page_timeout"] = self.page_timeout_spin.value()
         settings["stay_in_domain"] = self.stay_in_domain_check.isChecked()
         settings[K.SETTING_PROCESS_JS] = self.process_js_check.isChecked()
-        settings[K.SETTING_PROCESS_DYNAMIC] = self.process_dynamic_check.isChecked()
         settings[K.SETTING_BYPASS_COOKIE_CONSENT] = self.bypass_cookie_consent_check.isChecked()
         settings[K.SETTING_BYPASS_JS_REDIRECTS] = self.bypass_js_redirects_check.isChecked()
         settings[K.SETTING_USE_PATTERNS] = self.use_patterns_check.isChecked()
         settings[K.SETTING_FILTER_HIDDEN_LINKS] = self.filter_hidden_links_check.isChecked()
-        settings[K.SETTING_BYPASS_GATEWAYS] = self.bypass_gateways_check.isChecked()
         settings[K.SETTING_CUSTOM_PATTERN_PATH] = self.custom_pattern_edit.text() if self.custom_pattern_edit.text() else ""
         settings[K.SETTING_IMAGUS_SIEVE_PATH] = self.imagus_sieve_edit.text() if self.imagus_sieve_edit.text() else ""
 
@@ -718,6 +694,38 @@ class SettingsDialog(QDialog):
         self.settings = self.default_settings.copy()
         self.apply_settings_to_ui()
 
+    @staticmethod
+    def sanitize_settings(settings: dict) -> dict:
+        """Clamp all numeric settings to safe ranges and strip dangerous chars from strings."""
+        clamps = {
+            "search_depth": (0, 10),
+            "page_limit": (1, 10000),
+            "page_timeout": (5, 600),
+            "timeout": (1, 600),
+            "retry_count": (0, 20),
+            "parser_threads": (1, 64),
+            "downloader_threads": (1, 128),
+            "threads_per_file": (1, 8),
+            "min_image_width": (0, 99999),
+            "min_image_height": (0, 99999),
+            "min_image_size": (0, 99999),
+            "min_video_size": (0, 99999),
+            "max_download_speed": (0, 100000),
+        }
+        for key, (lo, hi) in clamps.items():
+            val = settings.get(key)
+            if val is not None:
+                try:
+                    settings[key] = max(lo, min(hi, int(val)))
+                except (TypeError, ValueError):
+                    settings[key] = K.DEFAULT_SETTINGS_VALUES.get(key, lo)
+        # Strip CRLF from string headers (prevent header injection)
+        for key in ("user_agent", "accept_language"):
+            val = settings.get(key, "")
+            if isinstance(val, str):
+                settings[key] = val.replace("\r", "").replace("\n", "")
+        return settings
+
     def load_settings(self):
         """
         Load settings from file or use defaults, including last used download directory.
@@ -731,7 +739,7 @@ class SettingsDialog(QDialog):
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 logger.info(f"Loaded settings from {settings_path}")
-                return settings
+                return self.sanitize_settings(settings)
             except Exception as e:
                 logger.error(f"Error loading settings from {settings_path}: {str(e)}")
         

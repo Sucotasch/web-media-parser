@@ -25,12 +25,12 @@ DEFAULT_MIN_VIDEO_SIZE_KB = 0 # 0 means no minimum size
 
 # Domain Health & Quarantine
 DEFAULT_QUARANTINE_FAILURE_THRESHOLD = 3
-DEFAULT_DOMAIN_PROBATION_TIMEOUT = 2  # Timeout for downloads from domains on "probation"
+DEFAULT_DOMAIN_PROBATION_TIMEOUT = 5  # Timeout for downloads from domains on "probation"
 DEFAULT_DOMAIN_PROBATION_RETRIES = 0 # Retries for downloads from domains on "probation"
 
 
 # HTTP Headers
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DEFAULT_ACCEPT_HEADER = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8"
 DEFAULT_ACCEPT_IMAGE_HEADER = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
@@ -115,6 +115,9 @@ QUARANTINE_MAX_ITEM_RETRIES = 1
 # Seconds of full queue inactivity before auto-completing the parsing task
 IDLE_COMPLETION_TIMEOUT_SECONDS = 5
 
+# Max concurrent requests per domain (parser + downloader combined)
+DOMAIN_CONCURRENCY_LIMIT = 2
+
 # Max threads for multi-threaded download of a single file (hard cap)
 MAX_THREADS_PER_FILE_CAP = 8
 
@@ -155,12 +158,9 @@ SETTING_USE_PATTERNS = "use_patterns"
 SETTING_CUSTOM_PATTERN_PATH = "custom_pattern_path"
 SETTING_IMAGUS_SIEVE_PATH = "imagus_sieve_path"
 SETTING_PROCESS_JS = "process_js"
-SETTING_PROCESS_DYNAMIC = "process_dynamic"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
-SETTING_USE_PATTERNS = "use_patterns"
 SETTING_FILTER_HIDDEN_LINKS = "filter_hidden_links"
-SETTING_BYPASS_GATEWAYS = "bypass_gateways"
 SETTING_STOP_WORDS = "stop_words"
 
 # Filter settings keys
