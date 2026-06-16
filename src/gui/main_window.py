@@ -740,8 +740,16 @@ class MainWindow(QMainWindow):
             self.log_handler.info(f"Loaded previous session state from: {state_path}")
 
     def start_parsing(self):
-        """Start the selected task from the queue, or fall back to URL input."""
+        """Start the selected task from the queue, or auto-select the first queued task."""
         task_id = self._get_selected_task_id()
+        if not task_id:
+            # Auto-select first non-terminal task
+            for task in self.task_queue.queue:
+                if task.status in (TaskStatus.QUEUED, TaskStatus.PAUSED):
+                    task_id = task.id
+                    idx = self.task_queue.queue.index(task)
+                    self.task_table.selectRow(idx)
+                    break
         if task_id:
             self._launch_task_from_queue(task_id)
         else:
