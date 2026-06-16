@@ -4,6 +4,7 @@
  */
 
 const mediaItems = [];
+let activeDomainFilter = "";
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
@@ -18,6 +19,9 @@ const pageInfoDiv = document.getElementById("page-info");
 const resultsDiv = document.getElementById("results");
 const emptyDiv = document.getElementById("empty");
 const errorDiv = document.getElementById("error");
+const domainFilter = document.getElementById("domain-filter");
+const chromeDownloadBtn = document.getElementById("chrome-download-btn");
+const chromeCountSpan = document.getElementById("chrome-count");
 
 // --- Connection check ---
 
@@ -37,12 +41,41 @@ async function checkConnection() {
   return false;
 }
 
+// --- Domain helpers ---
+
+function extractDomain(url) {
+  try {
+    return new URL(url).hostname;
+  } catch (e) {
+    return url;
+  }
+}
+
+function populateDomainFilter() {
+  const domains = new Map();
+  mediaItems.forEach((item) => {
+    const domain = extractDomain(item.url);
+    domains.set(domain, (domains.get(domain) || 0) + 1);
+  });
+
+  domainFilter.innerHTML = `<option value="">All domains (${mediaItems.length})</option>`;
+  const sorted = [...domains.entries()].sort((a, b) => b[1] - a[1]);
+  sorted.forEach(([domain, count]) => {
+    const opt = document.createElement("option");
+    opt.value = domain;
+    opt.textContent = `${domain} (${count})`;
+    domainFilter.appendChild(opt);
+  });
+}
+
 // --- Scan page ---
 
 scanBtn.addEventListener("click", async () => {
   scanBtn.disabled = true;
   scanBtn.textContent = "Scanning...";
   mediaItems.length = 0;
+  activeDomainFilter = "";
+  domainFilter.value = "";
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -63,8 +96,20 @@ scanBtn.addEventListener("click", async () => {
 
     if (response && response.media) {
       mediaItems.push(...response.media);
+      // Ask background to discover fullsize from linked pages (CORS bypass)
+      if (response.links && response.links.length > 0) {
+        const linked = await chrome.runtime.sendMessage({
+          action: "discoverFullsize",
+          links: response.links.slice(0, 15),
+          pageUrl: response.url,
+        });
+        if (linked && linked.media) {
+          mediaItems.push(...linked.media);
+        }
+      }
       pageInfoDiv.textContent = response.title || response.url;
       pageInfoDiv.classList.remove("hidden");
+      populateDomainFilter();
       renderMediaList();
       updateCount();
     } else {
@@ -78,12 +123,24 @@ scanBtn.addEventListener("click", async () => {
   scanBtn.textContent = "Scan This Page";
 });
 
+// --- Domain filter ---
+
+domainFilter.addEventListener("change", () => {
+  activeDomainFilter = domainFilter.value;
+  renderMediaList();
+  updateCount();
+});
+
 // --- Render media list ---
 
 function renderMediaList() {
   mediaList.innerHTML = "";
 
-  if (mediaItems.length === 0) {
+  const filtered = activeDomainFilter
+    ? mediaItems.filter((item) => extractDomain(item.url) === activeDomainFilter)
+    : mediaItems;
+
+  if (filtered.length === 0) {
     resultsDiv.classList.add("hidden");
     emptyDiv.classList.remove("hidden");
     return;
@@ -91,10 +148,9 @@ function renderMediaList() {
 
   emptyDiv.classList.add("hidden");
   resultsDiv.classList.remove("hidden");
-  updateCount();
-  downloadBtn.disabled = false;
 
-  mediaItems.forEach((item, index) => {
+  filtered.forEach((item) => {
+    const globalIndex = mediaItems.indexOf(item);
     const div = document.createElement("div");
     div.className = "media-item";
 
@@ -102,13 +158,13 @@ function renderMediaList() {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = true;
-    checkbox.dataset.index = index;
+    checkbox.dataset.index = globalIndex;
     checkbox.addEventListener("change", updateCount);
 
     // Thumbnail or placeholder
     const thumb = document.createElement("div");
     thumb.className = "thumb placeholder";
-    thumb.textContent = item.type === "video" ? "▶" : "📷";
+    thumb.textContent = item.type === "video" ? "\u25B6" : "\uD83D\uDCF7";
 
     // Lazy-load thumbnail for images
     if (item.type === "image" && item.url) {
@@ -120,7 +176,7 @@ function renderMediaList() {
         thumb.style.display = "none";
         img.style.display = "block";
       };
-      img.onerror = () => {}; // Keep placeholder
+      img.onerror = () => {};
       div.appendChild(img);
     }
     div.appendChild(thumb);
@@ -144,18 +200,25 @@ function renderMediaList() {
 
     if (item.width && item.height) {
       const sizeSpan = document.createElement("span");
-      sizeSpan.textContent = ` · ${item.width}×${item.height}`;
+      sizeSpan.textContent = ` \u00B7 ${item.width}\u00D7${item.height}`;
       metaDiv.appendChild(sizeSpan);
     }
     if (item.source) {
       const sourceSpan = document.createElement("span");
-      sourceSpan.textContent = ` · ${item.source}`;
+      sourceSpan.textContent = ` \u00B7 ${item.source}`;
       metaDiv.appendChild(sourceSpan);
     }
+
+    // Domain tag
+    const domainSpan = document.createElement("span");
+    domainSpan.className = "domain-tag";
+    domainSpan.textContent = ` \u00B7 ${extractDomain(item.url)}`;
+    metaDiv.appendChild(domainSpan);
+
     if (item.transformed) {
       const tSpan = document.createElement("span");
       tSpan.className = "transformed";
-      tSpan.textContent = " ✦ transformed";
+      tSpan.textContent = " \u2726 transformed";
       metaDiv.appendChild(tSpan);
     }
 
@@ -167,21 +230,67 @@ function renderMediaList() {
   });
 }
 
+function getVisibleCheckboxes() {
+  return mediaList.querySelectorAll("input[type='checkbox']");
+}
+
 function updateCount() {
-  const checked = mediaList.querySelectorAll("input[type='checkbox']:checked");
-  selectedCountSpan.textContent = checked.length;
-  countSpan.textContent = `${checked.length} / ${mediaItems.length}`;
-  downloadBtn.disabled = checked.length === 0;
-  selectAllCheckbox.checked = checked.length === mediaItems.length && mediaItems.length > 0;
+  const checked = getVisibleCheckboxes();
+  let checkedCount = 0;
+  checked.forEach((cb) => { if (cb.checked) checkedCount++; });
+
+  const total = activeDomainFilter
+    ? mediaItems.filter((item) => extractDomain(item.url) === activeDomainFilter).length
+    : mediaItems.length;
+
+  selectedCountSpan.textContent = checkedCount;
+  chromeCountSpan.textContent = checkedCount;
+  countSpan.textContent = `${checkedCount} / ${total}`;
+  downloadBtn.disabled = checkedCount === 0;
+  chromeDownloadBtn.disabled = checkedCount === 0;
+  selectAllCheckbox.checked = checkedCount === total && total > 0;
 }
 
 // --- Select all ---
 
 selectAllCheckbox.addEventListener("change", () => {
-  mediaList.querySelectorAll("input[type='checkbox']").forEach((cb) => {
+  getVisibleCheckboxes().forEach((cb) => {
     cb.checked = selectAllCheckbox.checked;
   });
   updateCount();
+});
+
+// --- Chrome Download ---
+
+chromeDownloadBtn.addEventListener("click", async () => {
+    const selected = [];
+    mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
+      const item = mediaItems[parseInt(cb.dataset.index)];
+      if (item) {
+        const baseName = item.url.split("/").pop().split("?")[0] || "";
+        selected.push({ url: item.url, referer: item.pageUrl || "", filename: baseName });
+      }
+    });
+
+  if (selected.length === 0) return;
+
+  chromeDownloadBtn.disabled = true;
+  chromeDownloadBtn.innerHTML = `Saving <span>${selected.length}</span>...`;
+
+  // Send to background for download
+  try {
+    const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected });
+    const saved = resp && resp.saved ? resp.saved : 0;
+    chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
+  } catch (e) {
+    showError(`Download failed: ${e.message}`);
+    chromeDownloadBtn.innerHTML = `Save (Chrome) <span>${selected.length}</span>`;
+  }
+
+  setTimeout(() => {
+    chromeDownloadBtn.innerHTML = `Save (Chrome) <span>${selected.length}</span>`;
+    chromeDownloadBtn.disabled = false;
+  }, 1500);
 });
 
 // --- Download ---
@@ -210,7 +319,7 @@ downloadBtn.addEventListener("click", async () => {
   if (resp && resp.error) {
     showError(resp.error);
   } else if (resp && resp.ok) {
-    downloadBtn.innerHTML = `✓ Added ${resp.added}`;
+    downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
       downloadBtn.innerHTML = `Download <span>${selected.length}</span>`;
       downloadBtn.disabled = false;

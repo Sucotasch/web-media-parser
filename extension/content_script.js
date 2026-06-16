@@ -139,46 +139,6 @@
     return bestUrl;
   }
 
-  // --- Fetch linked pages to discover fullsize images ---
-
-  async function discoverFullsizeFromLinks(links, currentUrl, maxLinks) {
-    const discovered = [];
-    const toCheck = links.slice(0, maxLinks || 20);
-
-    for (const linkUrl of toCheck) {
-      try {
-        const resp = await fetch(linkUrl, {
-          credentials: "include",
-          headers: { "Accept": "text/html" },
-          signal: AbortSignal.timeout(5000),
-        });
-        if (!resp.ok) continue;
-        const contentType = resp.headers.get("content-type") || "";
-        if (contentType.includes("image/") || contentType.includes("video/")) {
-          // Direct media URL
-          discovered.push({ url: linkUrl, type: contentType.includes("video/") ? "video" : "image", source: "link-direct" });
-          continue;
-        }
-        if (!contentType.includes("text/html")) continue;
-
-        const html = await resp.text();
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, "text/html");
-
-        const result = scanPageMedia(doc, linkUrl);
-        // Only keep the largest/best images from linked pages
-        result.media.forEach((item) => {
-          if (item.width > 200 || item.height > 200 || item.source === "meta" || !item.width) {
-            discovered.push({ ...item, source: "linked-page" });
-          }
-        });
-      } catch (e) {
-        // Skip failed fetches silently
-      }
-    }
-    return discovered;
-  }
-
   // --- Imagus Sieve Engine (inline) ---
 
   function parseSieve(data) {
@@ -246,21 +206,8 @@
   // --- Full scan orchestration ---
 
   async function performFullScan(sieveRules) {
-    // Step 1: Scan current page DOM
     const currentResult = scanPageMedia(document, window.location.href);
-    let allMedia = currentResult.media;
-    const linksToCheck = currentResult.links;
-
-    // Step 2: Discover fullsize from linked pages
-    if (linksToCheck.length > 0) {
-      const linkedMedia = await discoverFullsizeFromLinks(linksToCheck, window.location.href, 15);
-      allMedia = allMedia.concat(linkedMedia);
-    }
-
-    // Step 3: Apply sieve rules for URL transformation
-    allMedia = applySieveTransformation(allMedia, window.location.href, sieveRules);
-
-    return allMedia;
+    return { media: currentResult.media, links: currentResult.links };
   }
 
   // --- Message handler ---
@@ -278,8 +225,8 @@
             }
           } catch (e) {}
 
-          const media = await performFullScan(sieveRules);
-          sendResponse({ media, url: window.location.href, title: document.title });
+          const result = await performFullScan(sieveRules);
+          sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title });
         } catch (e) {
           sendResponse({ media: [], url: window.location.href, title: document.title, error: e.message });
         }

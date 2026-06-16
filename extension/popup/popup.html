@@ -11,23 +11,33 @@
   </div>
 
   <div id="scan-section">
-    <button id="scan-btn" class="primary">Scan This Page</button>
+    <button id="scan-btn" class="primary full-width">Scan This Page</button>
     <div id="page-info" class="hidden"></div>
   </div>
 
   <div id="results" class="hidden">
     <div class="results-header">
       <span id="count">0 items</span>
-      <label><input type="checkbox" id="select-all" checked> Select All</label>
+      <div class="results-controls">
+        <select id="domain-filter" class="domain-filter">
+          <option value="">All domains</option>
+        </select>
+        <label><input type="checkbox" id="select-all" checked> All</label>
+      </div>
     </div>
 
     <div id="media-list"></div>
 
     <div class="actions">
       <label><input type="checkbox" id="one-shot" checked> Page only</label>
-      <button id="download-btn" class="primary" disabled>
-        Download <span id="selected-count">0</span>
-      </button>
+      <div class="actions-buttons">
+        <button id="chrome-download-btn" class="secondary" disabled>
+          Save (Chrome) <span id="chrome-count">0</span>
+        </button>
+        <button id="download-btn" class="primary" disabled>
+          Download <span id="selected-count">0</span>
+        </button>
+      </div>
     </div>
   </div>
 

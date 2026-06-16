@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Web Media Parser",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "description": "Extract and download media from web pages",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"
