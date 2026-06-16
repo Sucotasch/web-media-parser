@@ -48,7 +48,7 @@ class ExtensionServer:
         """Start the HTTP server (called from asyncio event loop)."""
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "localhost", self.port)
+        self._site = web.TCPSite(self._runner, "127.0.0.1", self.port)
         await self._site.start()
         logger.info(f"Extension API server started on http://localhost:{self.port}")
 

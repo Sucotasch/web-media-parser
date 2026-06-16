@@ -12,6 +12,7 @@
   function scanPageMedia(doc, baseUrl) {
     const media = [];
     const seen = new Set();
+    const linkSet = new Set();
     const links = [];
 
     const JUNK_PATTERNS = [
@@ -41,11 +42,11 @@
     }
 
     function addLink(url) {
-      if (!url || links.includes(url)) return;
+      if (!url || linkSet.has(url)) return;
       if (url.startsWith("//")) url = "https:" + url;
       if (!url.startsWith("http://") && !url.startsWith("https://")) return;
       if (url === baseUrl) return;
-      if (links.includes(url)) return;
+      linkSet.add(url);
       links.push(url);
     }
 

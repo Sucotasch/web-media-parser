@@ -32,3 +32,7 @@ button.primary:disabled { background: #555; cursor: not-allowed; }
 .actions label { font-size: 12px; color: #aaa; }
 .hidden { display: none; }
 .error { padding: 10px 14px; color: #ef5350; font-size: 12px; }
+.footer { padding: 6px 14px; border-top: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+.sieve-info { font-size: 10px; color: #888; }
+.sieve-link { font-size: 11px; color: #1976d2; cursor: pointer; text-decoration: underline; }
+.sieve-link:hover { color: #42a5f5; }

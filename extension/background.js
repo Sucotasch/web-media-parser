@@ -3,7 +3,7 @@
  * Loads sieve rules into storage and communicates with desktop app.
  */
 
-const API_BASE = "http://localhost:19876";
+const API_BASE = "http://127.0.0.1:19876";
 
 // Load sieve rules from bundled file into storage
 async function loadSieveRules() {

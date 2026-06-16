@@ -228,3 +228,44 @@ function showError(msg) {
 
 // Init
 checkConnection();
+updateSieveInfo();
+
+// --- Sieve rules management ---
+
+async function updateSieveInfo() {
+  const infoEl = document.getElementById("sieve-info");
+  try {
+    const stored = await chrome.storage.local.get("sieveRules");
+    if (stored.sieveRules) {
+      const data = JSON.parse(stored.sieveRules);
+      const count = Object.keys(data).length;
+      infoEl.textContent = `Sieve: ${count} rules loaded`;
+    } else {
+      infoEl.textContent = "Sieve: no rules loaded";
+    }
+  } catch (e) {
+    infoEl.textContent = "Sieve: error reading rules";
+  }
+}
+
+document.getElementById("sieve-file").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const count = Object.keys(data).length;
+    if (count === 0) {
+      showError("File contains no rules");
+      return;
+    }
+    await chrome.storage.local.set({ sieveRules: text });
+    document.getElementById("sieve-info").textContent = `Sieve: ${count} rules loaded`;
+    showError(`Loaded ${count} sieve rules from ${file.name}`);
+    setTimeout(() => document.getElementById("error").classList.add("hidden"), 3000);
+  } catch (e) {
+    showError(`Failed to load: ${e.message}`);
+  }
+  e.target.value = "";
+});
