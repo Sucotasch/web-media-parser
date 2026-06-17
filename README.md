@@ -55,6 +55,33 @@
 - **Streaming:** M3U8 (HLS), MPD (DASH)
 - **API:** JSON-эндпоинты с извлечением медиа из вложенных структур
 
+### Браузерное расширение (Chrome/Chromium)
+
+Расширение работает как точка входа для desktop-приложения и как самостоятельный загрузчик.
+
+**Режимы работы:**
+
+| Режим | Кнопка | Что делает |
+|-------|--------|------------|
+| **Page only** ✓ | Download | Сканирует страницу → показывает полноразмерные → скачивает выбранные через Chrome |
+| **Page only** ✗ | Parse Page | Отправляет URL страницы в desktop → полный парсинг (rawler, sieve, deep crawl) |
+| Save (Chrome) | — | Скачивает выбранные изображения напрямую через Chrome downloads |
+| Ctrl+Shift+S | — | Сканирует + скачивает все fullsize через Chrome |
+| Ctrl+Shift+D | — | Сканирует + отправляет URL страницы в desktop |
+
+**Возможности расширения:**
+- Сканирование DOM: `<img>`, `<video>`, `srcset`, `data-src`, CSS backgrounds, og:image
+- Обнаружение fullsize: загрузка linked pages → поиск прямых CDN URL через Imagus sieve `res` regex
+- Извлечение cookies и User-Agent из браузера → передача в desktop для обхода блокировок
+- Фильтрация по домену и типу (Full size / Thumbnails)
+- Загрузка custom sieve rules из JSON файла
+
+**Установка:**
+1. `chrome://extensions` → Developer mode
+2. Load unpacked → выберите папку `extension/`
+3. При первом запуске загружаются 849 Imagus sieve rules
+4. Можно обновить через "Load sieve rules..." в popup
+
 ### Интерфейс
 - **PySide6 GUI** — тёмная тема, лог с фильтрацией по уровням
 - **Пауза / Продолжить / Стоп** — полный контроль над процессом
@@ -205,6 +232,9 @@ main.py
 │
 ├── src/downloader/
 │   └── media_downloader.py  — single/multi-thread загрузка, rate limit
+│
+├── src/server/
+│   └── http_server.py       — HTTP API для браузерного расширения (localhost:19876)
 │
 ├── src/
 │   ├── app_paths.py          — единый модуль путей (portable builds)
