@@ -520,10 +520,26 @@ class WebpageParser:
                              significant = True
 
                     if significant and not is_trash_media(abs_url):
-                        self.media_files.append(("image", abs_url, variant_attrs))
-                        found += 1
+                        # Check if this thumbnail has a parent <a> link to a webpage
+                        # If so, skip the thumbnail — the linked page will be crawled for fullsize
+                        is_interstitial_retry = self.context.get("interstitial_retry", False)
+                        parent_a = img.find_parent('a', href=True)
+                        has_parent_webpage_link = False
+                        if parent_a and parent_a.get('href') and self._is_element_visible(parent_a):
+                            link_url = parent_a.get('href')
+                            link_abs_url = urljoin(self.url, link_url)
+                            if link_abs_url.startswith(("http://", "https://")) and link_abs_url != abs_url:
+                                if not is_image_url(link_abs_url) and not is_trash_media(link_abs_url):
+                                    has_parent_webpage_link = True
+                                    # Add the linked page for crawling
+                                    if not is_interstitial_retry or link_abs_url != self.url:
+                                        self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 15.0}
+
+                        if not has_parent_webpage_link:
+                            self.media_files.append(("image", abs_url, variant_attrs))
+                            found += 1
                     
-                    # 3. Always attempt to follow parent link (don't miss content behind junk media)
+                    # Follow parent link for fullsize discovery
                     parent_a = img.find_parent('a', href=True)
                     if parent_a and parent_a.get('href') and self._is_element_visible(parent_a):
                         link_url, link_abs_url = parent_a.get('href'), urljoin(self.url, parent_a.get('href'))
@@ -531,16 +547,14 @@ class WebpageParser:
                             is_interstitial_retry = self.context.get("interstitial_retry", False)
                             
                             if is_interstitial_retry and link_abs_url == self.url:
-                                continue # Skip self-links in recovery mode
+                                continue
 
                             if is_image_url(link_abs_url):
-                                # If the link itself points to trash, we still follow it but don't download
                                 if not is_trash_media(link_abs_url):
                                     link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
                                     if self._is_significant_media("image", link_abs_url, link_attrs):
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                                 else:
-                                    # Even if it's trash-media link, it might be a gateway; add to links for crawl
                                     self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
                             elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
                                 if not is_trash_media(link_abs_url):
@@ -549,7 +563,7 @@ class WebpageParser:
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                                 else:
                                     self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
-                            else: 
+                            elif not has_parent_webpage_link: 
                                 self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'potential_media_container': True, 'priority': 15.0}
         
         for elem in soup.find_all(attrs={"style": True}):
