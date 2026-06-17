@@ -608,7 +608,8 @@ class ParserManager(QObject):
                 await self.download_queue.put(media_item)
                 if media_type == "image": self.stats["images_found"] += 1
                 elif media_type == "video": self.stats["videos_found"] += 1
-                logger.debug(f"Added {media_type} to download queue: {abs_url} (queue size: {self.download_queue.qsize()})")
+                src = attrs.get("source", "?")
+                logger.info(f"QUEUE: {media_type} | source={src} | {abs_url}")
             except Exception as err:
                 logger.error(f"Error processing media file {url}: {str(err)}", exc_info=True)
 
