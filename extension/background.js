@@ -235,6 +235,8 @@ async function getStatus() {
 
 // --- Keyboard commands ---
 
+let commandBusy = false;
+
 async function setBadge(text, color) {
   try {
     await chrome.action.setBadgeText({ text });
@@ -243,6 +245,9 @@ async function setBadge(text, color) {
 }
 
 async function commandScanAndProcess(action) {
+  if (commandBusy) return;
+  commandBusy = true;
+  try {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
 
@@ -288,6 +293,9 @@ async function commandScanAndProcess(action) {
     const context = await getPageContext(tab.id);
     await sendToDesktop([{ url: response.url }], false, context);
     setTimeout(() => setBadge(""), 3000);
+  }
+  } finally {
+    commandBusy = false;
   }
 }
 
