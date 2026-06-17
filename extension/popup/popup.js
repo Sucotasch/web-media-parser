@@ -305,9 +305,14 @@ chromeDownloadBtn.addEventListener("click", async () => {
 
   // Send to background for download
   try {
+    await chrome.action.setBadgeText({ text: `${selected.length}` });
+    await chrome.action.setBadgeBackgroundColor({ color: "#FFA000" });
     const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected });
     const saved = resp && resp.saved ? resp.saved : 0;
     chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
+    await chrome.action.setBadgeText({ text: `${saved}` });
+    await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+    setTimeout(() => chrome.action.setBadgeText({ text: "" }), 5000);
   } catch (e) {
     showError(`Download failed: ${e.message}`);
     chromeDownloadBtn.innerHTML = `Save (Chrome) <span>${selected.length}</span>`;
@@ -328,16 +333,23 @@ downloadBtn.addEventListener("click", async () => {
     // Deep parse: just send the page URL to desktop, no scan needed
     downloadBtn.disabled = true;
     downloadBtn.innerHTML = "Sending...";
+    await chrome.action.setBadgeText({ text: "..." });
+    await chrome.action.setBadgeBackgroundColor({ color: "#2196F3" });
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const pageUrl = tab ? tab.url : "";
-    // Get browser context (cookies + UA) for the desktop app
     let context = {};
     try { context = await chrome.runtime.sendMessage({ action: "getContext", tabId: tab?.id }); } catch (e) {}
     const resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false, context });
     if (resp && resp.ok) {
       downloadBtn.innerHTML = "\u2713 Sent to app";
+      await chrome.action.setBadgeText({ text: "\u2713" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
     } else if (resp && resp.error) {
       showError(resp.error);
+      await chrome.action.setBadgeText({ text: "!" });
+      await chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
+      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
     }
     setTimeout(() => {
       downloadBtn.innerHTML = "Download";
