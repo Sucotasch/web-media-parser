@@ -139,73 +139,9 @@
     return bestUrl;
   }
 
-  // --- Imagus Sieve Engine (inline) ---
-
-  function parseSieve(data) {
-    const rules = [];
-    for (const [name, rule] of Object.entries(data)) {
-      if (!rule || typeof rule !== "object") continue;
-      const img = rule.img || "";
-      const to = rule.to || "";
-      const link = rule.link || "";
-      if (!img || !to) continue;
-
-      let imgRegex;
-      try { imgRegex = new RegExp(img, "i"); } catch (e) { continue; }
-      let linkRegex = null;
-      if (link) { try { linkRegex = new RegExp(link, "i"); } catch (e) {} }
-
-      const isJS = typeof to === "string" && to.startsWith(":");
-      const toPattern = isJS ? to.slice(1).trim() : to;
-      rules.push({ name, imgRegex, toPattern, isJS, linkRegex });
-    }
-    return rules;
-  }
-
-  function applySieveRules(url, pageUrl, rules) {
-    for (const rule of rules) {
-      if (rule.linkRegex && !rule.linkRegex.test(pageUrl)) continue;
-      const match = url.match(rule.imgRegex);
-      if (!match) continue;
-
-      if (rule.isJS) {
-        try {
-          const fnBody = `"use strict"; const $ = ${JSON.stringify(match.slice())}; const document = window.document; const URL = window.URL; ${rule.toPattern}`;
-          const result = new Function(fnBody)();
-          if (typeof result === "string" && (result.startsWith("http") || result.startsWith("//"))) {
-            return result.startsWith("//") ? "https:" + result : result;
-          }
-        } catch (e) {}
-      } else {
-        let result = rule.toPattern.replace(/\$(\d+)/g, (_, num) => match[parseInt(num)] || "");
-        const extMatch = result.match(/#([^#]+)#/);
-        if (extMatch) {
-          const exts = extMatch[1].trim().split(/\s+/);
-          if (exts.length > 0) result = result.replace(extMatch[0], exts[0]);
-        }
-        if (result !== url) return result;
-      }
-    }
-    return null;
-  }
-
-  function applySieveTransformation(mediaList, pageUrl, rules) {
-    if (!rules || rules.length === 0) return mediaList;
-    const transformed = [];
-    for (const item of mediaList) {
-      const result = applySieveRules(item.url, pageUrl, rules);
-      if (result) {
-        transformed.push({ ...item, url: result, original: item.url, transformed: true });
-      } else {
-        transformed.push(item);
-      }
-    }
-    return transformed;
-  }
-
   // --- Full scan orchestration ---
 
-  async function performFullScan(sieveRules) {
+  async function performFullScan() {
     const currentResult = scanPageMedia(document, window.location.href);
     return { media: currentResult.media, links: currentResult.links };
   }
@@ -216,16 +152,7 @@
     if (request.action === "scanMedia") {
       (async () => {
         try {
-          let sieveRules = [];
-          try {
-            const stored = await chrome.storage.local.get("sieveRules");
-            if (stored.sieveRules) {
-              const data = JSON.parse(stored.sieveRules);
-              sieveRules = parseSieve(data);
-            }
-          } catch (e) {}
-
-          const result = await performFullScan(sieveRules);
+          const result = await performFullScan();
           sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title });
         } catch (e) {
           sendResponse({ media: [], url: window.location.href, title: document.title, error: e.message });

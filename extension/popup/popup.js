@@ -5,6 +5,9 @@
 
 const mediaItems = [];
 let activeDomainFilter = "";
+let activeSourceFilter = "";
+
+const FULLSIZE_SOURCES = new Set(["sieve-res", "linked-dom", "linked-html", "linked-img", "link-direct"]);
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
@@ -20,6 +23,7 @@ const resultsDiv = document.getElementById("results");
 const emptyDiv = document.getElementById("empty");
 const errorDiv = document.getElementById("error");
 const domainFilter = document.getElementById("domain-filter");
+const sourceFilter = document.getElementById("source-filter");
 const chromeDownloadBtn = document.getElementById("chrome-download-btn");
 const chromeCountSpan = document.getElementById("chrome-count");
 
@@ -75,7 +79,9 @@ scanBtn.addEventListener("click", async () => {
   scanBtn.textContent = "Scanning...";
   mediaItems.length = 0;
   activeDomainFilter = "";
+  activeSourceFilter = "";
   domainFilter.value = "";
+  sourceFilter.value = "";
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -131,14 +137,23 @@ domainFilter.addEventListener("change", () => {
   updateCount();
 });
 
+sourceFilter.addEventListener("change", () => {
+  activeSourceFilter = sourceFilter.value;
+  renderMediaList();
+  updateCount();
+});
+
 // --- Render media list ---
 
 function renderMediaList() {
   mediaList.innerHTML = "";
 
-  const filtered = activeDomainFilter
-    ? mediaItems.filter((item) => extractDomain(item.url) === activeDomainFilter)
-    : mediaItems;
+  const filtered = mediaItems.filter((item) => {
+    if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
+    if (activeSourceFilter === "fullsize" && !FULLSIZE_SOURCES.has(item.source)) return false;
+    if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
+    return true;
+  });
 
   if (filtered.length === 0) {
     resultsDiv.classList.add("hidden");

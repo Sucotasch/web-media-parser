@@ -36,7 +36,6 @@ loadSieveRules();
 
 // Parse sieve rules and extract res patterns (like Imagus cachedSieveRes)
 let cachedSieveRes = {};
-let cachedSieveLinkRegexes = [];
 
 async function loadSieveResPatterns() {
   try {
