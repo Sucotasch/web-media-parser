@@ -513,12 +513,11 @@ class WebpageParser:
                     # If this is a recovery pass, we relax significance rules to find the hidden target
                     significant = self._is_significant_media("image", abs_url, variant_attrs)
                     if is_interstitial_retry and not significant:
-                        # Loosen rules: if it looks like a real image but failed standard significance (e.g. metadata/classes),
-                        # we take it anyway because this page is explicitly a media landing page.
                         if not is_trash_media(abs_url):
                              logger.debug(f"Loosening significance rules for interstitial recovery: {abs_url}")
                              significant = True
 
+                    has_parent_webpage_link = False
                     if significant and not is_trash_media(abs_url):
                         # Check if this thumbnail has a parent <a> link to a webpage
                         # If so, skip the thumbnail — the linked page will be crawled for fullsize
