@@ -153,7 +153,7 @@
       (async () => {
         try {
           const result = await performFullScan();
-          sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title });
+          sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title, userAgent: navigator.userAgent });
         } catch (e) {
           sendResponse({ media: [], url: window.location.href, title: document.title, error: e.message });
         }

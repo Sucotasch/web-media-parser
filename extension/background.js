@@ -189,12 +189,30 @@ async function chromeDownload(items) {
 /**
  * Send media URLs to the desktop app.
  */
-async function sendToDesktop(urls, oneShot = false) {
+async function getPageContext(tabId) {
+  const context = {};
   try {
+    const cookies = await chrome.cookies.getAll({ tabId });
+    if (cookies.length > 0) {
+      context.cookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+    }
+  } catch (e) {}
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { action: "getUA" });
+    if (response && response.userAgent) context.user_agent = response.userAgent;
+  } catch (e) {}
+  return context;
+}
+
+async function sendToDesktop(urls, oneShot = false, context = {}) {
+  try {
+    const payload = { urls, one_shot: oneShot };
+    if (context.user_agent) payload.user_agent = context.user_agent;
+    if (context.cookies) payload.cookies = context.cookies;
     const response = await fetch(`${API_BASE}/api/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ urls, one_shot: oneShot }),
+      body: JSON.stringify(payload),
     });
     const data = await response.json();
     return data;
@@ -248,8 +266,8 @@ async function commandScanAndProcess(action) {
     }));
     await chromeDownload(toDownload);
   } else if (action === "send-desktop") {
-    // Deep parse: send just the page URL, desktop parser does full discovery
-    await sendToDesktop([{ url: response.url }], false);
+    const context = await getPageContext(tab.id);
+    await sendToDesktop([{ url: response.url }], false, context);
   }
 }
 
@@ -264,7 +282,7 @@ chrome.commands?.onCommand?.addListener((command) => {
 // Listen for messages from popup and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "download") {
-    sendToDesktop(request.urls, request.one_shot).then(sendResponse);
+    sendToDesktop(request.urls, request.one_shot, request.context || {}).then(sendResponse);
     return true;
   }
   if (request.action === "discoverFullsize") {
@@ -273,6 +291,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === "chromeDownload") {
     chromeDownload(request.items).then(sendResponse);
+    return true;
+  }
+  if (request.action === "getContext") {
+    getPageContext(request.tabId).then(sendResponse);
     return true;
   }
   if (request.action === "getStatus") {

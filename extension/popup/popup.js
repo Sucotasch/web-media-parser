@@ -330,7 +330,10 @@ downloadBtn.addEventListener("click", async () => {
     downloadBtn.innerHTML = "Sending...";
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const pageUrl = tab ? tab.url : "";
-    const resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false });
+    // Get browser context (cookies + UA) for the desktop app
+    let context = {};
+    try { context = await chrome.runtime.sendMessage({ action: "getContext", tabId: tab?.id }); } catch (e) {}
+    const resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false, context });
     if (resp && resp.ok) {
       downloadBtn.innerHTML = "\u2713 Sent to app";
     } else if (resp && resp.error) {
@@ -362,7 +365,12 @@ downloadBtn.addEventListener("click", async () => {
   downloadBtn.disabled = true;
   downloadBtn.innerHTML = `Sending <span>${selected.length}</span>...`;
 
-  const resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true });
+  // Get browser context (cookies + UA)
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let context = {};
+  try { context = await chrome.runtime.sendMessage({ action: "getContext", tabId: tab?.id }); } catch (e) {}
+
+  const resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true, context });
 
   if (resp && resp.error) {
     showError(resp.error);

@@ -62,7 +62,7 @@ class AsyncClientManager:
         Get default request headers with browser simulation.
         Modern headers (Chrome 130+) to better emulate real users.
         """
-        return {
+        headers = {
             "User-Agent": self.settings.get(
                 "user_agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -81,6 +81,11 @@ class AsyncClientManager:
             "DNT": "1",
             "Connection": "keep-alive",
         }
+        # Add cookies from browser extension context
+        ext_cookies = self.settings.get("extension_cookies", "")
+        if ext_cookies:
+            headers["Cookie"] = ext_cookies
+        return headers
 
     async def get_session(self) -> aiohttp.ClientSession:
         """

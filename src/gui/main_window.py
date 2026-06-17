@@ -1093,10 +1093,16 @@ class MainWindow(QMainWindow):
 
     def _start_extension_server(self):
         """Start the HTTP API server for browser extension communication."""
-        def add_tasks_from_extension(urls, one_shot=False):
+        def add_tasks_from_extension(urls, one_shot=False, user_agent="", cookies=""):
             """Callback: add tasks from extension to queue. Runs in HTTP thread."""
             added = 0
             settings = self.settings_dialog.get_settings()
+
+            # Override settings with browser context from extension
+            if user_agent:
+                settings["user_agent"] = user_agent
+            if cookies:
+                settings["extension_cookies"] = cookies
 
             if one_shot and urls:
                 source_page = urls[0].get("source", "") if urls else ""

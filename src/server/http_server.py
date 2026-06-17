@@ -112,13 +112,15 @@ class ExtensionServer:
 
         urls = body.get("urls", [])
         one_shot = body.get("one_shot", False)
+        user_agent = body.get("user_agent", "")
+        cookies = body.get("cookies", "")
 
         if not urls:
             return web.json_response({"error": "No URLs provided"}, status=400, headers=self._cors_headers())
 
         if self.add_tasks_callback:
             try:
-                result = self.add_tasks_callback(urls, one_shot)
+                result = self.add_tasks_callback(urls, one_shot, user_agent=user_agent, cookies=cookies)
                 return web.json_response({"ok": True, "added": len(urls), **(result or {})}, headers=self._cors_headers())
             except Exception as e:
                 logger.error(f"Error adding tasks from extension: {e}")
