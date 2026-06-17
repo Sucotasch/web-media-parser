@@ -93,7 +93,7 @@ SIGNIFICANT_MEDIA_IGNORE_PATTERNS = [
     "icon", "logo", "avatar", "social-", "button-", "placeholder", "nav-",
     "banner-", "advert", "ad-", "pixel", "tracker", "facebook", "twitter",
     "instagram", "linkedin", "youtube", "telegram", "vk.com", "yandex",
-    "thumb", "/th/", "thumbnail",
+    "thumb", "thumbnail",
 ]
 SIGNIFICANT_MEDIA_MIN_DIMENSION = 100 # Minimum width/height if specified in HTML
 
