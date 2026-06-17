@@ -112,18 +112,6 @@ async function discoverFullsize(links, pageUrl) {
         } catch (e) {}
         break; // Found matching link rule, stop
       }
-
-      // 2. Fallback: scan <img> src attributes from raw HTML
-      const SRC_RE = /<img[^>]+src=["']([^"']+)["']/gi;
-      let m;
-      while ((m = SRC_RE.exec(html)) !== null) {
-        let url = m[1];
-        if (url.startsWith("//")) url = "https:" + url;
-        if (url.startsWith("http") && !seen.has(url) && url !== linkUrl) {
-          seen.add(url);
-          discovered.push({ url, type: "image", pageUrl, source: "linked-img" });
-        }
-      }
     } catch (e) {}
   }
   return { media: discovered };

@@ -324,8 +324,9 @@ chromeDownloadBtn.addEventListener("click", async () => {
   }
 
   setTimeout(() => {
-    updateCount();
+    chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
     chromeDownloadBtn.disabled = false;
+    updateCount();
   }, 1500);
 });
 
@@ -394,8 +395,9 @@ downloadBtn.addEventListener("click", async () => {
   } else if (resp && resp.ok) {
     downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
-      downloadBtn.innerHTML = `Download <span>${selected.length}</span>`;
+      downloadBtn.textContent = "Download";
       downloadBtn.disabled = false;
+      updateCount();
     }, 1500);
   }
 
