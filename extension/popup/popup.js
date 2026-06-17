@@ -273,7 +273,9 @@ function updateCount() {
   }).length;
 
   selectedCountSpan.textContent = checkedCount;
-  chromeCountSpan.textContent = checkedCount;
+  // Re-query chromeCountSpan in case innerHTML was replaced
+  const cc = document.getElementById("chrome-count");
+  if (cc) cc.textContent = checkedCount;
   countSpan.textContent = `${checkedCount} / ${total}`;
   downloadBtn.disabled = checkedCount === 0;
   chromeDownloadBtn.disabled = !oneShotCheckbox.checked || checkedCount === 0;

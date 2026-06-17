@@ -23,7 +23,7 @@
       /\/button[s]?\//i, /\/badge/i, /\/arrow/i,
       /\/(nav|menu|search|cart|share|social|widget|advert|tracker)\b/i,
       /\/(prev|next|close|expand|collapse|play|pause|mute|volume)\b/i,
-      /\.gif$/i,
+      /\.(gif|png|ico)$/i,
     ];
 
     function isJunkUrl(url) {
