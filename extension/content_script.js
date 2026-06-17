@@ -14,7 +14,6 @@
     const seen = new Set();
     const linkSet = new Set();
     const links = [];
-    const mediaLinks = [];
 
     const JUNK_PATTERNS = [
       /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo\./i,
@@ -74,8 +73,7 @@
       if (parentA) {
         const href = parentA.getAttribute("href");
         if (href && href !== "#" && !href.startsWith("javascript:")) {
-          const fullHref = href.startsWith("//") ? "https:" + href : href;
-          if (!mediaLinks.includes(fullHref)) mediaLinks.push(fullHref);
+          addLink(href.startsWith("//") ? "https:" + href : href);
         }
       }
     });
@@ -126,7 +124,7 @@
       }
     });
 
-    return { media, links, mediaLinks };
+    return { media, links };
   }
 
   function parseSrcset(srcset) {
@@ -145,7 +143,7 @@
 
   async function performFullScan() {
     const currentResult = scanPageMedia(document, window.location.href);
-    return { media: currentResult.media, links: currentResult.links };
+    return { media: currentResult.media, links: currentResult.links, url: window.location.href, title: document.title };
   }
 
   // --- Message handler ---
@@ -155,7 +153,7 @@
       (async () => {
         try {
           const result = await performFullScan();
-          sendResponse({ media: result.media, links: result.links, mediaLinks: result.mediaLinks, url: window.location.href, title: document.title, userAgent: navigator.userAgent });
+          sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title, userAgent: navigator.userAgent });
         } catch (e) {
           sendResponse({ media: [], url: window.location.href, title: document.title, error: e.message });
         }
