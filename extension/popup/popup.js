@@ -265,9 +265,12 @@ function updateCount() {
   let checkedCount = 0;
   checked.forEach((cb) => { if (cb.checked) checkedCount++; });
 
-  const total = activeDomainFilter
-    ? mediaItems.filter((item) => extractDomain(item.url) === activeDomainFilter).length
-    : mediaItems.length;
+  const total = mediaItems.filter((item) => {
+    if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
+    if (activeSourceFilter === "fullsize" && !FULLSIZE_SOURCES.has(item.source)) return false;
+    if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
+    return true;
+  }).length;
 
   selectedCountSpan.textContent = checkedCount;
   chromeCountSpan.textContent = checkedCount;
