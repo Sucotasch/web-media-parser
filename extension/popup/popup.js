@@ -318,11 +318,11 @@ chromeDownloadBtn.addEventListener("click", async () => {
     setTimeout(() => chrome.action.setBadgeText({ text: "" }), 5000);
   } catch (e) {
     showError(`Download failed: ${e.message}`);
-    chromeDownloadBtn.innerHTML = `Save (Chrome) <span>${selected.length}</span>`;
+    updateCount();
   }
 
   setTimeout(() => {
-    chromeDownloadBtn.innerHTML = `Save (Chrome) <span>${selected.length}</span>`;
+    updateCount();
     chromeDownloadBtn.disabled = false;
   }, 1500);
 });
