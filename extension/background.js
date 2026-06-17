@@ -299,7 +299,7 @@ async function commandScanAndProcess(action) {
   }
 }
 
-const FULLSIZE_SOURCES = new Set(["sieve-res", "linked-dom", "linked-html", "linked-img", "link-direct"]);
+const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct"]);
 
 chrome.commands?.onCommand?.addListener((command) => {
   if (command === "save-chrome" || command === "send-desktop") {

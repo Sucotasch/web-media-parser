@@ -7,7 +7,7 @@ const mediaItems = [];
 let activeDomainFilter = "";
 let activeSourceFilter = "";
 
-const FULLSIZE_SOURCES = new Set(["sieve-res", "linked-dom", "linked-html", "linked-img", "link-direct"]);
+const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct"]);
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
