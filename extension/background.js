@@ -235,20 +235,36 @@ async function getStatus() {
 
 // --- Keyboard commands ---
 
+async function setBadge(text, color) {
+  try {
+    await chrome.action.setBadgeText({ text });
+    await chrome.action.setBadgeBackgroundColor({ color });
+  } catch (e) {}
+}
+
 async function commandScanAndProcess(action) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
+
+  await setBadge("...", "#FFA000");
 
   let response;
   try {
     response = await chrome.tabs.sendMessage(tab.id, { action: "scanMedia" });
   } catch (e) {
+    await setBadge("!", "#F44336");
+    setTimeout(() => setBadge(""), 3000);
     return;
   }
-  if (!response || !response.media) return;
+  if (!response || !response.media) {
+    await setBadge("0", "#F44336");
+    setTimeout(() => setBadge(""), 3000);
+    return;
+  }
 
   let media = response.media;
   if (response.links && response.links.length > 0) {
+    await setBadge("...", "#FFA000");
     const linked = await discoverFullsize(response.links.slice(0, 15), response.url);
     if (linked && linked.media) {
       media = media.concat(linked.media);
@@ -259,15 +275,19 @@ async function commandScanAndProcess(action) {
   const items = fullsize.length > 0 ? fullsize : media;
 
   if (action === "save-chrome") {
+    await setBadge(`${items.length}`, "#4CAF50");
     const toDownload = items.map(item => ({
       url: item.url,
       filename: item.url.split("/").pop().split("?")[0] || "",
       referer: response.url || "",
     }));
     await chromeDownload(toDownload);
+    setTimeout(() => setBadge(""), 5000);
   } else if (action === "send-desktop") {
+    await setBadge("✓", "#4CAF50");
     const context = await getPageContext(tab.id);
     await sendToDesktop([{ url: response.url }], false, context);
+    setTimeout(() => setBadge(""), 3000);
   }
 }
 
