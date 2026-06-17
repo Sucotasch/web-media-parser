@@ -26,6 +26,15 @@ const domainFilter = document.getElementById("domain-filter");
 const sourceFilter = document.getElementById("source-filter");
 const chromeDownloadBtn = document.getElementById("chrome-download-btn");
 const chromeCountSpan = document.getElementById("chrome-count");
+const deepParseWarning = document.getElementById("deep-parse-warning");
+
+function updateOneShotMode() {
+  const isDeepParse = !oneShotCheckbox.checked;
+  deepParseWarning.classList.toggle("hidden", !isDeepParse);
+  chromeDownloadBtn.disabled = isDeepParse || getVisibleCheckboxes().length === 0;
+}
+
+oneShotCheckbox.addEventListener("change", updateOneShotMode);
 
 // --- Connection check ---
 
@@ -262,7 +271,7 @@ function updateCount() {
   chromeCountSpan.textContent = checkedCount;
   countSpan.textContent = `${checkedCount} / ${total}`;
   downloadBtn.disabled = checkedCount === 0;
-  chromeDownloadBtn.disabled = checkedCount === 0;
+  chromeDownloadBtn.disabled = !oneShotCheckbox.checked || checkedCount === 0;
   selectAllCheckbox.checked = checkedCount === total && total > 0;
 }
 
@@ -329,7 +338,15 @@ downloadBtn.addEventListener("click", async () => {
   downloadBtn.innerHTML = `Sending <span>${selected.length}</span>...`;
 
   const oneShot = oneShotCheckbox.checked;
-  const resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: oneShot });
+  let resp;
+  if (oneShot) {
+    // Page only: send selected items directly
+    resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true });
+  } else {
+    // Deep parse: send just the page URL — desktop parser does full discovery
+    const pageUrl = mediaItems.length > 0 ? (mediaItems[0].pageUrl || "") : "";
+    resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false });
+  }
 
   if (resp && resp.error) {
     showError(resp.error);

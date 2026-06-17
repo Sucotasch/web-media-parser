@@ -230,7 +230,6 @@ async function commandScanAndProcess(action) {
   if (!response || !response.media) return;
 
   let media = response.media;
-  // Discover fullsize from linked pages
   if (response.links && response.links.length > 0) {
     const linked = await discoverFullsize(response.links.slice(0, 15), response.url);
     if (linked && linked.media) {
@@ -238,7 +237,6 @@ async function commandScanAndProcess(action) {
     }
   }
 
-  // Filter to fullsize only
   const fullsize = media.filter(m => FULLSIZE_SOURCES.has(m.source));
   const items = fullsize.length > 0 ? fullsize : media;
 
@@ -250,12 +248,8 @@ async function commandScanAndProcess(action) {
     }));
     await chromeDownload(toDownload);
   } else if (action === "send-desktop") {
-    const toSend = items.map(item => ({
-      url: item.url,
-      source: response.url || "",
-      type: item.type,
-    }));
-    await sendToDesktop(toSend, false);
+    // Deep parse: send just the page URL, desktop parser does full discovery
+    await sendToDesktop([{ url: response.url }], false);
   }
 }
 
