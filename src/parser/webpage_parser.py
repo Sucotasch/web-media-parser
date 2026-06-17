@@ -503,17 +503,10 @@ class WebpageParser:
                     
                     # 2. Extract media only if significant (not trash)
                     is_interstitial_retry = self.context.get("interstitial_retry", False)
-                    
-                    # Safety: In interstitial recovery mode, NEVER allow the page to refer to itself as media
-                    # to prevent infinite HTML-to-HTML loops.
-                    if is_interstitial_retry and abs_url == self.url:
-                        logger.debug(f"Skipping self-referencing media during interstitial recovery: {abs_url}")
-                        continue
 
-                    # If this is a recovery pass, we relax significance rules to find the hidden target
-                    significant = self._is_significant_media("image", abs_url, variant_attrs)
                     if is_interstitial_retry and not significant:
-                        if not is_trash_media(abs_url):
+                        # Loosen rules for interstitial recovery, but still filter trash
+                        if not is_trash_media(abs_url) and not any(p in abs_url.lower() for p in K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS):
                              logger.debug(f"Loosening significance rules for interstitial recovery: {abs_url}")
                              significant = True
 
@@ -570,7 +563,8 @@ class WebpageParser:
                 abs_url = urljoin(self.url, url)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"source": "css", "element": elem.name, "is_cdn": self._is_cdn_url(abs_url, "img")}
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                    if self._is_significant_media("image", abs_url, attrs):
+                        self.media_files.append(("image", abs_url, attrs)); found += 1
         
         for link_tag in soup.find_all("link", rel=re.compile(r"icon|apple-touch-icon")):
             href = link_tag.get("href")
@@ -592,7 +586,8 @@ class WebpageParser:
                 abs_url = urljoin(self.url, content)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"property": meta_tag.get("property", ""), "source": "meta", "is_cdn": self._is_cdn_url(abs_url, "img")}
-                    self.media_files.append(("image", abs_url, attrs)); found += 1
+                    if self._is_significant_media("image", abs_url, attrs):
+                        self.media_files.append(("image", abs_url, attrs)); found += 1
         logger.info(f"Found {found} images on {self.url}")
 
 
