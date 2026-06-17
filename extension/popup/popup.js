@@ -117,7 +117,7 @@ scanBtn.addEventListener("click", async () => {
       if (response.links && response.links.length > 0) {
         const linked = await chrome.runtime.sendMessage({
           action: "discoverFullsize",
-          links: response.links.slice(0, 15),
+          links: response.links.slice(0, 50),
           pageUrl: response.url,
         });
         if (linked && linked.media) {
