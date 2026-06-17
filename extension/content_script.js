@@ -14,6 +14,7 @@
     const seen = new Set();
     const linkSet = new Set();
     const links = [];
+    const mediaLinks = [];
 
     const JUNK_PATTERNS = [
       /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo\./i,
@@ -73,7 +74,8 @@
       if (parentA) {
         const href = parentA.getAttribute("href");
         if (href && href !== "#" && !href.startsWith("javascript:")) {
-          addLink(href.startsWith("//") ? "https:" + href : href);
+          const fullHref = href.startsWith("//") ? "https:" + href : href;
+          if (!mediaLinks.includes(fullHref)) mediaLinks.push(fullHref);
         }
       }
     });
@@ -124,7 +126,7 @@
       }
     });
 
-    return { media, links };
+    return { media, links, mediaLinks };
   }
 
   function parseSrcset(srcset) {
@@ -153,7 +155,7 @@
       (async () => {
         try {
           const result = await performFullScan();
-          sendResponse({ media: result.media, links: result.links, url: window.location.href, title: document.title, userAgent: navigator.userAgent });
+          sendResponse({ media: result.media, links: result.links, mediaLinks: result.mediaLinks, url: window.location.href, title: document.title, userAgent: navigator.userAgent });
         } catch (e) {
           sendResponse({ media: [], url: window.location.href, title: document.title, error: e.message });
         }

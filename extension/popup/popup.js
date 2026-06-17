@@ -114,10 +114,10 @@ scanBtn.addEventListener("click", async () => {
     if (response && response.media) {
       mediaItems.push(...response.media);
       // Ask background to discover fullsize from linked pages (CORS bypass)
-      if (response.links && response.links.length > 0) {
+      if (response.mediaLinks && response.mediaLinks.length > 0) {
         const linked = await chrome.runtime.sendMessage({
           action: "discoverFullsize",
-          links: response.links,
+          links: response.mediaLinks,
           pageUrl: response.url,
         });
         if (linked && linked.media) {

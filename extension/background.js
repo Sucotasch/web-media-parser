@@ -268,9 +268,8 @@ async function commandScanAndProcess(action) {
   }
 
   let media = response.media;
-  if (response.links && response.links.length > 0) {
-    await setBadge("...", "#FFA000");
-    const linked = await discoverFullsize(response.links, response.url);
+  if (response.mediaLinks && response.mediaLinks.length > 0) {
+    const linked = await discoverFullsize(response.mediaLinks, response.url);
     if (linked && linked.media) {
       media = media.concat(linked.media);
     }
