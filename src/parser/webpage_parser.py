@@ -502,6 +502,7 @@ class WebpageParser:
                     variant_attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
                     
                     # 2. Extract media only if significant (not trash)
+                    significant = self._is_significant_media("image", abs_url, variant_attrs)
                     is_interstitial_retry = self.context.get("interstitial_retry", False)
 
                     if is_interstitial_retry and not significant:
