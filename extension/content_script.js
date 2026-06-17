@@ -143,7 +143,7 @@
 
   async function performFullScan() {
     const currentResult = scanPageMedia(document, window.location.href);
-    return { media: currentResult.media, links: currentResult.links, url: window.location.href, title: document.title };
+    return { media: currentResult.media, links: currentResult.links };
   }
 
   // --- Message handler ---

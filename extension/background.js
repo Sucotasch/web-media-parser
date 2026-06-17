@@ -72,8 +72,6 @@ if (chrome.storage.onChanged) {
   });
 }
 
-const DISCOVER_JUNK = /\/(logo|icon|favicon|avatar|sprite|blank|pixel|spacer|loading|spinner|badge|arrow|button|userpic|userhead|ljcounter|l-stat|l-files|gravatar|social-|advert|tracker|1x1|thumb|thumbnail)\b/i;
-
 async function discoverFullsize(links, pageUrl) {
   const discovered = [];
   const seen = new Set();
@@ -121,7 +119,7 @@ async function discoverFullsize(links, pageUrl) {
       while ((m = SRC_RE.exec(html)) !== null) {
         let url = m[1];
         if (url.startsWith("//")) url = "https:" + url;
-        if (url.startsWith("http") && !seen.has(url) && url !== linkUrl && !DISCOVER_JUNK.test(url)) {
+        if (url.startsWith("http") && !seen.has(url) && url !== linkUrl) {
           seen.add(url);
           discovered.push({ url, type: "image", pageUrl, source: "linked-img" });
         }
@@ -271,7 +269,8 @@ async function commandScanAndProcess(action) {
 
   let media = response.media;
   if (response.links && response.links.length > 0) {
-    const linked = await discoverFullsize(response.links.slice(0, 50), response.url);
+    await setBadge("...", "#FFA000");
+    const linked = await discoverFullsize(response.links.slice(0, 15), response.url);
     if (linked && linked.media) {
       media = media.concat(linked.media);
     }
