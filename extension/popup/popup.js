@@ -32,6 +32,8 @@ function updateOneShotMode() {
   const isDeepParse = !oneShotCheckbox.checked;
   deepParseWarning.classList.toggle("hidden", !isDeepParse);
   chromeDownloadBtn.disabled = isDeepParse || getVisibleCheckboxes().length === 0;
+  downloadBtn.textContent = isDeepParse ? "Parse Page" : "Download";
+  downloadBtn.disabled = false;
 }
 
 oneShotCheckbox.addEventListener("change", updateOneShotMode);
@@ -320,33 +322,47 @@ chromeDownloadBtn.addEventListener("click", async () => {
 // --- Download ---
 
 downloadBtn.addEventListener("click", async () => {
-    const selected = [];
-    mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
-      const item = mediaItems[parseInt(cb.dataset.index)];
-      if (item) selected.push({
-        url: item.url,
-        source: item.pageUrl || "",
-        type: item.type,
-        original_url: item.original || null,
-        transformed: !!item.transformed,
-      });
+  const oneShot = oneShotCheckbox.checked;
+
+  if (!oneShot) {
+    // Deep parse: just send the page URL to desktop, no scan needed
+    downloadBtn.disabled = true;
+    downloadBtn.innerHTML = "Sending...";
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const pageUrl = tab ? tab.url : "";
+    const resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false });
+    if (resp && resp.ok) {
+      downloadBtn.innerHTML = "\u2713 Sent to app";
+    } else if (resp && resp.error) {
+      showError(resp.error);
+    }
+    setTimeout(() => {
+      downloadBtn.innerHTML = "Download";
+      downloadBtn.disabled = false;
+    }, 1500);
+    await checkConnection();
+    return;
+  }
+
+  // Page only: scan first, then send selected items
+  const selected = [];
+  mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
+    const item = mediaItems[parseInt(cb.dataset.index)];
+    if (item) selected.push({
+      url: item.url,
+      source: item.pageUrl || "",
+      type: item.type,
+      original_url: item.original || null,
+      transformed: !!item.transformed,
     });
+  });
 
   if (selected.length === 0) return;
 
   downloadBtn.disabled = true;
   downloadBtn.innerHTML = `Sending <span>${selected.length}</span>...`;
 
-  const oneShot = oneShotCheckbox.checked;
-  let resp;
-  if (oneShot) {
-    // Page only: send selected items directly
-    resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true });
-  } else {
-    // Deep parse: send just the page URL — desktop parser does full discovery
-    const pageUrl = mediaItems.length > 0 ? (mediaItems[0].pageUrl || "") : "";
-    resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false });
-  }
+  const resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true });
 
   if (resp && resp.error) {
     showError(resp.error);
