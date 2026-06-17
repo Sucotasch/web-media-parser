@@ -35,6 +35,20 @@
   "background": {
     "service_worker": "background.js"
   },
+  "commands": {
+    "save-chrome": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S"
+      },
+      "description": "Save fullsize images via Chrome downloads"
+    },
+    "send-desktop": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+D"
+      },
+      "description": "Send images to desktop app"
+    }
+  },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

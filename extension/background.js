@@ -215,6 +215,58 @@ async function getStatus() {
   }
 }
 
+// --- Keyboard commands ---
+
+async function commandScanAndProcess(action) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) return;
+
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(tab.id, { action: "scanMedia" });
+  } catch (e) {
+    return;
+  }
+  if (!response || !response.media) return;
+
+  let media = response.media;
+  // Discover fullsize from linked pages
+  if (response.links && response.links.length > 0) {
+    const linked = await discoverFullsize(response.links.slice(0, 15), response.url);
+    if (linked && linked.media) {
+      media = media.concat(linked.media);
+    }
+  }
+
+  // Filter to fullsize only
+  const fullsize = media.filter(m => FULLSIZE_SOURCES.has(m.source));
+  const items = fullsize.length > 0 ? fullsize : media;
+
+  if (action === "save-chrome") {
+    const toDownload = items.map(item => ({
+      url: item.url,
+      filename: item.url.split("/").pop().split("?")[0] || "",
+      referer: response.url || "",
+    }));
+    await chromeDownload(toDownload);
+  } else if (action === "send-desktop") {
+    const toSend = items.map(item => ({
+      url: item.url,
+      source: response.url || "",
+      type: item.type,
+    }));
+    await sendToDesktop(toSend, false);
+  }
+}
+
+const FULLSIZE_SOURCES = new Set(["sieve-res", "linked-dom", "linked-html", "linked-img", "link-direct"]);
+
+chrome.commands?.onCommand?.addListener((command) => {
+  if (command === "save-chrome" || command === "send-desktop") {
+    commandScanAndProcess(command);
+  }
+});
+
 // Listen for messages from popup and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "download") {
