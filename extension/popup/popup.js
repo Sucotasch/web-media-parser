@@ -79,9 +79,9 @@ scanBtn.addEventListener("click", async () => {
   scanBtn.textContent = "Scanning...";
   mediaItems.length = 0;
   activeDomainFilter = "";
-  activeSourceFilter = "";
+  activeSourceFilter = "fullsize";
   domainFilter.value = "";
-  sourceFilter.value = "";
+  sourceFilter.value = "fullsize";
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
