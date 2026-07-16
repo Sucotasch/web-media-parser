@@ -62,3 +62,16 @@ def default_download_dir() -> str:
     d = os.path.join(get_app_dir(), "downloads")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def task_state_path(task_download_path: str, task_id) -> str:
+    """Canonical session pickle path for a task.
+
+    Used by ParserManager (save/load) and MainWindow (stop delete)
+    to ensure all paths align.
+    """
+    session_dir = os.path.join(task_download_path, "sessions")
+    if task_id:
+        session_dir = os.path.join(session_dir, task_id)
+    os.makedirs(session_dir, exist_ok=True)
+    return os.path.join(session_dir, "last_session.pkl")

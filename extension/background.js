@@ -4,19 +4,23 @@
  */
 
 const API_BASE = "http://127.0.0.1:19876";
+const SIEVE_VERSION = "2026.04.01"; // Bump when shipping new sieve.json
 
 // Load sieve rules from bundled file into storage
-async function loadSieveRules() {
+async function loadSieveRules(force = false) {
   try {
-    const stored = await chrome.storage.local.get("sieveRules");
-    if (stored.sieveRules) {
-      console.info("Sieve rules already loaded");
+    const stored = await chrome.storage.local.get(["sieveRules", "sieveVersion"]);
+    if (!force && stored.sieveRules && stored.sieveVersion === SIEVE_VERSION) {
+      console.info("Sieve rules already loaded (version " + SIEVE_VERSION + ")");
       return;
     }
     const resp = await fetch(chrome.runtime.getURL("sieve.json"));
     const data = await resp.json();
-    await chrome.storage.local.set({ sieveRules: JSON.stringify(data) });
-    console.info(`Loaded ${Object.keys(data).length} sieve rules into storage`);
+    await chrome.storage.local.set({
+      sieveRules: JSON.stringify(data),
+      sieveVersion: SIEVE_VERSION,
+    });
+    console.info(`Loaded ${Object.keys(data).length} sieve rules into storage (v${SIEVE_VERSION})`);
   } catch (e) {
     console.error("Failed to load sieve rules:", e);
   }
@@ -25,7 +29,7 @@ async function loadSieveRules() {
 // Load rules on install and update
 chrome.runtime.onInstalled.addListener(async (details) => {
   if (details.reason === "install" || details.reason === "update") {
-    await loadSieveRules();
+    await loadSieveRules(true);
   }
 });
 
@@ -72,29 +76,33 @@ if (chrome.storage.onChanged) {
   });
 }
 
+const DISCOVER_CONCURRENCY = 5;
+
 async function discoverFullsize(links, pageUrl) {
   const discovered = [];
   const seen = new Set();
+  const lock = { acquire() {}, release() {} }; // no-op — JS is single-threaded in SW
 
-  for (const linkUrl of links) {
+  async function processLink(linkUrl) {
     try {
       const resp = await fetch(linkUrl, {
         headers: { "Accept": "text/html" },
         signal: AbortSignal.timeout(8000),
       });
-      if (!resp.ok) continue;
+      if (!resp.ok) return [];
       const ct = resp.headers.get("content-type") || "";
       if (ct.includes("image/") || ct.includes("video/")) {
-        discovered.push({ url: linkUrl, type: ct.includes("video/") ? "video" : "image", pageUrl, source: "link-direct" });
-        continue;
+        return [{ url: linkUrl, type: ct.includes("video/") ? "video" : "image", pageUrl, source: "link-direct" }];
       }
-      if (!ct.includes("text/html")) continue;
+      if (!ct.includes("text/html")) return [];
 
       const html = await resp.text();
+      const results = [];
 
       // 1. Try sieve res patterns
       for (const [name, { linkRegex, resPattern }] of Object.entries(cachedSieveRes)) {
         if (!linkRegex.test(linkUrl.replace(/^https?:\/\//, "")) && !linkRegex.test(linkUrl)) continue;
+        let foundAny = false;
         try {
           const patterns = Array.isArray(resPattern) ? resPattern : [resPattern];
           for (const pat of patterns) {
@@ -105,15 +113,16 @@ async function discoverFullsize(links, pageUrl) {
               if (!imgUrl.startsWith("http")) imgUrl = "https:" + imgUrl;
               if (!seen.has(imgUrl)) {
                 seen.add(imgUrl);
-                discovered.push({ url: imgUrl, type: "image", pageUrl, source: "sieve-res" });
+                results.push({ url: imgUrl, type: "image", pageUrl, source: "sieve-res" });
+                foundAny = true;
               }
             }
           }
         } catch (e) {}
-        break; // Found matching link rule, stop
+        if (foundAny) break;
       }
 
-      // 2. Fallback: scan <img> src from HTML, keep only high-quality extensions
+      // 2. Fallback: scan <img> src from HTML
       const SRC_RE = /<img[^>]+src=["']([^"']+)["']/gi;
       let m;
       while ((m = SRC_RE.exec(html)) !== null) {
@@ -122,11 +131,22 @@ async function discoverFullsize(links, pageUrl) {
         if (url.startsWith("http") && !seen.has(url) && url !== linkUrl
             && /\.(jpe?g|webp|avif|heic|bmp|tiff?)$/i.test(url)) {
           seen.add(url);
-          discovered.push({ url, type: "image", pageUrl, source: "linked-img" });
+          results.push({ url, type: "image", pageUrl, source: "linked-img" });
         }
       }
-    } catch (e) {}
+      return results;
+    } catch (e) {
+      return [];
+    }
   }
+
+  // Process links in chunks of DISCOVER_CONCURRENCY
+  for (let i = 0; i < links.length; i += DISCOVER_CONCURRENCY) {
+    const chunk = links.slice(i, i + DISCOVER_CONCURRENCY);
+    const results = await Promise.all(chunk.map(processLink));
+    for (const r of results) discovered.push(...r);
+  }
+
   return { media: discovered };
 }
 
@@ -157,7 +177,7 @@ async function resolveUrl(url) {
           }
         }
       } catch (e) {}
-      break;
+      // Only break if res found something; otherwise try next rule
     }
   } catch (e) {}
   return url;
@@ -193,9 +213,12 @@ async function chromeDownload(items) {
 async function getPageContext(tabId) {
   const context = {};
   try {
-    const cookies = await chrome.cookies.getAll({ tabId });
-    if (cookies.length > 0) {
-      context.cookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.url && /^https?:/i.test(tab.url)) {
+      const cookies = await chrome.cookies.getAll({ url: tab.url });
+      if (cookies.length > 0) {
+        context.cookies = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+      }
     }
   } catch (e) {}
   try {
@@ -325,6 +348,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "getContext") {
     getPageContext(request.tabId).then(sendResponse);
     return true;
+  }
+  if (request.action === "clearBadgeAfter") {
+    // Clear badge from background (persists after popup closes)
+    setTimeout(() => setBadge(""), request.delay || 5000);
+    sendResponse({ ok: true });
+    return false;
   }
   if (request.action === "getStatus") {
     getStatus().then(sendResponse);

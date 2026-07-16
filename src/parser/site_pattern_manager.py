@@ -671,6 +671,19 @@ def _transform(m):
             global_transformed = self._apply_global_transformations(url)
             if global_transformed != url:
                 results = [global_transformed]
+                transformed = True
+
+        # 4. WordPress-style size suffix strip (e.g., -300x200.jpg → .jpg)
+        if not transformed:
+            stripped = re.sub(
+                r"(-\d{2,4}x\d{2,4})(\.(?:jpe?g|png|webp|avif))(?=$|\?)",
+                r"\2",
+                results[0],
+                count=1,
+                flags=re.I,
+            )
+            if stripped != results[0]:
+                results = [stripped]
 
         # Final deduplication while preserving order
         seen = set()

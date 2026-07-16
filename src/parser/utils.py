@@ -432,3 +432,77 @@ def extract_largest_image_from_srcset(srcset):
                     best_url = url
 
     return best_url
+
+
+# --- Segment-aware URL classifier (WP-1) ---
+
+# Path segments that almost never hold scrapeable media content
+DEFAULT_LINK_SKIP_SEGMENTS = frozenset({
+    # account / commerce
+    "login", "signin", "signup", "register", "logout", "account", "profile",
+    "cart", "checkout", "payment", "subscribe", "billing", "password", "auth",
+    # legal / corporate
+    "privacy", "privacy-policy", "terms", "tos", "legal", "copyright",
+    "dmca", "cookies", "cookie-policy", "gdpr", "imprint", "impressum",
+    "about", "about-us", "contact", "careers", "jobs", "press", "help",
+    "support", "faq", "feedback", "sitemap", "robots.txt",
+    # noise
+    "advert", "advertising", "ads", "adserver", "sponsor", "promo",
+    "newsletter", "unsubscribe", "widget", "embed", "share", "redirect",
+    "go", "out", "external", "tracking", "pixel", "analytics",
+    "search", "login.php", "wp-admin", "wp-login",
+})
+
+# Hosts that are ad networks
+_AD_HOSTS = (
+    "doubleclick.", "googlesyndication.", "googleadservices.",
+    "facebook.com/tr", "adservice.", "adnxs.", "taboola.", "outbrain.",
+)
+
+
+def _path_segments(url):
+    """Extract lowercase path segments from a URL."""
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return []
+    return [s for s in path.split("/") if s]
+
+
+def should_skip_crawl_url(url, extra_stop_words=None):
+    """Return True if URL should not be queued for HTML parsing.
+
+    Uses segment-aware matching (not substring) to avoid false positives
+    like "ad" in "media" or "admin".
+    """
+    if not url:
+        return True
+    try:
+        p = urlparse(url)
+    except Exception:
+        return True
+
+    path = (p.path or "").lower()
+    segs = _path_segments(url)
+
+    # Explicit file junk
+    if path.endswith((".css", ".js", ".map", ".xml", ".json", ".txt", ".ico", ".woff", ".woff2", ".ttf")):
+        return True
+
+    # Segment match
+    skip = set(DEFAULT_LINK_SKIP_SEGMENTS)
+    if extra_stop_words:
+        for w in extra_stop_words:
+            w = (w or "").strip().lower().strip("/")
+            if len(w) >= 3:
+                skip.add(w)
+
+    if any(s in skip for s in segs):
+        return True
+
+    # Host-level ad networks
+    full = url.lower()
+    if any(h in full for h in _AD_HOSTS):
+        return True
+
+    return False

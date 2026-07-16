@@ -791,7 +791,11 @@ class MainWindow(QMainWindow):
 
         self.log_handler.info(f"Pausing active task {active.id} to switch...")
 
-        # 1. Save State
+        # 1. Mark PAUSED FIRST — so on_task_ended sees PAUSED and doesn't overwrite
+        active.mark_paused()
+        self._update_task_row(active.id)
+
+        # 2. Save State
         try:
             if pm.loop and not pm.loop.is_closed():
                 future = asyncio.run_coroutine_threadsafe(
@@ -801,16 +805,22 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_handler.error(f"Error saving state on switch: {e}")
 
-        # 2. Signal stop (non-blocking)
+        # 3. Signal stop (non-blocking — task_ended will see PAUSED status)
         pm.stop_parsing()
 
-        # 3. Mark Paused
-        active.mark_paused()
-        self._update_task_row(active.id)
+        # 4. Free active slot
         self.task_queue.clear_active()
 
     def _launch_parser_for_task(self, task):
         """Create ParserManager + QThread for a TaskItem."""
+        # Disconnect old parser signals to prevent old task_ended from corrupting new task
+        old_pm = getattr(self, 'parser_manager', None)
+        if old_pm is not None:
+            try:
+                old_pm.task_ended.disconnect(self.on_task_ended)
+            except (RuntimeError, TypeError):
+                pass  # signal not connected
+
         self.parser_manager = ParserManager(
             url=task.url,
             download_path=task.download_path,
@@ -857,16 +867,20 @@ class MainWindow(QMainWindow):
         self.log_handler.info(f"Files will be saved to {download_path}")
 
         settings = self.settings_dialog.get_settings()
+        one_shot = self.one_shot_check.isChecked()
+
+        # Add to queue manager for tracking (but as a direct-run task)
+        task = self.task_queue.add_task(url, settings, download_path, one_shot=one_shot)
+        self.task_queue.start_task(task.id)
+
         self.parser_manager = ParserManager(
             url=url,
             download_path=download_path,
             settings=settings,
             log_handler=self.log_handler,
+            task_id=task.id,
+            one_shot=one_shot,
         )
-
-        # Add to queue manager for tracking (but as a direct-run task)
-        task = self.task_queue.add_task(url, settings, download_path)
-        self.task_queue.start_task(task.id)
 
         # Connect signals
         self._connect_parser_signals()
@@ -879,6 +893,7 @@ class MainWindow(QMainWindow):
 
         self.update_ui_state(True)
         self.status_bar.showMessage("Parsing started")
+        self.one_shot_check.setChecked(False)
 
     def _connect_parser_signals(self):
         """Connect ParserManager Qt signals to MainWindow slots."""
@@ -959,7 +974,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 # Remove state file
-                state_path = self.task_queue.get_state_file_path(active.id)
+                state_path = self.task_queue.get_state_file_path(active)
                 if os.path.exists(state_path):
                     try:
                         os.remove(state_path)
@@ -1142,6 +1157,14 @@ class MainWindow(QMainWindow):
                 task._pending_downloads = items
                 added = len(items)
                 self.log_handler.info(f"One-shot: {added} items -> {task_folder}")
+
+                # Auto-start one_shot task if no active task
+                if self.task_queue.active_task is None:
+                    def _auto_start():
+                        self.task_queue.start_task(task.id)
+                        self._launch_parser_for_task(task)
+                        self.update_ui_state(True)
+                    QTimer.singleShot(0, _auto_start)
             else:
                 for item in urls:
                     url = item.get("url", "").strip()

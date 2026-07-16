@@ -8,20 +8,20 @@ Global constants for the Web Media Parser application.
 # Default Application Settings
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_TIMEOUT = 30  # General network timeout for requests
-DEFAULT_PAGE_TIMEOUT = 60  # Timeout for fetching and processing a single webpage or API
+DEFAULT_PAGE_TIMEOUT = 30  # Timeout for fetching and processing a single webpage or API
 DEFAULT_CONNECT_TIMEOUT = 20 # Timeout for establishing a connection
 DEFAULT_SOCK_READ_TIMEOUT = DEFAULT_PAGE_TIMEOUT # Timeout for reading from a socket
 
 DEFAULT_SEARCH_DEPTH = 3
-DEFAULT_PARSER_THREADS = 2
-DEFAULT_DOWNLOADER_THREADS = 4
+DEFAULT_PARSER_THREADS = 4
+DEFAULT_DOWNLOADER_THREADS = 8
 DEFAULT_THREADS_PER_FILE = 1 # For multi-threaded download of a single file
 
 # Media Filtering
 DEFAULT_MIN_IMAGE_WIDTH = 100
 DEFAULT_MIN_IMAGE_HEIGHT = 100
-DEFAULT_MIN_IMAGE_SIZE_KB = 0 # 0 means no minimum size
-DEFAULT_MIN_VIDEO_SIZE_KB = 0 # 0 means no minimum size
+DEFAULT_MIN_IMAGE_SIZE_KB = 40 # Minimum image file size in KB
+DEFAULT_MIN_VIDEO_SIZE_KB = 1000 # Minimum video file size in KB
 
 # Domain Health & Quarantine
 DEFAULT_QUARANTINE_FAILURE_THRESHOLD = 3
@@ -57,6 +57,9 @@ DEFAULT_STOP_WORDS = [
     "login", "register", "cart", "checkout", "about_us", "contact", "privacy_policy", "terms_of_service", "careers"
 ]
 
+# Crawl limits
+DEFAULT_MAX_LINKS_PER_PAGE = 200  # Cap links per page to prevent queue explosion on menu-heavy pages
+
 # Gateway & Visibility Filtering
 DEFAULT_FILTER_HIDDEN_LINKS = True
 DEFAULT_BYPASS_GATEWAYS = True
@@ -89,11 +92,21 @@ GATEWAY_OVERLAY_SELECTORS = [
 ]
 
 # Patterns for 'noise' media that shouldn't be counted as main content
+# NOTE: "thumb"/"thumbnail" removed — they drop legitimate CDN content before sieve upgrade
 SIGNIFICANT_MEDIA_IGNORE_PATTERNS = [
-    "icon", "logo", "avatar", "social-", "button-", "placeholder", "nav-",
-    "banner-", "advert", "ad-", "pixel", "tracker", "facebook", "twitter",
+    "favicon", "sprite", "emoji", "gravatar", "userpic",
+    "/logo.", "/icon/", "/icons/", "apple-touch-icon",
+    "pixel.", "1x1.", "tracking", "analytics",
+    "facebook.com", "twitter.com", "t.co/",
+    "icon", "avatar", "social-", "button-", "placeholder", "nav-",
+    "banner-", "advert", "ad-", "tracker",
     "instagram", "linkedin", "youtube", "telegram", "vk.com", "yandex",
-    "thumb", "thumbnail",
+]
+
+# Soft hints for thumbnail URLs — used for priority, NOT for hard filtering
+THUMBNAIL_URL_HINTS = [
+    "/thumb", "/thumbs/", "/thumbnail", "_thumb", "-thumb",
+    "/small/", "/s/", "/preview/", "/lqip/", "w=150", "w=200",
 ]
 SIGNIFICANT_MEDIA_MIN_DIMENSION = 100 # Minimum width/height if specified in HTML
 

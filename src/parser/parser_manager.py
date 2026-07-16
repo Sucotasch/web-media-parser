@@ -36,10 +36,12 @@ from src.parser.utils import (
     is_webpage_url,
     is_same_domain,
     normalize_url,
+    should_skip_crawl_url,
     # is_image_url, # Not used directly
     # is_video_url # Not used directly
 )
 from src.parser.shared_session import AsyncClientManager
+from src.app_paths import task_state_path
 from src import constants as K # Import constants
 
 logger = logging.getLogger(__name__)
@@ -214,6 +216,8 @@ class ParserManager(QObject):
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # Unpaused by default
+        # threading.Event for cross-thread signaling (download threads, progress monitor)
+        self._thread_stop_event = threading.Event()
         self.url_queue = PriorityURLQueue(settings=self.settings)
         self.download_queue = asyncio.Queue()
         self.quarantine_queue = asyncio.Queue()
@@ -443,12 +447,13 @@ class ParserManager(QObject):
             links_found = parse_result[0]
             media_files_found = parse_result[1]
             
-            # Extract and sync cookies to the shared downloader session
+            # Extract and sync cookies to the shared downloader session (domain-scoped)
             cookies = parse_result[5]
             if cookies and self._shared_downloader_session:
                 logger.debug(f"Syncing {len(cookies)} cookies from parser to shared downloader session")
+                domain = urlparse(url).hostname
                 for name, value in cookies.items():
-                    self._shared_downloader_session.cookies.set(name, value)
+                    self._shared_downloader_session.cookies.set(name, value, domain=domain, path="/")
 
             if parse_result[2] != K.PARSER_SUCCESS:
                 logger.error(f"Error parsing {url}: {parse_result[3]}")
@@ -471,7 +476,17 @@ class ParserManager(QObject):
             if isinstance(links_data, dict): # From WebpageParser
                 for disc_url, link_ctx in links_data.items(): urls_to_queue.append((disc_url, link_ctx))
             elif isinstance(links_data, set): # From JSONWebpageParser
-                for disc_url in links_data: urls_to_queue.append((disc_url, {})) 
+                for disc_url in links_data: urls_to_queue.append((disc_url, {}))
+
+            # Cap per-page links: sort by priority, keep top N
+            max_links = self.settings.get("max_links_per_page", K.DEFAULT_MAX_LINKS_PER_PAGE)
+            if max_links > 0 and len(urls_to_queue) > max_links:
+                urls_to_queue.sort(
+                    key=lambda x: float(x[1].get("priority", 0)),
+                    reverse=True
+                )
+                urls_to_queue = urls_to_queue[:max_links]
+                logger.debug(f"Capped links per page to {max_links} (had {len(links_data)} total)")
 
             for disc_url_str, link_spec_ctx in urls_to_queue:
                 abs_disc_url = disc_url_str
@@ -489,8 +504,8 @@ class ParserManager(QObject):
                     continue
                 
                 stop_words_list = self.settings.get(K.SETTING_STOP_WORDS, K.DEFAULT_STOP_WORDS)
-                if any(stop_word.lower() in abs_disc_url.lower() for stop_word in stop_words_list):
-                    logger.debug(f"Skipping link with stop word: {abs_disc_url}")
+                if should_skip_crawl_url(abs_disc_url, stop_words_list):
+                    logger.debug(f"Skipping non-content link: {abs_disc_url}")
                     continue
 
                 new_ctx = {"source_url": url, "start_url": self.start_url, **link_spec_ctx}
@@ -631,7 +646,7 @@ class ParserManager(QObject):
             try:
                 # Check before expensive download
                 if not self.is_running:
-                    self.download_queue.task_done(); break
+                    break  # finally block handles task_done()
                 url = media_item["url"]
                 filepath_from_queue = media_item["filepath"] 
                 domain = urlparse(url).netloc
@@ -653,7 +668,7 @@ class ParserManager(QObject):
                         url=url, filepath=filepath_from_queue, settings=self.settings,
                         media_type=media_item["media_type"], source_url=media_item["source_url"],
                         shared_session=self._shared_downloader_session,
-                        stop_event=self._stop_event
+                        stop_event=self._thread_stop_event
                     )
                     downloader.set_progress_callback(self._update_current_progress)
                     base_filename_for_status = os.path.basename(filepath_from_queue)
@@ -771,10 +786,13 @@ class ParserManager(QObject):
                 self._pause_event.set()
             if self.download_queue is not None:
                 self._drain_queues()
+        # Signal cross-thread stop for download threads and progress monitor
+        if self._thread_stop_event is not None:
+            self._thread_stop_event.set()
         logger.info("Parsing stop procedure initiated.")
 
     def _monitor_progress(self) -> None:
-        while self.is_running and not self._stop_event.is_set():
+        while self.is_running and not self._thread_stop_event.is_set():
             try:
                 if self.is_paused and not self._pause_event.is_set(): time.sleep(0.2); continue
                 total_found = self.stats["images_found"] + self.stats["videos_found"]
@@ -879,11 +897,7 @@ class ParserManager(QObject):
         loop = asyncio.get_running_loop()
         pickled = await loop.run_in_executor(None, pickle.dumps, state)
 
-        session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR)
-        if self.task_id:
-            session_dir = os.path.join(session_dir, self.task_id)
-        os.makedirs(session_dir, exist_ok=True)
-        full_state_path = os.path.join(session_dir, K.SESSION_STATE_FILENAME)
+        full_state_path = task_state_path(task_download_path, self.task_id)
         tmp_path = full_state_path + ".tmp"
 
         # Atomic write: write to temp file → fsync → rename
@@ -905,10 +919,7 @@ class ParserManager(QObject):
             raise
 
     async def load_state(self, task_download_path: str) -> None:
-        session_dir = os.path.join(task_download_path, K.SESSION_STATE_SUBDIR)
-        if self.task_id:
-            session_dir = os.path.join(session_dir, self.task_id)
-        session_file_path = os.path.join(session_dir, K.SESSION_STATE_FILENAME)
+        session_file_path = task_state_path(task_download_path, self.task_id)
         if not os.path.exists(session_file_path):
             logger.info(f"No session state file found at {session_file_path}. Starting fresh.")
             return
@@ -930,16 +941,15 @@ class ParserManager(QObject):
                      # all previously valid URLs are re-queued correctly.
                      await self.url_queue.put(item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3], bypass_checks=True)
 
-            # Restore download_queue, but skip items whose URL was already downloaded.
-            # This prevents re-downloading files that completed before the previous pause.
-            skipped_downloads = 0
+            # Restore ALL pending download_queue items.
+            # downloaded_files is populated at enqueue time (not completion time),
+            # so filtering by it would incorrectly drop items that were queued but never downloaded.
+            restored = 0
             for item in state.get("download_queue_items", []):
-                if item.get("url") not in self.downloaded_files:
-                    await self.download_queue.put(item)
-                else:
-                    skipped_downloads += 1
-            if skipped_downloads:
-                logger.info(f"load_state: skipped {skipped_downloads} already-downloaded items from download_queue")
+                await self.download_queue.put(item)
+                restored += 1
+            if restored:
+                logger.info(f"load_state: restored {restored} pending download items")
 
             for item in state.get("quarantine_queue_items", []):
                 await self.quarantine_queue.put(item)

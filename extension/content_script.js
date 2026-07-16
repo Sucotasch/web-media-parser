@@ -30,11 +30,14 @@
       return JUNK_PATTERNS.some(p => p.test(url));
     }
 
+    function toAbsolute(url) {
+      if (!url) return null;
+      try { return new URL(url, baseUrl).href; } catch (e) { return null; }
+    }
+
     function addMedia(url, type, attrs = {}) {
+      url = toAbsolute(url);
       if (!url || seen.has(url)) return;
-      if (url.startsWith("//")) url = "https:" + url;
-      if (!url.startsWith("http://") && !url.startsWith("https://")) return;
-      if (seen.has(url)) return;
       if (isJunkUrl(url)) return;
       if (attrs.width && attrs.height && attrs.width < 50 && attrs.height < 50) return;
       seen.add(url);
@@ -42,9 +45,8 @@
     }
 
     function addLink(url) {
+      url = toAbsolute(url);
       if (!url || linkSet.has(url)) return;
-      if (url.startsWith("//")) url = "https:" + url;
-      if (!url.startsWith("http://") && !url.startsWith("https://")) return;
       if (url === baseUrl) return;
       linkSet.add(url);
       links.push(url);
@@ -73,7 +75,7 @@
       if (parentA) {
         const href = parentA.getAttribute("href");
         if (href && href !== "#" && !href.startsWith("javascript:")) {
-          addLink(href.startsWith("//") ? "https:" + href : href);
+          addLink(href);
         }
       }
     });
@@ -82,8 +84,8 @@
     doc.querySelectorAll("a[href]").forEach((a) => {
       const href = a.getAttribute("href");
       if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
-      const fullHref = href.startsWith("//") ? "https:" + href : href;
-      if (fullHref === baseUrl) return;
+      const fullHref = toAbsolute(href);
+      if (!fullHref || fullHref === baseUrl) return;
       // Check if link looks like it points to an image file
       if (/\.(jpe?g|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i.test(fullHref)) {
         addMedia(fullHref, "image", { source: "a-link" });
@@ -119,22 +121,23 @@
     // <meta og:image>
     doc.querySelectorAll('meta[property="og:image"], meta[name="twitter:image"]').forEach((meta) => {
       const content = meta.getAttribute("content");
-      if (content && (content.startsWith("http") || content.startsWith("//"))) {
-        addMedia(content, "image", { source: "meta" });
-      }
+      if (content) addMedia(content, "image", { source: "meta" });
     });
 
     return { media, links };
   }
 
   function parseSrcset(srcset) {
-    let bestUrl = null, maxWidth = 0;
+    let bestUrl = null, bestScore = -1;
     srcset.split(",").forEach((item) => {
       const parts = item.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        const width = parseInt(parts[1]);
-        if (!isNaN(width) && width > maxWidth) { maxWidth = width; bestUrl = parts[0]; }
+      if (!parts[0]) return;
+      let score = 1;
+      if (parts[1]) {
+        if (parts[1].endsWith("w")) score = parseInt(parts[1], 10) || 1;
+        else if (parts[1].endsWith("x")) score = (parseFloat(parts[1]) || 1) * 10000;
       }
+      if (score > bestScore) { bestScore = score; bestUrl = parts[0]; }
     });
     return bestUrl;
   }
@@ -149,6 +152,10 @@
   // --- Message handler ---
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "getUA") {
+      sendResponse({ userAgent: navigator.userAgent });
+      return;
+    }
     if (request.action === "scanMedia") {
       (async () => {
         try {

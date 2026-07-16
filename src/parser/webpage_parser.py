@@ -7,11 +7,12 @@ Webpage parser class for extracting media files and links from webpages
 
 import re
 import os
-import time 
+import time
 import json
 import asyncio
 import logging
-import mimetypes 
+import mimetypes
+import yarl
 from typing import Set, List, Tuple, Dict, Any, Optional, Union
 from urllib.parse import urlparse, urljoin 
 
@@ -132,7 +133,11 @@ class WebpageParser:
                     if source_url and source_url != self.url:
                         request_specific_headers["Referer"] = source_url
                     elif referrer_policy == "origin":
-                        request_specific_headers["Referer"] = get_domain(self.url)
+                        parsed = urlparse(self.url)
+                        if parsed.scheme and parsed.netloc:
+                            request_specific_headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+                        else:
+                            request_specific_headers["Referer"] = get_domain(self.url)
                 
                 cookies = {}
                 if self.settings.get(K.SETTING_BYPASS_COOKIE_CONSENT, K.DEFAULT_BYPASS_COOKIE_CONSENT):
@@ -531,6 +536,10 @@ class WebpageParser:
                         if not has_parent_webpage_link:
                             self.media_files.append(("image", abs_url, variant_attrs))
                             found += 1
+                        elif variant_attrs.get("transformed"):
+                            # Sieve transformed thumb → fullsize; keep it even with parent-link
+                            self.media_files.append(("image", abs_url, variant_attrs))
+                            found += 1
                     
                     # Follow parent link for fullsize discovery
                     parent_a = img.find_parent('a', href=True)
@@ -637,7 +646,15 @@ class WebpageParser:
                 continue
             abs_url = urljoin(self.url, href)
             if abs_url.startswith(("http://", "https://")):
-                self.links[abs_url] = {'from_image': False, 'element': 'a', 'text': a_tag.get_text(strip=True, separator=" ")[:100]} 
+                text = a_tag.get_text(strip=True, separator=" ")[:100]
+                existing = self.links.get(abs_url)
+                if existing is not None:
+                    # Preserve from_image: True set by image extraction
+                    if existing.get("from_image") or existing.get("priority", 0) >= 10:
+                        if text and not existing.get("text"):
+                            existing["text"] = text
+                        continue
+                self.links[abs_url] = {'from_image': False, 'element': 'a', 'text': text}
                 found += 1
         
         canonical_tag = soup.find("link", rel="canonical", href=True)
@@ -647,6 +664,52 @@ class WebpageParser:
                 self.links[abs_url] = {'from_image': False, 'element': 'canonical', 'priority': 2.0}
                 found += 1
         logger.info(f"Found {found} valid links on {self.url}")
+
+    def _extract_jsonld_media(self, soup: BeautifulSoup) -> None:
+        """Extract media URLs from JSON-LD structured data (schema.org)."""
+        found = 0
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            stack = data if isinstance(data, list) else [data]
+            for obj in stack:
+                if not isinstance(obj, dict):
+                    continue
+                obj_type = obj.get("@type", "")
+                # Collect URLs from common schema.org types
+                urls = []
+                if "VideoObject" in str(obj_type):
+                    for key in ("contentUrl", "embedUrl", "url"):
+                        u = obj.get(key)
+                        if isinstance(u, str) and u.startswith("http"):
+                            urls.append(("video", u))
+                if "ImageObject" in str(obj_type) or "image" in obj:
+                    img = obj.get("image") or obj.get("url")
+                    if isinstance(img, str) and img.startswith("http"):
+                        urls.append(("image", img))
+                    elif isinstance(img, dict):
+                        u = img.get("url") or img.get("contentUrl")
+                        if isinstance(u, str) and u.startswith("http"):
+                            urls.append(("image", u))
+                # Article / Gallery / Post with image
+                if "image" in obj and "ImageObject" not in str(obj_type):
+                    img = obj.get("image")
+                    if isinstance(img, str) and img.startswith("http"):
+                        urls.append(("image", img))
+                    elif isinstance(img, list):
+                        for item in img[:5]:  # cap at 5
+                            u = item if isinstance(item, str) else (item.get("url") if isinstance(item, dict) else None)
+                            if u and isinstance(u, str) and u.startswith("http"):
+                                urls.append(("image", u))
+                for media_type, u in urls:
+                    if not is_media_url(u):
+                        continue
+                    self.media_files.append((media_type, u, {"source": "json-ld"}))
+                    found += 1
+        if found:
+            logger.info(f"Found {found} media URLs from JSON-LD on {self.url}")
 
     def _is_element_visible(self, element: Any) -> bool:
         """Heuristic to check if an element is hidden via CSS (honeypot/bot-trap)"""
@@ -824,6 +887,9 @@ class WebpageParser:
             # 2. Video extraction
             await self._extract_videos(soup)
 
+            # 2b. JSON-LD structured data
+            self._extract_jsonld_media(soup)
+
             # 3. Gateway handling (Dynamic Bypass)
             # Prevent infinite loops: only 3 attempts per URL
             if self._bypass_attempts < 3:
@@ -835,6 +901,13 @@ class WebpageParser:
                     success = await self._execute_bypass(gateway_action)
                     if success:
                         logger.info(f"Cookies updated. RE-FETCHING original content: {self.url}")
+                        # Sync bypass cookies to aiohttp session so re-fetch includes them
+                        if self._sync_session:
+                            for c in self._sync_session.cookies:
+                                self.session.cookie_jar.update_cookies(
+                                    {c.name: c.value},
+                                    yarl.URL(f"{urlparse(self.url).scheme}://{urlparse(self.url).netloc}/")
+                                )
                         # Reset discovered content before re-fetching
                         self.media_files.clear()
                         self.links.clear()

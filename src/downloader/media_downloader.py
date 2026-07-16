@@ -274,12 +274,15 @@ class MediaDownloader:
                     return {"success": False, "error": f"Could not create directory: {e}"}
 
             write_buffer = bytearray()
-            with open(self.filepath, mode) as f:
+            temp_path = self.filepath + ".partial"
+            with open(temp_path, mode) as f:
                 start_time = time.time()
                 network_chunk_size = 8192  
                 downloaded_bytes = 0
                 for chunk in response_get.iter_content(chunk_size=network_chunk_size):
                     if self.stop_event and self.stop_event.is_set():
+                        try: os.remove(temp_path)
+                        except OSError: pass
                         return {"success": False, "error": "Download manually aborted"}
                     
                     if chunk:
@@ -302,14 +305,16 @@ class MediaDownloader:
                         return {"success": False, "error": f"Disk write error: {e}"}
 
             if content_length > 0:
-                actual_size = os.path.getsize(self.filepath)
+                actual_size = os.path.getsize(temp_path)
                 if actual_size != content_length:
                     try:
-                        os.remove(self.filepath)
+                        os.remove(temp_path)
                     except OSError:
                         pass
                     return {"success": False, "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
 
+            # Atomic rename from .partial to final path
+            os.replace(temp_path, self.filepath)
             if self.progress_callback: self.progress_callback(100)
             logger.info(f"Download completed: {os.path.basename(self.filepath)}")
             return {"success": True, "message": "File downloaded successfully"}

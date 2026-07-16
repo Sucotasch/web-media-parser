@@ -124,9 +124,35 @@ scanBtn.addEventListener("click", async () => {
           mediaItems.push(...linked.media);
         }
       }
+      // Apply sieve transforms (string rules only — JS rules need page DOM)
+      try {
+        const stored = await chrome.storage.local.get("sieveRules");
+        if (stored.sieveRules && typeof parseSieve === "function") {
+          const rules = parseSieve(JSON.parse(stored.sieveRules));
+          const pageUrl = response.url;
+          for (const item of mediaItems) {
+            if (item.source === "sieve-res" || item.source === "sieve-to") continue;
+            const transformed = applySieveRules(item.url, pageUrl, rules);
+            if (transformed && transformed !== item.url) {
+              item.original_url = item.url;
+              item.url = transformed;
+              item.transformed = true;
+              item.source = "sieve-to";
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Sieve transform failed:", e);
+      }
       pageInfoDiv.textContent = response.title || response.url;
       pageInfoDiv.classList.remove("hidden");
       populateDomainFilter();
+      // Fallback to "all" if no fullsize sources found
+      const fsCount = mediaItems.filter(m => FULLSIZE_SOURCES.has(m.source)).length;
+      if (fsCount === 0) {
+        activeSourceFilter = "";
+        sourceFilter.value = "";
+      }
       renderMediaList();
       updateCount();
     } else {
@@ -317,7 +343,7 @@ chromeDownloadBtn.addEventListener("click", async () => {
     chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
     await chrome.action.setBadgeText({ text: `${saved}` });
     await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
-    setTimeout(() => chrome.action.setBadgeText({ text: "" }), 5000);
+    chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 5000 });
   } catch (e) {
     showError(`Download failed: ${e.message}`);
     updateCount();
@@ -350,12 +376,12 @@ downloadBtn.addEventListener("click", async () => {
       downloadBtn.innerHTML = "\u2713 Sent to app";
       await chrome.action.setBadgeText({ text: "\u2713" });
       await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
-      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
+      chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
     } else if (resp && resp.error) {
       showError(resp.error);
       await chrome.action.setBadgeText({ text: "!" });
       await chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
-      setTimeout(() => chrome.action.setBadgeText({ text: "" }), 3000);
+      chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
     }
     setTimeout(() => {
       downloadBtn.innerHTML = "Download";

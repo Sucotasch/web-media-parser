@@ -15,6 +15,7 @@ from datetime import datetime
 from PySide6.QtCore import QObject, Signal
 
 from src.core.task_item import TaskItem, TaskStatus
+from src.app_paths import task_state_path
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -192,11 +193,12 @@ class TaskQueueManager(QObject):
             logger.debug(f"clear_active: cleared {old_id[:8]}")
             self.active_task_changed.emit("")
 
-    def get_state_file_path(self, task_id: str) -> str:
-        """Return the full path where a task's session state should be saved."""
-        session_dir = os.path.join(self._base_dir, "sessions", task_id)
-        os.makedirs(session_dir, exist_ok=True)
-        return os.path.join(session_dir, "state.pkl")
+    def get_state_file_path(self, task: TaskItem) -> str:
+        """Return the canonical session pickle path for a task.
+
+        Uses task_state_path so save/load/delete all agree on the path.
+        """
+        return task_state_path(task.download_path, task.id)
 
     def cleanup_partial_files(self, task: TaskItem) -> None:
         """Remove *.part* and incomplete files in a task's download folder.

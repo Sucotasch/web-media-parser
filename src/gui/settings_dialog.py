@@ -46,38 +46,38 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.resize(600, 700)
 
-        # Default settings
+        # Default settings — single source of truth is constants.py
         self.default_settings = {
             # Parser settings
-            "search_depth": 3,
+            "search_depth": K.DEFAULT_SEARCH_DEPTH,
             "page_limit": 1000,
-            "stay_in_domain": True,
-            "process_js": True,  # Enable JavaScript processing by default
-            "page_timeout": 30,
+            "stay_in_domain": K.DEFAULT_STAY_IN_DOMAIN,
+            "process_js": K.DEFAULT_PROCESS_JS,
+            "page_timeout": K.DEFAULT_PAGE_TIMEOUT,
             # Pattern settings
-            "use_patterns": True,  # Enable image patterns by default
-            "custom_pattern_path": None,  # Path to custom pattern file
-            "imagus_sieve_path": None,  # Path to Imagus sieve file
+            "use_patterns": K.DEFAULT_USE_PATTERNS,
+            "custom_pattern_path": None,
+            "imagus_sieve_path": None,
             # Bypass settings
-            "bypass_cookie_consent": True,  # Enable cookie consent bypass
-            "bypass_js_redirects": True,  # Enable JavaScript redirect bypass
+            "bypass_cookie_consent": K.DEFAULT_BYPASS_COOKIE_CONSENT,
+            "bypass_js_redirects": K.DEFAULT_BYPASS_JS_REDIRECTS,
             # Filters
-            "min_image_width": 100,
-            "min_image_height": 100,
-            "min_image_size": 40,
-            "min_video_size": 1000,  # Ensure video filtering works by default
+            "min_image_width": K.DEFAULT_MIN_IMAGE_WIDTH,
+            "min_image_height": K.DEFAULT_MIN_IMAGE_HEIGHT,
+            "min_image_size": K.DEFAULT_MIN_IMAGE_SIZE_KB,
+            "min_video_size": K.DEFAULT_MIN_VIDEO_SIZE_KB,
             # Performance
-            "parser_threads": 4,
-            "downloader_threads": 8,
+            "parser_threads": K.DEFAULT_PARSER_THREADS,
+            "downloader_threads": K.DEFAULT_DOWNLOADER_THREADS,
             "max_download_speed": 0,
-            "threads_per_file": 1,
+            "threads_per_file": K.DEFAULT_THREADS_PER_FILE,
             # Remember last used directory
-            "last_download_dir": os.path.expanduser("~"),  # User-chosen, remembered in settings
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "last_download_dir": os.path.expanduser("~"),
+            "user_agent": K.DEFAULT_USER_AGENT,
             "referrer": "auto",
-            "accept_language": "en-US,en;q=0.9",
-            "timeout": 30,
-            "retry_count": 3,
+            "accept_language": K.DEFAULT_ACCEPT_LANGUAGE,
+            "timeout": K.DEFAULT_TIMEOUT,
+            "retry_count": K.DEFAULT_RETRY_COUNT,
             "proxy": "",
             # Stop words
             "stop_words": [
@@ -145,11 +145,11 @@ class SettingsDialog(QDialog):
         self.search_depth_spin.setToolTip("Maximum link depth for parsing")
         parser_grid.addWidget(self.search_depth_spin, 0, 1)
 
-        # Page limit
-        parser_grid.addWidget(QLabel("Page Limit:"), 1, 0)
+        # Content limit (pages from which files were downloaded)
+        parser_grid.addWidget(QLabel("Content Limit:"), 1, 0)
         self.page_limit_spin = QSpinBox()
         self.page_limit_spin.setRange(1, 1000)
-        self.page_limit_spin.setToolTip("Maximum number of pages to process")
+        self.page_limit_spin.setToolTip("Stop after downloading files from N pages (0 = unlimited)")
         parser_grid.addWidget(self.page_limit_spin, 1, 1)
 
         # Page timeout
@@ -588,9 +588,9 @@ class SettingsDialog(QDialog):
         self.stop_words_edit.setPlainText("\n".join(stop_words))
 
         # Performance
-        self.parser_threads_spin.setValue(self.settings.get("parser_threads", 2))
+        self.parser_threads_spin.setValue(self.settings.get("parser_threads", K.DEFAULT_PARSER_THREADS))
         self.downloader_threads_spin.setValue(
-            self.settings.get("downloader_threads", 4)
+            self.settings.get("downloader_threads", K.DEFAULT_DOWNLOADER_THREADS)
         )
         self.threads_per_file_spin.setValue(self.settings.get("threads_per_file", 1))
         self.speed_slider.setValue(self.settings.get("max_download_speed", 0))
