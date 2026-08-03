@@ -69,9 +69,9 @@ async function loadSieveResPatterns() {
             urlPattern = { type: "js", template: rule.url };
           } else {
             // String transform: $1, $2 replacements + optional POST data after " :"
-            const postMatch = rule.url.match(/\s*:(.+)$/);
+            const postMatch = rule.url.match(/(\s+):(.+)$/);
             const urlTemplate = postMatch ? rule.url.slice(0, postMatch.index) : rule.url;
-            const postData = postMatch ? postMatch[1].trim() : null;
+            const postData = postMatch ? postMatch[2].trim() : null;
             urlPattern = { type: "string", template: urlTemplate, postData };
           }
         }
@@ -137,14 +137,22 @@ async function discoverFullsize(links, pageUrl) {
       // Find matching sieve rule for this URL
       for (const [name, { linkRegex, resPattern, urlPattern }] of Object.entries(cachedSieveRes)) {
         const strippedUrl = linkUrl.replace(/^https?:\/\//, "");
-        if (linkRegex.test(strippedUrl) || linkRegex.test(linkUrl)) {
+        // Reset lastIndex to avoid test() skipping due to global flag
+        linkRegex.lastIndex = 0;
+        if (linkRegex.test(strippedUrl) || (linkRegex.lastIndex = 0, linkRegex.test(linkUrl))) {
           matchedRuleName = name;
-          matchedGroups = linkUrl.match(linkRegex) || strippedUrl.match(linkRegex);
+          matchedGroups = strippedUrl.match(linkRegex) || linkUrl.match(linkRegex);
           // Apply url transform if present and is string type
           if (urlPattern && urlPattern.type === "string") {
             const transformed = applyUrlTransform(urlPattern.template, matchedGroups);
             if (transformed) {
-              linkUrl = transformed;
+              // Preserve protocol if template doesn't include it
+              if (!transformed.startsWith("http") && !transformed.startsWith("//")) {
+                const protocol = linkUrl.startsWith("https") ? "https://" : "http://";
+                linkUrl = protocol + transformed;
+              } else {
+                linkUrl = transformed.replace(/^\/\//, "https://");
+              }
               // If POST data specified, switch to POST
               if (urlPattern.postData) {
                 fetchOptions.method = "POST";
