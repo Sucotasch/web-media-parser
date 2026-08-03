@@ -96,6 +96,31 @@ if (chrome.storage.onChanged) {
 
 const DISCOVER_CONCURRENCY = 5;
 
+// Semaphore for limiting concurrent downloads
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.running = 0;
+    this.queue = [];
+  }
+  
+  async acquire() {
+    if (this.running < this.max) {
+      this.running++;
+      return;
+    }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  
+  release() {
+    this.running--;
+    if (this.queue.length > 0) {
+      this.running++;
+      this.queue.shift()();
+    }
+  }
+}
+
 // Apply string url transform: replace $1, $2 with regex match groups
 function applyUrlTransform(template, matchGroups) {
   if (!template || !matchGroups) return null;
@@ -262,9 +287,11 @@ async function resolveUrl(url) {
   return url;
 }
 
-async function chromeDownload(items) {
+async function chromeDownload(items, concurrentLimit = 2) {
+  const sem = new Semaphore(concurrentLimit);
   let saved = 0;
   for (const item of items) {
+    await sem.acquire();
     try {
       // Resolve gallery page URL to direct CDN image URL
       const resolved = await resolveUrl(item.url);
@@ -281,6 +308,8 @@ async function chromeDownload(items) {
       if (downloadId) saved++;
     } catch (e) {
       console.error(`Download failed: ${item.url} — ${e.message}`);
+    } finally {
+      sem.release();
     }
   }
   return { saved };
@@ -421,7 +450,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   if (request.action === "chromeDownload") {
-    chromeDownload(request.items).then(sendResponse);
+    const limit = request.concurrentLimit || 2;
+    chromeDownload(request.items, limit).then(sendResponse);
     return true;
   }
   if (request.action === "getContext") {
