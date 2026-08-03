@@ -335,7 +335,7 @@ async function chromeDownload(items, concurrentLimit = 2) {
             }
           };
           chrome.downloads.onChanged.addListener(listener);
-          startNext(); // Try to start next immediately (will check limit inside)
+          setTimeout(startNext, 0); // Try to start next (async to avoid stack overflow)
         });
       }).catch(e => {
         console.error(`Resolve URL failed: ${item.url} — ${e.message}`);
