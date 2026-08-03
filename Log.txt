@@ -1,0 +1,16 @@
+[media-downloader] cmd: "C:/Users/sucot/AppData/Roaming/media-downloader/bin/yt-dlp.exe" "--proxy" "127.0.0.1:2080" "--newline" "--ignore-config" "--no-playlist" "-o" "%(title).200s-%(id)s.%(ext)s" "--output-na-placeholder" "NA" "-f" "bestaudio" "--extract-audio" "--audio-quality" "0" "--audio-format" "mp3" "--embed-thumbnail" "--no-js-runtimes" "--js-runtimes" "deno:C:/Users/sucot/AppData/Roaming/media-downloader/bin/deno.exe" "--progress-template" "download:[download] downloaded_bytes:%(progress.downloaded_bytes)s ETA:%(progress.eta)s total_bytes_estimate:%(progress.total_bytes_estimate)s total_bytes:%(progress.total_bytes)s progress.speed:%(progress.speed)s filename:%(progress.filename)s" "https://www.youtube.com/watch?v=ajCvO9iCYMs"
+[youtube] Extracting URL: https://www.youtube.com/watch?v=ajCvO9iCYMs
+[youtube] ajCvO9iCYMs: Downloading webpage
+[youtube] ajCvO9iCYMs: Downloading android vr player API JSON
+[youtube] ajCvO9iCYMs: Downloading player dfc3d2b2-main
+[youtube] [jsc:deno] Solving JS challenges using deno
+[youtube] ajCvO9iCYMs: Downloading m3u8 information
+[info] ajCvO9iCYMs: Downloading 1 format(s): 251
+[info] Downloading video thumbnail 41 ...
+[info] Writing video thumbnail 41 to: Cream Pie (1956) by Sharon Dix � BANNED VINYL-ajCvO9iCYMs.webp
+[download] Destination: Cream Pie (1956) by Sharon Dix � BANNED VINYL-ajCvO9iCYMs.webm
+[download] 3,26 MiB / 3,26 MiB (100%) at 2,36 MiB/s, ETA NA
+[ExtractAudio] Destination: Cream Pie (1956) by Sharon Dix � BANNED VINYL-ajCvO9iCYMs.mp3
+[ThumbnailsConvertor] Converting thumbnail "Cream Pie (1956) by Sharon Dix � BANNED VINYL-ajCvO9iCYMs.webp" to png
+[EmbedThumbnail] ffmpeg: Adding thumbnail to "Cream Pie (1956) by Sharon Dix � BANNED VINYL-ajCvO9iCYMs.mp3"
+[media-downloader] Download Completed Successfully

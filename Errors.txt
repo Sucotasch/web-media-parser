@@ -1,0 +1,15 @@
+Fetch API cannot load vr:t=16300146. URL scheme "vr" is not supported.
+Контекст
+background.js
+Трассировка стека
+background.js:88 (анонимные функции)
+const resp = await fetch(linkUrl, {
+ 
+	 
+Fetch API cannot load vr:t=7710089. URL scheme "vr" is not supported.
+Контекст
+background.js
+Трассировка стека
+background.js:88 (анонимные функции)
+const resp = await fetch(linkUrl, {
+
