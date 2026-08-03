@@ -48,16 +48,34 @@ async function loadSieveResPatterns() {
     const data = JSON.parse(result.sieveRules);
     cachedSieveRes = {};
     for (const [name, rule] of Object.entries(data)) {
-      if (!rule || typeof rule !== "object" || !rule.res || !rule.link) continue;
+      if (!rule || typeof rule !== "object") continue;
+      // Require link + (res OR url) — url alone can be a redirect/transform
+      if (!rule.link || (!rule.res && !rule.url)) continue;
       try {
         const linkRegex = new RegExp(rule.link, "i");
-        let resPattern;
-        if (typeof rule.res === "string") {
-          resPattern = new RegExp(rule.res, "i");
-        } else if (Array.isArray(rule.res)) {
-          resPattern = rule.res.map(r => new RegExp(r, "i"));
+        let resPattern = undefined;
+        if (rule.res) {
+          if (typeof rule.res === "string") {
+            resPattern = new RegExp(rule.res, "i");
+          } else if (Array.isArray(rule.res)) {
+            resPattern = rule.res.map(r => new RegExp(r, "i"));
+          }
         }
-        if (resPattern) cachedSieveRes[name] = { linkRegex, resPattern };
+        // Parse url property (string transform or JS expression)
+        let urlPattern = null;
+        if (rule.url && typeof rule.url === "string") {
+          if (rule.url.startsWith(":")) {
+            // JS expression — not supported in service worker, skip
+            urlPattern = { type: "js", template: rule.url };
+          } else {
+            // String transform: $1, $2 replacements + optional POST data after " :"
+            const postMatch = rule.url.match(/\s*:(.+)$/);
+            const urlTemplate = postMatch ? rule.url.slice(0, postMatch.index) : rule.url;
+            const postData = postMatch ? postMatch[1].trim() : null;
+            urlPattern = { type: "string", template: urlTemplate, postData };
+          }
+        }
+        cachedSieveRes[name] = { linkRegex, resPattern, urlPattern };
       } catch (e) {}
     }
     console.info(`Loaded ${Object.keys(cachedSieveRes).length} sieve res patterns`);
@@ -78,6 +96,29 @@ if (chrome.storage.onChanged) {
 
 const DISCOVER_CONCURRENCY = 5;
 
+// Apply string url transform: replace $1, $2 with regex match groups
+function applyUrlTransform(template, matchGroups) {
+  if (!template || !matchGroups) return null;
+  try {
+    let result = template;
+    // Replace $1, $2, etc. with captured groups (literal string replacement)
+    for (let i = 1; i < matchGroups.length; i++) {
+      const placeholder = `$${i}`;
+      if (result.includes(placeholder) && matchGroups[i] !== undefined) {
+        // Use split/join to avoid regex escaping issues with $
+        result = result.split(placeholder).join(matchGroups[i]);
+      }
+    }
+    // $& means full match
+    if (result.includes("$&")) {
+      result = result.split("$&").join(matchGroups[0] || "");
+    }
+    return result || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function discoverFullsize(links, pageUrl) {
   const discovered = [];
   const seen = new Set();
@@ -85,10 +126,38 @@ async function discoverFullsize(links, pageUrl) {
 
   async function processLink(linkUrl) {
     try {
-      const resp = await fetch(linkUrl, {
+      // Try to apply sieve url pattern (string transforms + optional POST data)
+      let fetchOptions = {
         headers: { "Accept": "text/html" },
         signal: AbortSignal.timeout(8000),
-      });
+      };
+      let matchedRuleName = null;
+      let matchedGroups = null;
+
+      // Find matching sieve rule for this URL
+      for (const [name, { linkRegex, resPattern, urlPattern }] of Object.entries(cachedSieveRes)) {
+        const strippedUrl = linkUrl.replace(/^https?:\/\//, "");
+        if (linkRegex.test(strippedUrl) || linkRegex.test(linkUrl)) {
+          matchedRuleName = name;
+          matchedGroups = linkUrl.match(linkRegex) || strippedUrl.match(linkRegex);
+          // Apply url transform if present and is string type
+          if (urlPattern && urlPattern.type === "string") {
+            const transformed = applyUrlTransform(urlPattern.template, matchedGroups);
+            if (transformed) {
+              linkUrl = transformed;
+              // If POST data specified, switch to POST
+              if (urlPattern.postData) {
+                fetchOptions.method = "POST";
+                fetchOptions.headers["Content-Type"] = "application/x-www-form-urlencoded";
+                fetchOptions.body = urlPattern.postData;
+              }
+            }
+          }
+          break;
+        }
+      }
+
+      const resp = await fetch(linkUrl, fetchOptions);
       if (!resp.ok) return [];
       const ct = resp.headers.get("content-type") || "";
       if (ct.includes("image/") || ct.includes("video/")) {
@@ -101,6 +170,7 @@ async function discoverFullsize(links, pageUrl) {
 
       // 1. Try sieve res patterns
       for (const [name, { linkRegex, resPattern }] of Object.entries(cachedSieveRes)) {
+        if (!resPattern) continue; // Skip rules without res (url-only rules)
         if (!linkRegex.test(linkUrl.replace(/^https?:\/\//, "")) && !linkRegex.test(linkUrl)) continue;
         let foundAny = false;
         try {
@@ -164,6 +234,7 @@ async function resolveUrl(url) {
     const html = await resp.text();
     const strippedUrl = url.replace(/^https?:\/\//, "");
     for (const [name, { linkRegex, resPattern }] of Object.entries(cachedSieveRes)) {
+      if (!resPattern) continue; // Skip rules without res
       if (!linkRegex.test(strippedUrl) && !linkRegex.test(url)) continue;
       try {
         const patterns = Array.isArray(resPattern) ? resPattern : [resPattern];

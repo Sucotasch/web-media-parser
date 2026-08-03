@@ -48,6 +48,8 @@
       url = toAbsolute(url);
       if (!url || linkSet.has(url)) return;
       if (url === baseUrl) return;
+      // Filter out non-HTTP(S) schemes to prevent fetch errors in background
+      if (!url.startsWith("http://") && !url.startsWith("https://")) return;
       linkSet.add(url);
       links.push(url);
     }
