@@ -288,31 +288,63 @@ async function resolveUrl(url) {
 }
 
 async function chromeDownload(items, concurrentLimit = 2) {
-  const sem = new Semaphore(concurrentLimit);
-  let saved = 0;
-  for (const item of items) {
-    await sem.acquire();
-    try {
-      // Resolve gallery page URL to direct CDN image URL
-      const resolved = await resolveUrl(item.url);
+  return new Promise((resolve) => {
+    let saved = 0;
+    let started = 0;
+    let completed = 0;
+    const total = items.length;
+    const activeIds = new Set();
 
-      const downloadId = await new Promise((resolve) => {
+    function startNext() {
+      // If we've started all items or have enough active, wait
+      if (started >= total) {
+        if (completed >= total) resolve({ saved });
+        return;
+      }
+      if (activeIds.size >= concurrentLimit) return;
+
+      const item = items[started++];
+      resolveUrl(item.url).then(resolved => {
+        const url = resolved || item.url;
         chrome.downloads.download({
-          url: resolved,
+          url: url,
           filename: item.filename || undefined,
           conflictAction: "uniquify"
-        }, (id) => {
-          resolve(chrome.runtime.lastError ? null : id);
+        }, (downloadId) => {
+          if (chrome.runtime.lastError || !downloadId) {
+            console.error(`Download failed to start: ${item.url} — ${chrome.runtime.lastError?.message}`);
+            completed++;
+            startNext();
+            return;
+          }
+          activeIds.add(downloadId);
+
+          const listener = (delta) => {
+            if (delta.id === downloadId && delta.state?.current) {
+              const state = delta.state.current;
+              if (state === 'complete' || state === 'interrupted') {
+                chrome.downloads.onChanged.removeListener(listener);
+                activeIds.delete(downloadId);
+                if (state === 'complete') saved++;
+                completed++;
+                startNext();
+              }
+            }
+          };
+          chrome.downloads.onChanged.addListener(listener);
         });
+      }).catch(e => {
+        console.error(`Resolve URL failed: ${item.url} — ${e.message}`);
+        completed++;
+        startNext();
       });
-      if (downloadId) saved++;
-    } catch (e) {
-      console.error(`Download failed: ${item.url} — ${e.message}`);
-    } finally {
-      sem.release();
     }
-  }
-  return { saved };
+
+    // Start initial batch
+    for (let i = 0; i < Math.min(concurrentLimit, total); i++) {
+      startNext();
+    }
+  });
 }
 
 /**
