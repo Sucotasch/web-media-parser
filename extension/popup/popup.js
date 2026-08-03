@@ -6,6 +6,7 @@
 const mediaItems = [];
 let activeDomainFilter = "";
 let activeSourceFilter = "";
+let concurrentLimit = 2;
 
 const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct"]);
 
@@ -27,6 +28,7 @@ const sourceFilter = document.getElementById("source-filter");
 const chromeDownloadBtn = document.getElementById("chrome-download-btn");
 const chromeCountSpan = document.getElementById("chrome-count");
 const deepParseWarning = document.getElementById("deep-parse-warning");
+const concurrentLimitInput = document.getElementById("concurrent-limit");
 
 function updateOneShotMode() {
   const isDeepParse = !oneShotCheckbox.checked;
@@ -34,6 +36,7 @@ function updateOneShotMode() {
   chromeDownloadBtn.disabled = isDeepParse || getVisibleCheckboxes().length === 0;
   downloadBtn.textContent = isDeepParse ? "Parse Page" : "Download";
   downloadBtn.disabled = false;
+  concurrentLimitInput.disabled = isDeepParse;
 }
 
 oneShotCheckbox.addEventListener("change", updateOneShotMode);
@@ -338,7 +341,7 @@ chromeDownloadBtn.addEventListener("click", async () => {
   try {
     await chrome.action.setBadgeText({ text: `${selected.length}` });
     await chrome.action.setBadgeBackgroundColor({ color: "#FFA000" });
-    const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected });
+    const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected, concurrentLimit });
     const saved = resp && resp.saved ? resp.saved : 0;
     chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
     await chrome.action.setBadgeText({ text: `${saved}` });
@@ -439,6 +442,20 @@ function showError(msg) {
 // Init
 checkConnection();
 updateSieveInfo();
+
+// Load concurrent limit setting
+chrome.storage.local.get("concurrentLimit", (data) => {
+  if (data.concurrentLimit) {
+    concurrentLimit = data.concurrentLimit;
+    concurrentLimitInput.value = concurrentLimit;
+  }
+});
+
+// Save concurrent limit on change
+concurrentLimitInput.addEventListener("change", () => {
+  concurrentLimit = parseInt(concurrentLimitInput.value) || 2;
+  chrome.storage.local.set({ concurrentLimit });
+});
 
 // --- Sieve rules management ---
 
