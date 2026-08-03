@@ -293,17 +293,20 @@ async function chromeDownload(items, concurrentLimit = 2) {
     let started = 0;
     let completed = 0;
     const total = items.length;
-    const activeIds = new Set();
+    let activeCount = 0; // Track how many downloads are in progress
 
     function startNext() {
-      // If we've started all items or have enough active, wait
+      // If all items processed, check if we're done
       if (started >= total) {
         if (completed >= total) resolve({ saved });
         return;
       }
-      if (activeIds.size >= concurrentLimit) return;
+      // If at limit, wait (will be called again when one completes)
+      if (activeCount >= concurrentLimit) return;
 
       const item = items[started++];
+      activeCount++; // Increment immediately to reserve the slot
+
       resolveUrl(item.url).then(resolved => {
         const url = resolved || item.url;
         chrome.downloads.download({
@@ -313,37 +316,37 @@ async function chromeDownload(items, concurrentLimit = 2) {
         }, (downloadId) => {
           if (chrome.runtime.lastError || !downloadId) {
             console.error(`Download failed to start: ${item.url} — ${chrome.runtime.lastError?.message}`);
+            activeCount--; // Release the slot
             completed++;
             startNext();
             return;
           }
-          activeIds.add(downloadId);
 
           const listener = (delta) => {
             if (delta.id === downloadId && delta.state?.current) {
               const state = delta.state.current;
               if (state === 'complete' || state === 'interrupted') {
                 chrome.downloads.onChanged.removeListener(listener);
-                activeIds.delete(downloadId);
+                activeCount--; // Release the slot
                 if (state === 'complete') saved++;
                 completed++;
-                startNext();
+                startNext(); // Start next download now that we have a free slot
               }
             }
           };
           chrome.downloads.onChanged.addListener(listener);
+          startNext(); // Try to start next immediately (will check limit inside)
         });
       }).catch(e => {
         console.error(`Resolve URL failed: ${item.url} — ${e.message}`);
+        activeCount--; // Release the slot
         completed++;
         startNext();
       });
     }
 
-    // Start initial batch
-    for (let i = 0; i < Math.min(concurrentLimit, total); i++) {
-      startNext();
-    }
+    // Start the chain (it will keep calling itself until limit is reached)
+    startNext();
   });
 }
 
