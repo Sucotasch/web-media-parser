@@ -131,6 +131,12 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            querySelector/closest/src; фолбэк на document (не первый элемент),
            стубы () => null на Document — чистый fail-open. Fetch/XHR (110) и
            IMGS_ext_data (86) — асинхронные, вне синхронного пайплайна.
+[✓] P0.5     this.node-шим в worker.js (P0): url-правила с this.node больше
+           не падают с 'reading node' (20 правил) — lazy-ветки работают
+           ($[2] ? ... : this.node...), DOM-зависимые ветки тихо fail-open.
+           + expression-wrapper: IIFE `(()=>{...})()` возвращают значение
+           (раньше undefined — голый body не возвращает trailing expression);
+           wrapCache — решение кэшируется, двойная компиляция исключена.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
 [ ] P3       curl_cffi impersonation как HTTP-движок (по появлению реальных блоков)
 [ ] P4       JS-обход интерстициальных прокладок (отложено — sieve-POST цепочка
@@ -142,8 +148,9 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
 - `CREATE_NO_WINDOW` (Windows) / `start_new_session` (Unix) в обоих `Popen` — иначе каждое `deno run` открывало видимое консольное окно на всю задачу.
 - `$._ = htmlStr` в dom_worker.js — Imagus-конвенция: res-правила читают сырой текст загруженной страницы (`$._.match(...)`); без этого 504 правила давали `reading 'match'` и fullsize-дискавери = 0. Плюс рекурсивное расплющивание вложенных массивов (`[[['#url']]]`) со снятием `#`-маркера.
 - P1.5: `this.node` — поиск элемента в DOM (a[href] по URL из контекста exact/relative, img[src] по группам regex); Proxy-шим: `src` от первого img внутри, `closest/querySelector` от якоря; фолбэк на `document` с стубами `() => null` — правила вроде Google_Images (`closest('a')`) и CNN-m-pp (`querySelector('img')`) работают, а при отсутствии матча — честный null без мусорных URL лого/навигации.
+- P0.5: `this.node`-шим в worker.js — url/to-правила с `this.node` (20 в sieve) больше не кидают `reading 'node'`: lazy-ветки (`$[2] ? X : this.node...`) дают результат, DOM-ветки — тихий fail-open (src/closest/querySelector → null/[]). Плюс expression-wrapper: голый body не возвращает значение trailing-выражения, поэтому `(()=>{...})()` правила давали undefined (молчаливый fail-open) — теперь `return (expr)` для чистых выражений (probe-компиляция + wrapCache).
 
-Тесты: `tests/test_js_engine.py` (26, включая `$._`, вложенные массивы, CREATE_NO_WINDOW, fail-open, P1.5 this.node/find/фолбэк), `tests/test_junk_filter.py` (31), иконки в `tests/test_js_processing.py`. Смоук: 147 passed, 1 skipped; боевой запуск — 1940 media через fullsize-дискавери, 0 DOM-ошибок.
+Тесты: `tests/test_js_engine.py` (30, включая `$._`, вложенные массивы, CREATE_NO_WINDOW, fail-open, P1.5 this.node/find/фолбэк, P0.5 lazy/guard/IIFE-обёртка), `tests/test_junk_filter.py` (31), иконки в `tests/test_js_processing.py`. Смоук: 151 passed, 1 skipped; боевой запуск — 1163 media через fullsize-дискавери, 0 DOM-ошибок (P1.5 подтверждён в бою).
 
 ---
 

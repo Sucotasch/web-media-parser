@@ -66,10 +66,73 @@ def test_run_js_location_shim():
 def test_run_js_dom_rule_fails_open():
     engine = _engine_or_skip()
     try:
-        # Needs real DOM — worker has no this.node; must return None, not raise.
+        # Needs real DOM — P0 worker has no page HTML; the this.node shim
+        # returns null-ish values, so the rule fails open (None), not raises.
         code = "return this.node.closest('tr')?.querySelector('img')?.src"
         result = engine.run_js(code, ["x"], "https://example.com/")
         assert result is None
+    finally:
+        engine.shutdown()
+
+
+def test_run_js_this_node_shim_lazy_branch():
+    # P0 url rules often branch on groups first, e.g. Ancensored-x:
+    #   $[2] ? '//'+$[1]+'clip/-/-/'+$[2] : this.node.closest('a').href
+    # Without the this.node shim the WHOLE rule threw "reading 'node'" and
+    # even the working branch never returned. The shim must let the group
+    # branch evaluate normally.
+    engine = _engine_or_skip()
+    try:
+        code = "return $[2] ? '//'+$[1]+'clip/-/-/'+$[2] : this.node.closest('a').href"
+        result = engine.run_js(code, ["ancensored.com/x", "ancensored.com/", "abc123"],
+                               "https://ancensored.com/")
+        assert result == "//ancensored.com/clip/-/-/abc123"
+    finally:
+        engine.shutdown()
+
+
+def test_run_js_this_node_shim_guard_branch():
+    # Kino-Teatr.ru: `(($[3]||$[4])&&!this.node.src) throw ''` — this.node.src
+    # is a guard. The P0 shim's src is null, so the guard triggers the rule's
+    # own `throw ''` (fail-open, as it does in the extension when not hovering
+    # an image) — the shim must NOT raise "reading 'node'", and the fallback
+    # $[0] branch must still work when groups are absent.
+    engine = _engine_or_skip()
+    try:
+        code = ("(()=>{if(($[3]||$[4])&&!this.node.src)throw '';"
+                "return $[3]?$[0].replace($[3],'foto/'):$[4]?$[0].replace($[4],'poster/'):$[0]})()")
+        # $[3]/$[4] absent -> guard no-op -> returns $[0] (no exception)
+        result = engine.run_js(code, ["https://kino-teatr.ru/photo/1.jpg", "kino-teatr.ru/"],
+                               "https://kino-teatr.ru/")
+        assert result == "https://kino-teatr.ru/photo/1.jpg"
+    finally:
+        engine.shutdown()
+
+
+def test_run_js_expression_wrapper_iife():
+    # Regression: Imagus rules wrapped as `(()=>{...})()` are pure expressions
+    # — a bare function body does NOT return a trailing expression's value, so
+    # without the `return (...)` wrapper they all yielded undefined (silent
+    # fail-open). The wrapper must make the IIFE's return value visible.
+    engine = _engine_or_skip()
+    try:
+        code = "(()=>{return $[0]+'/wrap'})()"
+        assert engine.run_js(code, ["https://x/a.jpg"], "https://x/") == "https://x/a.jpg/wrap"
+        # ternary expression (no statements) also works
+        code2 = "$[2] ? '//'+$[1]+'c/'+$[2] : $[0]"
+        assert engine.run_js(code2, ["https://x/1", "https://x/", "y"], "https://x/") == "//https://x/c/y"
+    finally:
+        engine.shutdown()
+
+
+def test_run_js_this_node_redirect_works():
+    # Imagus convention: `this` may be reassigned by the rule. Since the shim
+    # is passed via fn.call, a rule that reassigns `this` (redirect pattern)
+    # must not clobber the shim — verify the pure return still works.
+    engine = _engine_or_skip()
+    try:
+        code = "return this.node ? $[0]+'/ok' : 'no-node'"
+        assert engine.run_js(code, ["https://x/a.jpg"], "https://x/") == "https://x/a.jpg/ok"
     finally:
         engine.shutdown()
 

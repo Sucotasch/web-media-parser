@@ -26,6 +26,51 @@ function shimLocation(pageUrl) {
   }
 }
 
+// `this` for url/to rules that reference this.node / this.find / this.TRG.
+// The P0 worker has NO page HTML, so a real DOM element is impossible — but
+// url rules often branch on groups first (`$[2] ? '//'+$[1]+... : this.node...`)
+// or read this.node.src only as a guard. Without a shim every such rule threw
+// "Cannot read properties of undefined (reading 'node')" and the WORKING
+// branch never ran. This shim returns safe null-ish values instead, so lazy
+// branches still evaluate and genuine DOM lookups fail open (no exception).
+function shimSelf(groups) {
+  const node = {
+    src: null,
+    href: null,
+    textContent: null,
+    className: "",
+    tagName: "A",
+    nodeType: 1,
+    parentNode: null,
+    previousElementSibling: null,
+    closest: () => null,
+    matches: () => false,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getAttribute: () => null,
+    hasAttribute: () => false,
+  };
+  return {
+    href: null,
+    node: node,
+    TRG: node,
+    tagName: "A",
+    src: null,
+    getAttribute: () => null,
+    closest: () => null,
+    matches: () => false,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    parentNode: null,
+    previousElementSibling: null,
+    find: () => null,
+    set: null,
+    prepare: null,
+    getImages: null,
+    $: groups || [],
+  };
+}
+
 function handle(line) {
   let req;
   try {
@@ -49,14 +94,42 @@ function handle(line) {
     // window shim: rules may read window.URL / window.location; anything
     // heavier (window.fetch, window.document.body...) is undefined -> throw.
     const window = { location, URL, document };
+    // Many Imagus rules are wrapped as `(()=>{...})()` expressions. A bare
+    // function body does NOT return the value of a trailing expression, so
+    // `(()=>{return 42})()` as the last statement yields undefined. Try
+    // compiling the body as `return (body)` (works only when the body is a
+    // pure expression — statements like `;` or a top-level `return` make the
+    // wrapper a SyntaxError and it falls back to the raw body, which carries
+    // its own return). This is robust for both styles without a fragile
+    // prefix heuristic.
+    const body = code.trim();
+    // Cache the wrap decision per rule body: the probe Function compile is
+    // cheap but double-compiles per call; rule bodies are a small finite set.
+    let wrapped = wrapCache.get(body);
+    if (wrapped === undefined) {
+      const exprBody = body.replace(/;\s*$/, "");
+      wrapped = body;
+      try {
+        new Function('"use strict";\nreturn (' + exprBody + ')');
+        wrapped = "return (" + exprBody + ")";
+      } catch (_) {
+        // statement-style body — keep as-is
+      }
+      wrapCache.set(body, wrapped);
+    }
     const fn = new Function("$", "location", "document", "window", "URL",
-      '"use strict";\n' + code);
-    const result = fn($, location, document, window, URL);
+      '"use strict";\n' + wrapped);
+    const self = shimSelf($);
+    const result = fn.call(self, $, location, document, window, URL);
     return JSON.stringify(typeof result === "string" ? { id, result } : { id, result: null });
   } catch (e) {
     return JSON.stringify({ id, error: String((e && e.message) || e) });
   }
 }
+
+// Wrap-decision cache keyed by rule body (see handle()). Bounded: one entry
+// per distinct sieve JS rule body.
+const wrapCache = new Map();
 
 // Route rule console output to stderr, NEVER stdout: stdout is the JSON
 // protocol channel (one response line per request). A rule calling
