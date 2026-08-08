@@ -26,6 +26,7 @@
 - **Встроенные паттерны** — готовые правила для популярных сайтов
 - **Custom patterns (JSON)** — собственные правила с `image_transformations`
 - **Imagus Sieve** — загрузка правил Imagus; JS-правила конвертируются в Python callables
+- **JS Engine (Deno)** — опциональный лёгкий JS-движок: выполняет JS-правила sieve в песочнице (подробнее в разделе [JS Engine](#js-engine-deno))
 - **Page only режим** — скачивание только с указанной страницы без обхода сайта
 
 ### Очередь задач
@@ -118,7 +119,14 @@ python build_exe.py
 ```
 dist/WebMediaParser/
 ├── WebMediaParser.exe
-├── Imagus_sieve_2026.04.01_849.json
+├── Imagus_sieve_2026.04.01_849.json   — правила Imagus
+├── Imagus_sieve_2026.07.15_823.json
+├── junk_allowlist.txt                 — исключения для фильтра рекламы/мусора
+├── bin/                               — JS-движок Deno (при сборке с Deno)
+│   ├── deno.exe
+│   ├── worker.js                      — воркер JS-правил (P0)
+│   ├── dom_worker.js                  — DOM-воркер happy-dom (P1)
+│   └── deno_cache/                    — офлайн-кэш npm (happy-dom)
 ├── sessions/          (создаётся при первом запуске)
 └── _internal/
     └── resources/
@@ -126,6 +134,8 @@ dist/WebMediaParser/
         ├── domain_blocklist.txt
         └── patterns/site_patterns.json
 ```
+
+> **Deno не обязателен.** Без `bin/` приложение работает в статическом режиме (как раньше); включить движок можно в настройках.
 
 ---
 
@@ -199,12 +209,36 @@ dist/WebMediaParser/
 | Timeout | 30 сек | Таймаут сетевого запроса |
 | Retry Count | 3 | Повторные попытки при ошибке |
 | Proxy | — | Прокси в формате `host:port` |
+| **JS Engine** | Static | `Static` (по умолчанию) / `Deno` — см. [JS Engine (Deno)](#js-engine-deno) |
+| Filter Ads/Junk | ✓ | Пропускать рекламные/tracker URL (allowlist-совместимо) |
 
 ### Logging
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | Enable logging to file | Выкл | Запись лога в текстовый файл |
 | Log file | web_media_parser.log | Путь к файлу лога |
+
+---
+
+## JS Engine (Deno)
+
+Парсер может выполнять **JS-правила Imagus sieve** через лёгкий движок Deno вместо устаревшего конвертера JS→Python. Движок **выключен по умолчанию** (`Static`) — включите в *Settings → HTTP → JS Engine → Deno*.
+
+### Что даёт
+- **P0** — JS `to`-правила (преобразование thumbnail → fullsize URL)
+- **P1** — JS `url`/`res`-правила: загрузка linked-страниц и извлечение fullsize через DOM (happy-dom) и сырой текст страницы (`$._`)
+- **P0.5/P1.5** — `this.node`-эмуляция: правила с `this.node.closest/querySelector/src` дают результат там, где раньше молча падали
+- **Fullsize-дискавери** — переходы thumbnail→страница-оболочка→полноразмерный оригинал (imx.to и др.)
+
+### Безопасность
+- Воркеры запускаются **без прав** (`--allow-*` не выдаются), скрипты страницы не выполняются — только правила пользователя против DOM
+- Офлайн-кэш npm бандлится в `bin/deno_cache/` — движок работает без интернета
+
+### Ограничения (осознанные)
+- Правила, которым нужен **реальный элемент браузера** (`this.node.closest(...)` на сложных галереях), fail-open — серверный движок не может дать hovered-элемент
+- **Асинхронные** правила (fetch/XMLHttpRequest, `IMGS_ext_data`) несовместимы с синхронным пайплайном и не выполняются
+- **Cloudflare Turnstile/Managed Challenge** движок не обходит (требуют реального браузера); помогают cookies расширения (`extension_cookies`) + прокси
+- При любой ошибке движка приложение автоматически откатывается на статический парсинг (fail-open)
 
 ---
 
@@ -226,7 +260,9 @@ main.py
 │   ├── priority_url_queue.py — приоритетная очередь URL (heap-based)
 │   ├── webpage_parser.py     — HTML, lazy-load, JS-редиректы, bypass, фильтрация
 │   ├── json_parser.py        — JSON API парсинг
-│   ├── site_pattern_manager.py — паттерны + Imagus Sieve (JS→Python)
+│   ├── site_pattern_manager.py — паттерны + Imagus Sieve (JS правила → Deno/Static)
+│   ├── js_engine/           — Deno JS движок: engine.py, worker.js (P0), dom_worker.js (P1)
+│   ├── junk_filter.py       — классификатор ad/трекер/форумный хром (P2-lite)
 │   ├── shared_session.py     — aiohttp.ClientSession
 │   └── utils.py              — is_media_url, normalize_url, is_banner_or_ad
 │
