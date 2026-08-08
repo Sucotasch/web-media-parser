@@ -14,7 +14,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="web_media_parser",
-    version="1.0.0",
+    version="1.1.0",
     description="Web Media Parser - A tool for parsing and downloading media files from websites",
     author="WebMediaParser",
     packages=find_packages(),
