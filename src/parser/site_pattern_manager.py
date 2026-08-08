@@ -11,8 +11,8 @@ import re
 import sys
 import json
 import logging
-from typing import Dict, List, Any, Optional, Tuple, Set
-from urllib.parse import urlparse
+from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse, urljoin
 from .utils import get_domain
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class SitePatternManager:
     Supports advanced features like CSS selectors and API integrations
     """
 
-    def __init__(self, enable_built_in=True, custom_pattern_path=None, imagus_sieve_path=None):
+    def __init__(self, enable_built_in=True, custom_pattern_path=None, imagus_sieve_path=None, js_engine=None):
         self.patterns = {}
         self.imagus_rules = {}  # Rules indexed by domain
         self.imagus_global_rules = [] # Rules without specific domain
@@ -33,6 +33,10 @@ class SitePatternManager:
         self.enable_built_in = enable_built_in
         self.custom_pattern_path = custom_pattern_path
         self.imagus_sieve_path = imagus_sieve_path
+        # Optional Deno JS engine (P0: executes sieve JS `to` rules that the
+        # Python converter cannot handle). None disables JS rule execution and
+        # keeps the previous behaviour exactly.
+        self.js_engine = js_engine
         
         # Load patterns
         self.load_patterns()
@@ -166,12 +170,12 @@ class SitePatternManager:
             rules_count = 0
             js_converted = 0
             js_skipped = 0
+            js_deno = 0
             for rule_name, rule_data in data.items():
                 if not isinstance(rule_data, dict): continue
                 
-                # Rules must have at least 'to' or 'res' to be useful
+                # Rules must have a 'to' rule to be useful
                 to_rule = rule_data.get('to', '')
-                res_rule = rule_data.get('res', '')
                 
                 # Handle JS rules (starts with :)
                 if isinstance(to_rule, str) and to_rule.startswith(':'):
@@ -180,6 +184,12 @@ class SitePatternManager:
                     if callable_fn:
                         rule_data['to_callable'] = callable_fn
                         js_converted += 1
+                    elif self.js_engine is not None and self._js_rule_deno_capable(to_rule):
+                        # Rule doesn't need real DOM (no this.node/document.body
+                        # etc.) — run it through the Deno worker at transform
+                        # time (P0). Keeps the raw JS body after ':'.
+                        rule_data['to_js'] = to_rule[1:].strip()
+                        js_deno += 1
                     else:
                         js_skipped += 1
                         continue  # Can't convert — skip entirely
@@ -209,6 +219,8 @@ class SitePatternManager:
             log_parts = [f"Loaded {rules_count} Imagus sieve rules from {file_path}"]
             if js_converted:
                 log_parts.append(f"JS converted: {js_converted}")
+            if js_deno:
+                log_parts.append(f"JS deno: {js_deno}")
             if js_skipped:
                 log_parts.append(f"JS skipped (needs DOM): {js_skipped}")
             logger.info(" | ".join(log_parts))
@@ -225,6 +237,23 @@ class SitePatternManager:
         return re.sub(r'(?<!\\)\$(\d+)', lambda m: f'\\g<{m.group(1)}>', target)
 
     # --- JS rule conversion ---
+
+    # Keywords that REQUIRE a real DOM node/page that a Deno shim cannot
+    # provide (this.node, document.body, querySelector, fetch, ...). Rules
+    # containing any of these cannot run in the P0 Deno worker (which only
+    # shims location/URL/document.URL) and stay on the skipped path.
+    _DENO_HARD_DOM_KEYWORDS = (
+        'this.node', 'this.TRG', 'this.find', 'this.set', 'this.prepare',
+        'this.getImages', 'document.body', 'document.documentElement',
+        'querySelector', 'getElementById',
+        'getElementsBy', 'createElement', 'appendChild', 'innerHTML',
+        'outerHTML', '.closest(', 'sessionStorage', 'localStorage',
+        'XMLHttpRequest', 'fetch(', 'Port.send', 'addEventListener',
+    )
+
+    def _js_rule_deno_capable(self, js_code: str) -> bool:
+        """True if a JS rule can run in the sandboxed Deno worker (P0)."""
+        return not any(kw in js_code for kw in self._DENO_HARD_DOM_KEYWORDS)
 
     # DOM keywords that indicate the rule needs browser context
     _DOM_KEYWORDS = (
@@ -272,13 +301,11 @@ class SitePatternManager:
 
     def _build_js_callable(self, expr: str, full_js: str):
         """Build a Python callable from a JS return expression."""
-        import re as _re
-
         # Normalize $[n] → group(n) references for internal processing
         # We'll compile a function that receives a match object
 
-        # Check for #ext# pattern (variant expansion)
-        has_ext_pattern = '#ext#' in expr or bool(_re.search(r"'#[^']+#'", expr))
+        # #ext# variant expansion is handled inside the generated function (see
+        # func_src below), so no pre-check is needed here.
 
         # Convert JS expression to Python expression
         py_expr = self._js_expr_to_python(expr)
@@ -508,7 +535,6 @@ def _transform(m):
         try:
             parsed_url = urlparse(url)
             domain = parsed_url.netloc.lower()
-            path = parsed_url.path.lower()
             full_url = url.lower()
         except Exception:
             return []
@@ -563,20 +589,23 @@ def _transform(m):
                         if 'replace_patterns' in transform_data:
                             for replace_pattern in transform_data['replace_patterns']:
                                 source, target = replace_pattern.get('source'), replace_pattern.get('target')
-                                if source and target:
+                                # Empty target is legal (a strip/delete rule, e.g.
+                                # "thumbs/th_" -> ""); only the source must be set.
+                                if source and target is not None:
                                     new_url = re.sub(source, target, results[0], flags=re.IGNORECASE)
                                     if new_url != results[0]:
                                         results[0] = new_url
                                         transformed = True
-                    
-                    # Native imagus_patterns section
-                    elif 'imagus_patterns' in pattern_data:
+
+                    # Native imagus_patterns section — separate `if`, not `elif`,
+                    # so a pattern carrying BOTH sections applies both (Q13).
+                    if 'imagus_patterns' in pattern_data:
                         imagus_data = pattern_data['imagus_patterns']
                         for transform_type in ['photo_transform', 'media', 'image']:
                             if transform_type in imagus_data:
                                 for transform in imagus_data[transform_type]:
                                     source, target = transform.get('source'), transform.get('target')
-                                    if source and target:
+                                    if source and target is not None:
                                         new_url = re.sub(source, target, results[0], flags=re.IGNORECASE)
                                         if new_url != results[0]:
                                             results[0] = new_url
@@ -638,6 +667,34 @@ def _transform(m):
                                 logger.debug(f"Imagus callable failed: {e}")
                                 break
 
+                        # JS rule via Deno worker (P0): run the raw JS body with
+                        # $[n] groups + page-URL shim, then expand #ext# variants
+                        # exactly like the regex path below.
+                        to_js = rule.get('to_js')
+                        if to_js and self.js_engine is not None:
+                            try:
+                                groups = [match.group(0)]
+                                groups += [match.group(i) for i in range(1, match.re.groups + 1)]
+                                js_result = self.js_engine.run_js(to_js, groups, source_url)
+                                if js_result:
+                                    variants = self._expand_variants(js_result)
+                                    for variant in variants:
+                                        variant = variant.strip()
+                                        if not variant:
+                                            continue
+                                        if variant.startswith('//'):
+                                            variant = 'https:' + variant
+                                        elif variant and '://' not in variant:
+                                            scheme = results[0].split('://', 1)[0]
+                                            variant = f"{scheme}://{variant}"
+                                        if variant and variant != v_url:
+                                            sieve_results.append(variant)
+                                    transformed = True
+                                break
+                            except Exception as e:
+                                logger.debug(f"Imagus JS (Deno) failed: {e}")
+                                break
+
                         # Fallback: regex substitution
                         to_pattern = rule.get('to_python', '')
                         if not to_pattern: continue
@@ -694,7 +751,159 @@ def _transform(m):
                 seen.add(u)
                 
         return final_list
-    
+
+    # --- Sieve link->url->res chain (thumbnail transitions) ---
+    #
+    # Many sieve rules are not pure URL transforms (img+to) but page-fetch
+    # chains: match `link` regex on the thumbnail's parent href, apply the
+    # `url` template (string transform; everything after " :" is POSTed form
+    # data, e.g. imx.to "imgContinue="), fetch that page, then extract the
+    # fullsize image from it via the `res` regex(es). This mirrors the
+    # extension's background.js discoverFullsize. The parser manager calls
+    # these for from_image links so external image hosts resolve to fullsize
+    # originals instead of being dropped by stay-in-domain checks.
+
+    def get_link_rule(self, link_url: str):
+        """Find a sieve rule whose `link` regex matches the given URL.
+
+        Returns (rule_data, match_object) or None. Matches against the
+        scheme-stripped URL first, then the full URL (extension behaviour).
+        """
+        if not link_url:
+            return None
+        stripped = re.sub(r'^https?://', '', link_url, flags=re.I)
+        variants = [stripped, link_url]
+        rules = list(self.imagus_global_rules)
+        for domain_rules in self.imagus_rules.values():
+            rules.extend(domain_rules)
+        for rule in rules:
+            link_regex = rule.get('link')
+            if not link_regex or not isinstance(link_regex, str):
+                continue
+            try:
+                compiled = re.compile(link_regex, re.I)
+            except re.error:
+                continue
+            for v in variants:
+                m = compiled.search(v)
+                if m:
+                    return rule, m
+        return None
+
+    def apply_link_url_transform(self, rule, match, page_url=""):
+        """Build (fetch_url, post_data) from a sieve rule's `url` template.
+
+        Substitutes $1..$n / $& from the regex match. Content after a space +
+        colon (" :imgContinue=") becomes form POST data. JS url expressions
+        (starting with ':') are evaluated in the Deno shim worker (P1) when
+        an engine is available — they receive $[n] groups and the page-URL
+        shim (location/document.URL); rules needing a real gallery DOM throw
+        and fall back to None (fail-open). Returns None when no fetchable
+        transform exists.
+        """
+        url_tpl = rule.get('url')
+        if not url_tpl or not isinstance(url_tpl, str):
+            return None
+        if url_tpl.startswith(':'):
+            if self.js_engine is None:
+                return None
+            groups = [match.group(0)]
+            groups += [match.group(i) for i in range(1, match.re.groups + 1)]
+            js_result = self.js_engine.run_js(url_tpl, groups, page_url)
+            if not js_result:
+                return None
+            post_match = re.search(r'\s+:(.+)$', js_result)
+            template = js_result[:post_match.start()] if post_match else js_result
+            post_data = post_match.group(1).strip() if post_match else None
+            if not template:
+                return None
+            if template.startswith('//'):
+                template = 'https:' + template
+            elif not template.startswith(('http://', 'https://')):
+                template = 'https://' + template
+            return template, post_data
+        post_match = re.search(r'\s+:(.+)$', url_tpl)
+        template = url_tpl[:post_match.start()] if post_match else url_tpl
+        post_data = post_match.group(1).strip() if post_match else None
+        result = template
+        # Substitute $n in DESCENDING order so $10 isn't corrupted when $1 is
+        # replaced first (e.g. '$10' would become 'g(1)0' otherwise).
+        for i in range(len(match.groups()), 0, -1):
+            placeholder = f'${i}'
+            if placeholder in result and match.group(i) is not None:
+                result = result.replace(placeholder, match.group(i))
+        if '$&' in result:
+            result = result.replace('$&', match.group(0) or '')
+        if not result:
+            return None
+        if result.startswith('//'):
+            result = 'https:' + result
+        elif not result.startswith(('http://', 'https://')):
+            result = 'https://' + result
+        return result, post_data
+
+    def extract_res_urls(self, rule, html, page_url="", groups=None, href=""):
+        """Extract fullsize media URLs from a linked page's HTML.
+
+        Applies the rule's `res` regex(es); JS res expressions (starting with
+        ':') are evaluated against a happy-dom document in the Deno DOM
+        worker (P1) when the engine supports it — they receive $[n] groups
+        and a `this` link shim. If no pattern yields results, falls back to a
+        plain <img src> scan filtered to photo extensions
+        (jpg/webp/avif/heic/bmp/tiff) — mirrors the extension's
+        discoverFullsize fallback.
+        """
+        if not html:
+            return []
+        urls, seen = [], set()
+        res = rule.get('res')
+        patterns = res if isinstance(res, list) else [res]
+        for pat in patterns:
+            if not pat or not isinstance(pat, str):
+                continue
+            if pat.lstrip().startswith(':'):
+                if self.js_engine is None or not self.js_engine.dom_available():
+                    continue  # JS res needs the DOM worker — skipped as before
+                found = self.js_engine.run_dom_js(pat, html, page_url, groups, href)
+                if found:
+                    for u in found:
+                        u = u.strip()
+                        if not u:
+                            continue
+                        if u.startswith('//'):
+                            u = 'https:' + u
+                        elif not u.startswith(('http://', 'https://')):
+                            u = urljoin(page_url or "", u)
+                        if u.startswith(('http://', 'https://')) and u not in seen:
+                            seen.add(u)
+                            urls.append(u)
+                    if urls:
+                        break
+                continue
+            try:
+                for m in re.finditer(pat, html, re.I):
+                    if m.lastindex and m.group(1):
+                        u = m.group(1)
+                        if not u.startswith('http'):
+                            u = 'https:' + u
+                        if u not in seen:
+                            seen.add(u)
+                            urls.append(u)
+            except re.error:
+                continue
+            if urls:
+                break
+        if not urls:
+            for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I):
+                u = m.group(1)
+                if u.startswith('//'):
+                    u = 'https:' + u
+                if (u.startswith('http') and u not in seen and
+                        re.search(r'\.(jpe?g|webp|avif|heic|bmp|tiff?)$', u, re.I)):
+                    seen.add(u)
+                    urls.append(u)
+        return urls
+
     def _apply_global_transformations(self, url: str) -> str:
         """
         Apply global thumbnail transformations to a URL
@@ -703,8 +912,7 @@ def _transform(m):
             return url
             
         original_url = url
-        transformed = False
-        
+
         # Get thumbnail transformations
         common_patterns = self.global_settings['common_image_patterns']
         if 'thumbnail_transform' in common_patterns:
@@ -712,12 +920,13 @@ def _transform(m):
                 source = transform.get('source')
                 target = transform.get('target')
                 
-                if source and target:
+                # Empty target is legal (strip/delete rule) — same semantics as
+                # the native pattern sections (see transform_image_url).
+                if source and target is not None:
                     try:
                         new_url = re.sub(source, target, url, flags=re.IGNORECASE)
                         if new_url != url:
                             url = new_url
-                            transformed = True
                             logger.debug(f"Transformed image URL using global pattern: {original_url} -> {url}")
                     except Exception as e:
                         logger.debug(f"Error applying global pattern {source}: {str(e)}")

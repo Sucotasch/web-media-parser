@@ -7,8 +7,6 @@ Fix for brotli support in aiohttp
 
 import importlib.util
 import logging
-import sys
-import os
 
 logger = logging.getLogger(__name__)
 

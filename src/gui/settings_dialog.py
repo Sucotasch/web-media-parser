@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QSpinBox,
-    QDoubleSpinBox,
     QCheckBox,
     QPushButton,
     QTabWidget,
@@ -22,13 +21,11 @@ from PySide6.QtWidgets import (
     QSlider,
     QPlainTextEdit,
     QComboBox,
-    QScrollArea,
     QFileDialog,
 )
 from PySide6.QtCore import Qt
 import json
 import os
-import sys
 import logging
 import src.constants as K
 from src.app_paths import settings_path as _settings_path
@@ -79,6 +76,9 @@ class SettingsDialog(QDialog):
             "timeout": K.DEFAULT_TIMEOUT,
             "retry_count": K.DEFAULT_RETRY_COUNT,
             "proxy": "",
+            # Media formats
+            "enabled_image_formats": list(K.DEFAULT_ENABLED_IMAGE_FORMATS),
+            "enabled_video_formats": list(K.DEFAULT_ENABLED_VIDEO_FORMATS),
             # Stop words
             "stop_words": [
                 "login",
@@ -148,7 +148,7 @@ class SettingsDialog(QDialog):
         # Content limit (pages from which files were downloaded)
         parser_grid.addWidget(QLabel("Content Limit:"), 1, 0)
         self.page_limit_spin = QSpinBox()
-        self.page_limit_spin.setRange(1, 1000)
+        self.page_limit_spin.setRange(0, 1000)
         self.page_limit_spin.setToolTip("Stop after downloading files from N pages (0 = unlimited)")
         parser_grid.addWidget(self.page_limit_spin, 1, 1)
 
@@ -178,6 +178,18 @@ class SettingsDialog(QDialog):
             "Use site patterns for extracting fullsize images from thumbnails (improves image quality)"
         )
         parser_grid.addWidget(self.use_patterns_check, 5, 1)
+        
+        # JS engine for Imagus sieve JS rules
+        parser_grid.addWidget(QLabel("JS Engine:"), 6, 0)
+        self.js_engine_combo = QComboBox()
+        self.js_engine_combo.addItem("Static", "static")
+        self.js_engine_combo.addItem("Deno (experimental)", "deno")
+        self.js_engine_combo.setToolTip(
+            "Engine for Imagus sieve JS rules. 'Static' uses the built-in Python "
+            "converter (default). 'Deno' executes JS rules in a sandboxed Deno "
+            "worker (requires deno.exe; falls back to static on any error)."
+        )
+        parser_grid.addWidget(self.js_engine_combo, 6, 1)
         
         # Custom pattern file
         parser_grid.addWidget(QLabel("Custom Pattern File:"), 7, 0)
@@ -278,6 +290,33 @@ class SettingsDialog(QDialog):
 
         filters_layout.addWidget(video_group)
 
+        # Media format allowlists (settings-driven replacement for hard-coded junk formats)
+        image_formats_group = QGroupBox("Image Formats")
+        image_formats_grid = QGridLayout(image_formats_group)
+        self.image_format_checks = {}
+        for i, ext in enumerate(K.IMAGE_EXTENSIONS):
+            checkbox = QCheckBox(ext.lstrip(".").upper())
+            checkbox.setToolTip(f"Allow downloading {ext} images")
+            self.image_format_checks[ext] = checkbox
+            image_formats_grid.addWidget(checkbox, i // 4, i % 4)
+        image_formats_group.setToolTip(
+            "Enabled image formats. GIF/SVG/ICO are disabled by default (decorative junk) — "
+            "check them to download anyway."
+        )
+        filters_layout.addWidget(image_formats_group)
+
+        video_formats_group = QGroupBox("Video Formats")
+        video_formats_grid = QGridLayout(video_formats_group)
+        self.video_format_checks = {}
+        # Include streaming manifests: they must stay enabled after a settings save
+        video_format_list = list(K.VIDEO_EXTENSIONS) + [".m3u8", ".mpd"]
+        for i, ext in enumerate(video_format_list):
+            checkbox = QCheckBox(ext.lstrip(".").upper())
+            checkbox.setToolTip(f"Allow downloading {ext} videos")
+            self.video_format_checks[ext] = checkbox
+            video_formats_grid.addWidget(checkbox, i // 4, i % 4)
+        filters_layout.addWidget(video_formats_group)
+
         # Stop words group
         stop_words_group = QGroupBox("Stop Words")
         stop_words_layout = QVBoxLayout(stop_words_group)
@@ -290,6 +329,22 @@ class SettingsDialog(QDialog):
         stop_words_layout.addWidget(self.stop_words_edit)
 
         filters_layout.addWidget(stop_words_group)
+
+        # P2-lite junk filter (ad/tracker URL classifier + allowlist)
+        junk_group = QGroupBox("Junk Filter")
+        junk_layout = QVBoxLayout(junk_group)
+        self.filter_junk_check = QCheckBox(
+            "Filter ads/trackers/junk from media and links"
+        )
+        self.filter_junk_check.setToolTip(
+            "P2-lite: drops media URLs from known ad networks and skips junk "
+            "transitions (search/account/reply forms, post permalinks). "
+            "Precision-first — listing pages (forum.php, index.php) and "
+            "content paths are never blocked. Add domains to junk_allowlist.txt "
+            "next to the app to always keep a host."
+        )
+        junk_layout.addWidget(self.filter_junk_check)
+        filters_layout.addWidget(junk_group)
 
         # Performance tab
         performance_tab = QWidget()
@@ -561,8 +616,14 @@ class SettingsDialog(QDialog):
         self.use_patterns_check.setChecked(
             self.settings.get(K.SETTING_USE_PATTERNS, K.DEFAULT_USE_PATTERNS)
         )
+        js_engine = self.settings.get(K.SETTING_JS_ENGINE, K.DEFAULT_SETTINGS_VALUES.get(K.SETTING_JS_ENGINE, "static"))
+        idx = self.js_engine_combo.findData(js_engine)
+        self.js_engine_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.filter_hidden_links_check.setChecked(
             self.settings.get(K.SETTING_FILTER_HIDDEN_LINKS, K.DEFAULT_FILTER_HIDDEN_LINKS)
+        )
+        self.filter_junk_check.setChecked(
+            self.settings.get(K.SETTING_FILTER_JUNK, True)
         )
         
         # Pattern settings
@@ -582,6 +643,18 @@ class SettingsDialog(QDialog):
         self.min_image_height_spin.setValue(self.settings.get("min_image_height", 100))
         self.min_image_size_spin.setValue(self.settings.get("min_image_size", 40))
         self.min_video_size_spin.setValue(self.settings.get("min_video_size", 1000))
+
+        # Media formats
+        enabled_images = set(self.settings.get(
+            K.SETTING_ENABLED_IMAGE_FORMATS, K.DEFAULT_ENABLED_IMAGE_FORMATS
+        ))
+        for ext, checkbox in self.image_format_checks.items():
+            checkbox.setChecked(ext in enabled_images)
+        enabled_videos = set(self.settings.get(
+            K.SETTING_ENABLED_VIDEO_FORMATS, K.DEFAULT_ENABLED_VIDEO_FORMATS
+        ))
+        for ext, checkbox in self.video_format_checks.items():
+            checkbox.setChecked(ext in enabled_videos)
 
         # Stop words
         stop_words = self.settings.get("stop_words", [])
@@ -623,7 +696,9 @@ class SettingsDialog(QDialog):
         settings[K.SETTING_BYPASS_COOKIE_CONSENT] = self.bypass_cookie_consent_check.isChecked()
         settings[K.SETTING_BYPASS_JS_REDIRECTS] = self.bypass_js_redirects_check.isChecked()
         settings[K.SETTING_USE_PATTERNS] = self.use_patterns_check.isChecked()
+        settings[K.SETTING_JS_ENGINE] = self.js_engine_combo.currentData() or "static"
         settings[K.SETTING_FILTER_HIDDEN_LINKS] = self.filter_hidden_links_check.isChecked()
+        settings[K.SETTING_FILTER_JUNK] = self.filter_junk_check.isChecked()
         settings[K.SETTING_CUSTOM_PATTERN_PATH] = self.custom_pattern_edit.text() if self.custom_pattern_edit.text() else ""
         settings[K.SETTING_IMAGUS_SIEVE_PATH] = self.imagus_sieve_edit.text() if self.imagus_sieve_edit.text() else ""
 
@@ -647,6 +722,12 @@ class SettingsDialog(QDialog):
         settings["downloader_threads"] = self.downloader_threads_spin.value()
         settings["threads_per_file"] = self.threads_per_file_spin.value()
         settings["max_download_speed"] = self.speed_slider.value()
+        settings[K.SETTING_ENABLED_IMAGE_FORMATS] = [
+            ext for ext, checkbox in self.image_format_checks.items() if checkbox.isChecked()
+        ]
+        settings[K.SETTING_ENABLED_VIDEO_FORMATS] = [
+            ext for ext, checkbox in self.video_format_checks.items() if checkbox.isChecked()
+        ]
 
         # HTTP
         settings["user_agent"] = self.user_agent_edit.text()
@@ -699,7 +780,7 @@ class SettingsDialog(QDialog):
         """Clamp all numeric settings to safe ranges and strip dangerous chars from strings."""
         clamps = {
             "search_depth": (0, 10),
-            "page_limit": (1, 10000),
+            "page_limit": (0, 10000),  # 0 = unlimited (matches UI tooltip)
             "page_timeout": (5, 600),
             "timeout": (1, 600),
             "retry_count": (0, 20),
@@ -719,11 +800,50 @@ class SettingsDialog(QDialog):
                     settings[key] = max(lo, min(hi, int(val)))
                 except (TypeError, ValueError):
                     settings[key] = K.DEFAULT_SETTINGS_VALUES.get(key, lo)
-        # Strip CRLF from string headers (prevent header injection)
-        for key in ("user_agent", "accept_language"):
+        # Normalize format allowlists (protect against corrupted settings.json).
+        # NOTE: an empty list is a legitimate user choice ("disable this format class"),
+        # so defaults are applied only when the value is missing or entirely corrupt.
+        for key, default in (
+            (K.SETTING_ENABLED_IMAGE_FORMATS, K.DEFAULT_ENABLED_IMAGE_FORMATS),
+            (K.SETTING_ENABLED_VIDEO_FORMATS, K.DEFAULT_ENABLED_VIDEO_FORMATS),
+            (K.SETTING_ENABLED_AUDIO_FORMATS, K.DEFAULT_ENABLED_AUDIO_FORMATS),
+        ):
+            val = settings.get(key)
+            if val is None or not isinstance(val, list):
+                settings[key] = list(default)
+            else:
+                cleaned = [
+                    str(item).strip().lower() for item in val
+                    if isinstance(item, str) and str(item).strip().lower().startswith(".")
+                ]
+                settings[key] = cleaned if (cleaned or not val) else list(default)
+        # Strip CRLF from string headers/values (prevent header injection).
+        # proxy is included so a crafted settings.json can't smuggle header
+        # lines into the request line / Host header.
+        for key in ("user_agent", "accept_language", "proxy"):
             val = settings.get(key, "")
             if isinstance(val, str):
                 settings[key] = val.replace("\r", "").replace("\n", "")
+        # Normalize stop_words to a list of non-empty stripped strings.
+        # Protects against a corrupted settings.json where stop_words is a
+        # string (iterating chars) or contains non-string items.
+        sw = settings.get("stop_words")
+        if sw is not None:
+            if isinstance(sw, str):
+                sw = [sw]
+            if isinstance(sw, list):
+                cleaned = []
+                seen = set()
+                for item in sw:
+                    if not isinstance(item, str):
+                        continue
+                    w = item.strip()
+                    if w and w.lower() not in seen:
+                        cleaned.append(w)
+                        seen.add(w.lower())
+                settings["stop_words"] = cleaned
+            else:
+                settings["stop_words"] = list(K.DEFAULT_STOP_WORDS)
         return settings
 
     def load_settings(self):

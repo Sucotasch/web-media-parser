@@ -7,8 +7,9 @@ Utility functions for parser module
 
 import re
 import os
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from src import constants as K
+from src.parser import junk_filter
 
 
 def format_proxy_url(proxy_str):
@@ -77,6 +78,48 @@ def is_trash_media(url):
     path = parsed_url.path
     
     return any(path.endswith(ext) for ext in K.TRASH_MEDIA_EXTENSIONS)
+
+
+def is_format_allowed(url, media_type="image", settings=None):
+    """Check if the URL's file extension is in the enabled-format allowlist.
+
+    The allowlist (Settings -> Filters) replaces the historical hard-coded junk
+    formats (GIF/SVG/ICO/CUR). Defaults preserve previous behavior: those
+    formats stay disabled unless the user explicitly enables them.
+
+    Extension-less URLs are classified elsewhere (is_media_url, etc.) and are
+    never blocked here. Unknown media types and non-media extensions (e.g.
+    .html/.js) pass through unchanged — other filters decide on those.
+    """
+    if not url:
+        return True
+    if media_type not in ("image", "video", "audio"):
+        return True
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return True
+    ext = os.path.splitext(path)[1]
+    if not ext:
+        return True
+
+    # Only make a decision for extensions that belong to the media universe;
+    # everything else (page/script extensions) is handled by other filters.
+    media_universe = set(
+        K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS
+        + [".m3u8", ".mpd", ".cur"]
+    )  # .cur is historical trash — in the universe, absent from every allowlist
+    if ext not in media_universe:
+        return True
+
+    cfg = settings or {}
+    if media_type == "video":
+        allowed = cfg.get(K.SETTING_ENABLED_VIDEO_FORMATS, K.DEFAULT_ENABLED_VIDEO_FORMATS)
+    elif media_type == "audio":
+        allowed = cfg.get(K.SETTING_ENABLED_AUDIO_FORMATS, K.DEFAULT_ENABLED_AUDIO_FORMATS)
+    else:
+        allowed = cfg.get(K.SETTING_ENABLED_IMAGE_FORMATS, K.DEFAULT_ENABLED_IMAGE_FORMATS)
+    return ext in (allowed or [])
 
 
 def get_domain(url):
@@ -323,9 +366,20 @@ def is_same_domain(url1, url2):
     return base_domain1 == base_domain2
 
 
+# Tracking query params that never affect content identity — stripped during
+# normalization so the same resource re-encountered with different tracking
+# suffixes deduplicates correctly (avoids _1/_2 duplicates after Resume).
+TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "fbclid", "gclid", "mc_cid", "mc_eid", "igshid",
+})
+
+
 def normalize_url(url):
     """
-    Normalize URL by removing fragments, normalizing path, and lowercase domain.
+    Normalize URL by removing fragments, sorting query parameters, dropping
+    tracking params, lowercasing scheme/domain, and collapsing repeated
+    adjacent path segments.
     Ensures consistency across parser restarts.
     """
     try:
@@ -339,38 +393,125 @@ def normalize_url(url):
         path = parsed.path
         if path.endswith("/") and len(path) > 1:
             path = path[:-1]
+
+        # Collapse runs of 3+ identical adjacent path segments (threads/threads/
+        # threads/x -> threads/x). urljoin of a relative link like "threads/members/..."
+        # against a slug-style base URL without a trailing slash (vBulletin threads/...)
+        # appends the same directory over and over; without this, each re-parse grows
+        # the URL, defeating the processed_urls dedup and causing exponential crawler
+        # loops (34MB logs). Only runs of 3+ are collapsed — a legit doubled directory
+        # (/a/a/b) is preserved because normalize_url also runs on download URLs where
+        # rewriting could point at a path the server never served.
+        segments = path.split("/")
+        collapsed = []
+        i = 0
+        n = len(segments)
+        while i < n:
+            seg = segments[i]
+            if not seg:
+                collapsed.append(seg)
+                i += 1
+                continue
+            j = i + 1
+            while j < n and segments[j] == seg:
+                j += 1
+            run = j - i
+            if run >= 3:
+                collapsed.append(seg)  # collapse the whole run to a single occurrence
+            else:
+                collapsed.extend(segments[i:j])
+            i = j
+        path = "/".join(collapsed)
+        
+        # Sort query params (stable identity) and drop tracking params
+        query = parsed.query
+        if query:
+            try:
+                from urllib.parse import parse_qsl, urlencode
+                pairs = [
+                    (k, v) for k, v in parse_qsl(query, keep_blank_values=True)
+                    if k.lower() not in TRACKING_PARAMS
+                ]
+                query = urlencode(sorted(pairs))
+            except Exception:
+                query = parsed.query
         
         # Reconstruct without fragment
-        normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path, fragment="").geturl()
+        normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path, query=query, fragment="").geturl()
         return normalized
     except Exception:
         return url
 
 
+# Keywords that suggest banners or ads. Matched against URL/attribute
+# *tokens* (segment-aware), not free substrings, to avoid false positives
+# like "ads" inside "downloads" or "media" (see §3.10 / DEV_GUIDE §3).
+_AD_KEYWORDS = (
+    "ads", "advert", "advertisement", "advertising", "adserver", "adservice",
+    "banner", "banners", "promo", "promotion", "promotions",
+    "sponsor", "sponsors", "sponsored",
+    "tracking", "tracker", "trackers", "pixel", "pixels",
+    "analytics", "marketing", "campaign", "campaigns",
+    "popup", "popups", "popover", "popovers",
+    "cta", "ctas", "calltoaction", "call-to-action",
+    # known ad networks / trackers (host-level; high precision)
+    "adsense", "doubleclick", "googlesyndication", "googleadservices",
+    "adnxs", "taboola", "outbrain", "adservice", "adroll", "criteo",
+)
+
+# Tokens are split on any non-word character. A token matches a keyword when
+# it equals it or extends it by a single char (simple plurals: banners, ads,
+# pixels); longer compounds (adsync, downloader) are NOT treated as ads.
+
+def _matches_ad_keyword(token: str) -> bool:
+    token = token.strip().lower()
+    if not token:
+        return False
+    for kw in _AD_KEYWORDS:
+        kw = kw.replace("-", "")
+        tok = token.replace("-", "")
+        if tok == kw:
+            return True
+        # Simple plural (banners, ads, pixels) — the +1 char must be a trailing 's'
+        if len(tok) == len(kw) + 1 and tok.startswith(kw) and tok.endswith("s"):
+            return True
+    return False
+
+
+def _ad_tokens_from_url(url: str) -> list:
+    """Host + path tokens from a URL (segment-aware ad detection)."""
+    try:
+        parsed = urlparse(url.lower())
+        combined = f"{parsed.netloc}/{parsed.path}"
+    except Exception:
+        combined = (url or "").lower()
+    return [t for t in re.split(r"[^\w]+", combined) if t]
+
+
 def is_banner_or_ad(url, attrs):
     """
-    Check if a media file is likely to be a banner or advertisement
+    Check if a media file is likely to be a banner or advertisement.
+
+    URL keywords are matched against host/path tokens (segment-aware), never
+    as free substrings, so "ads" cannot flag "downloads"/"media". P2-lite:
+    also applies the compact ad-network host suffix list + banner-size
+    third-party rule (allowlist-aware).
     """
-    # Keywords that suggest banners or ads (use word boundaries to avoid false positives)
-    ad_keywords = [
-        "ads", "advert", "advertisement",
-        "banner", "promo", "promotion", "sponsor",
-        "tracking", "pixel", "analytics", "marketing", "campaign",
-        "popup", "popover", "cta", "calltoaction", "call-to-action",
-    ]
-
-    url_lower = url.lower()
-
-    # Check URL for ad-related keywords
-    for keyword in ad_keywords:
-        if keyword in url_lower:
-            return True
+    # P2-lite: compact ad-network suffixes + path tokens (allowlist-aware)
+    if junk_filter.is_ad_url(url):
+        return True
+    # Check URL host/path tokens for ad-related keywords
+    if any(_matches_ad_keyword(t) for t in _ad_tokens_from_url(url)):
+        return True
 
     # Check element attributes
     if attrs:
-        # Check for small dimensions (common for ad pixels)
-        width = attrs.get("width", "")
-        height = attrs.get("height", "")
+        # Check for small dimensions (common for ad pixels).
+        # Parser attrs store parsed sizes under "dimensions" (dict);
+        # raw HTML width/height attributes are also accepted for other callers.
+        dims = attrs.get("dimensions") if isinstance(attrs.get("dimensions"), dict) else {}
+        width = dims.get("width", attrs.get("width", ""))
+        height = dims.get("height", attrs.get("height", ""))
 
         try:
             if width and height:
@@ -391,16 +532,12 @@ def is_banner_or_ad(url, attrs):
         except (ValueError, TypeError):
             pass
 
-        # Check for ad-related classes or IDs
-        element_class = attrs.get("class", "")
-        element_id = attrs.get("id", "")
-        element_alt = attrs.get("alt", "")
-
-        for keyword in ad_keywords:
-            if (
-                (isinstance(element_class, str) and keyword in element_class.lower())
-                or (isinstance(element_id, str) and keyword in element_id.lower())
-                or (isinstance(element_alt, str) and keyword in element_alt.lower())
+        # Check for ad-related classes or IDs (token-based, same split as URLs
+        # so "ad-banner" splits into ad|banner and banner matches)
+        for attr_name in ("class", "id", "alt"):
+            attr_val = attrs.get(attr_name, "")
+            if isinstance(attr_val, str) and any(
+                _matches_ad_keyword(t) for t in re.split(r"[^\w]+", attr_val.lower()) if t
             ):
                 return True
 
@@ -473,9 +610,15 @@ def should_skip_crawl_url(url, extra_stop_words=None):
     """Return True if URL should not be queued for HTML parsing.
 
     Uses segment-aware matching (not substring) to avoid false positives
-    like "ad" in "media" or "admin".
+    like "ad" in "media" or "admin". P2-lite: also applies the compact
+    junk-transition rules (universal action forms / account URLs / post
+    permalinks + ad-network hosts). Listing/hub pages (forum.php, index.php)
+    and content paths are deliberately NOT skipped.
     """
     if not url:
+        return True
+    # P2-lite: universal junk transitions + ad hosts (allowlist-aware)
+    if junk_filter.should_skip_junk_url(url):
         return True
     try:
         p = urlparse(url)

@@ -6,7 +6,6 @@ Main window of the application
 """
 
 import os
-import time
 import logging
 import threading
 from datetime import datetime
@@ -29,16 +28,19 @@ from PySide6.QtWidgets import (
     QTableView,
     QHeaderView,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QItemSelectionModel, QTimer, QMetaObject
-from PySide6.QtGui import QIcon, QDesktopServices, QStandardItemModel, QStandardItem, QColor
+from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor
 import asyncio
 from src.gui.settings_dialog import SettingsDialog
 from src.parser.parser_manager import ParserManager
 from src.gui.log_handler import GUILogHandler
 from src.core.task_queue_manager import TaskQueueManager
-from src.core.task_item import TaskStatus
+from src.core.task_item import TaskStatus, TaskItem
 from src.server.http_server import ExtensionServer
 from src.parser.utils import normalize_url, is_media_url
+from src.app_paths import queue_path
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -66,9 +68,10 @@ class MainWindow(QMainWindow):
         self._stats_timer.timeout.connect(self._update_active_task_stats)
         self._stats_timer.start(2000)  # every 2 seconds
 
-        # Set up event loop
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        # Note: no GUI-thread event loop is created here anymore. All async work
+        # runs in ParserManager's own loop (pm.loop) or the extension server's
+        # thread-local loop; the removed run_coroutine helpers were the only
+        # consumers of a MainWindow-level loop.
 
         # Extension API server
         self.extension_server = ExtensionServer()
@@ -466,8 +469,7 @@ class MainWindow(QMainWindow):
 
     def _load_queue_state(self):
         """Load task queue from disk and refresh the table."""
-        queue_path = os.path.join(self.download_dir, "task_queue.json")
-        count = self.task_queue.load(queue_path)
+        count = self.task_queue.load(queue_path())
         if count > 0:
             self.log_handler.info(f"Loaded {count} tasks from queue file")
             self._refresh_task_table()
@@ -587,11 +589,11 @@ class MainWindow(QMainWindow):
         self.update_ui_state(False)
         self.log_handler.info(f"Cleared {count} tasks from queue")
 
-        # Delete task_queue.json
-        queue_path = os.path.join(self.download_dir, "task_queue.json")
+        # Delete task_queue.json (canonical path next to the exe)
+        qpath = queue_path()
         try:
-            if os.path.exists(queue_path):
-                os.remove(queue_path)
+            if os.path.exists(qpath):
+                os.remove(qpath)
                 self.log_handler.info("Deleted task_queue.json")
         except OSError as e:
             self.log_handler.error(f"Error deleting task_queue.json: {e}")
@@ -682,7 +684,6 @@ class MainWindow(QMainWindow):
                         continue
 
                     csv_path = (row.get("Path") or "").strip()
-                    csv_status = (row.get("Status") or "").strip().lower()
 
                     # If original path exists with files — restore as completed
                     if csv_path and os.path.isdir(csv_path) and os.listdir(csv_path):
@@ -732,12 +733,6 @@ class MainWindow(QMainWindow):
                 self.dir_input.setText(last_dir)
             # Apply file logging setting
             self._apply_file_logging()
-
-    async def _load_previous_state(self, state_path: str):
-        """Load previous session state"""
-        if os.path.exists(state_path):
-            await self.parser_manager.load_state(state_path)
-            self.log_handler.info(f"Loaded previous session state from: {state_path}")
 
     def start_parsing(self):
         """Start the selected task from the queue, or auto-select the first queued task."""
@@ -949,10 +944,6 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Task paused")
         self._update_start_button_state()
 
-    def _apply_pause_state(self):
-        """Deprecated, keeping for safety but logic moved to toggle_pause."""
-        pass
-
     def stop_parsing(self):
         """
         Stop the parsing process — hard stop for current task only.
@@ -1088,24 +1079,6 @@ class MainWindow(QMainWindow):
                     self._launch_parser_for_task(next_task)
                     self.status_bar.showMessage(f"Auto-started: {next_task.url}")
 
-    def run_coroutine(self, coroutine):
-        """Run a coroutine in the Qt event loop"""
-        try:
-            future = asyncio.Future()
-            asyncio.create_task(self._run_coroutine(coroutine, future))
-            return future
-        except Exception as e:
-            self.log_handler.error(f"Error running coroutine: {str(e)}")
-            return None
-
-    async def _run_coroutine(self, coroutine, future):
-        """Helper method to run coroutine and set future result"""
-        try:
-            result = await coroutine
-            future.set_result(result)
-        except Exception as e:
-            future.set_exception(e)
-
     def _start_extension_server(self):
         """Start the HTTP API server for browser extension communication."""
         def add_tasks_from_extension(urls, one_shot=False, user_agent="", cookies=""):
@@ -1222,10 +1195,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event — save queue and active task state."""
-        # Always save the queue state
-        queue_path = os.path.join(self.download_dir, "task_queue.json")
+        # Always save the queue state (canonical path next to the exe)
         try:
-            self.task_queue.save(queue_path)
+            self.task_queue.save(queue_path())
         except Exception as e:
             self.log_handler.error(f"Error saving queue state: {e}")
 

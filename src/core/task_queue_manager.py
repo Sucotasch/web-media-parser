@@ -8,15 +8,14 @@ Task queue manager for managing multiple parsing tasks sequentially.
 import os
 import json
 import glob
+import copy
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
+from typing import List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
 from src.core.task_item import TaskItem, TaskStatus
 from src.app_paths import task_state_path
-from src import constants as K
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +72,8 @@ class TaskQueueManager(QObject):
         """
         task = TaskItem(
             url=url,
-            settings=dict(settings),       # shallow copy is enough
-            download_path=download_path,
+            settings=copy.deepcopy(settings),  # deep copy: nested lists (e.g. stop_words)
+            download_path=download_path,       # must not be shared between tasks
             one_shot=one_shot,
         )
         terminal = {TaskStatus.COMPLETED, TaskStatus.STOPPED, TaskStatus.FAILED}

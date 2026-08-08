@@ -7,13 +7,14 @@ Priority URL Queue implementation for intelligent URL processing
 
 import asyncio
 import logging
-from typing import Dict, Any, Tuple, Optional, Set
+from typing import Dict, Any, Tuple
 import re
+from collections import Counter
 from urllib.parse import urlparse
 from heapq import heappush, heappop
 from dataclasses import dataclass, field
 from datetime import datetime
-from src.parser.utils import is_media_url
+from src.parser.utils import is_media_url, normalize_url
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,12 @@ class PriorityURLQueue:
         """
         context = context or {}
         if context.get("interstitial_retry"):
+            return True
+        # Thumbnail transitions (from_image links to fullsize viewer pages) and
+        # direct media URLs are media lookups, never "excavation" — domain
+        # restriction must not apply to them (the sieve fullsize-discovery
+        # chain depends on following external image-host links like imx.to).
+        if context.get("from_image") or is_media_url(url):
             return True
 
         stay_in_domain = self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN)
@@ -413,11 +420,29 @@ class PriorityURLQueue:
         """Add URL to the priority queue with context information.
         bypass_checks: if True, skips priority calculation and relationship checks (used for state restoration).
         """
+        # Guard against pathological URL growth (repeated path segments from
+        # relative-link urljoin, e.g. threads/threads/threads/...). Collapse
+        # duplicates via normalize_url, then drop anything still absurdly long.
+        url = normalize_url(url)
+        try:
+            path_segs = [s for s in urlparse(url).path.split("/") if s]
+            seg_count = len(path_segs)
+        except Exception:
+            path_segs, seg_count = [], 0
+        # A single segment appearing many times is a urljoin-bloat signature
+        # (e.g. threads/members/threads/members/...) even when not adjacent.
+        repeated_seg = False
+        if path_segs:
+            repeated_seg = max(Counter(path_segs).values()) > 3
+        if seg_count > K.MAX_URL_PATH_SEGMENTS or len(url) > K.MAX_URL_LENGTH or repeated_seg:
+            logger.debug(f"Skipping pathological URL (segments={seg_count}, len={len(url)}): {url[:120]}")
+            return
+
         async with self._lock:
             if bypass_checks:
                 # Use a default or provided priority if bypassing
                 priority = context.get('priority', 1.0) if context else 1.0
-                effective_source_url = source_url
+                effective_source_url = normalize_url(source_url) if source_url else source_url
             else:
                 # Make sure we use the most appropriate source URL for downward path enforcement
                 effective_source_url = source_url
@@ -426,7 +451,9 @@ class PriorityURLQueue:
                     # use that for downward path enforcement
                     logger.debug(f"Using start_url from context: {context['start_url']} instead of source_url: {source_url}")
                     effective_source_url = context['start_url']
-                    
+                # Normalize the reference URL too so path comparison in
+                # _is_downward_url sees the same collapsed form as `url`.
+                effective_source_url = normalize_url(effective_source_url) if effective_source_url else effective_source_url
                 priority = self._calculate_url_priority(url, depth, effective_source_url, context)
                 
                 # If priority is zero, the URL didn't pass the relationship check - skip it

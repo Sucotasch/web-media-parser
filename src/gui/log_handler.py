@@ -6,9 +6,7 @@ Custom log handler for GUI with filtering support
 """
 
 import logging
-from datetime import datetime
-from PySide6.QtWidgets import QTextEdit
-from PySide6.QtCore import Qt, QMetaObject, Signal, Slot, QObject
+from PySide6.QtCore import Signal, Slot, QObject
 
 
 class LogFilter:

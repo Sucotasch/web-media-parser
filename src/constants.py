@@ -52,13 +52,33 @@ DEFAULT_BYPASS_COOKIE_CONSENT = True
 DEFAULT_BYPASS_JS_REDIRECTS = True
 DEFAULT_USE_PATTERNS = True     # For SitePatternManager
 
-# Stop words for URL filtering (example, can be expanded)
+# Stop words for URL filtering — matched against PATH SEGMENTS (segment-aware),
+# never as free substrings (so "ad" can't kill "media"/"admin"). Plain words
+# only: underscored variants (about_us, privacy_policy) never match real segments.
 DEFAULT_STOP_WORDS = [
-    "login", "register", "cart", "checkout", "about_us", "contact", "privacy_policy", "terms_of_service", "careers"
+    "login", "register", "cart", "checkout", "about", "contact", "privacy", "terms", "careers"
 ]
 
 # Crawl limits
 DEFAULT_MAX_LINKS_PER_PAGE = 200  # Cap links per page to prevent queue explosion on menu-heavy pages
+
+# Guards against pathological URL growth (e.g. urljoin of relative vBulletin
+# "threads/..." links on a base URL without a trailing slash appends the same
+# segment forever: threads/threads/threads/...). URLs beyond these bounds are
+# dropped by PriorityURLQueue.put() before they can flood the queue.
+MAX_URL_PATH_SEGMENTS = 50   # Max path segments a queued URL may have
+MAX_URL_LENGTH = 2000        # Max total length of a queued URL
+
+# Fullsize discovery via the sieve link->url->res chain (mirrors the
+# extension's discoverFullsize). Applied to thumbnail-transition links
+# (from_image) on every parsed page so external image hosts (imx.to, postimg,
+# ...) resolve to fullsize originals instead of being dropped by domain checks.
+# Media lookups are never content-capped (a 500-image gallery resolves all
+# 500); the guards are RESOURCE-based only: per-probe timeout, concurrency,
+# and a total time budget per source page so a dead host can't stall a worker.
+FULLSIZE_DISCOVER_CONCURRENCY = 5   # Concurrent probes (extension uses 5)
+FULLSIZE_DISCOVER_TIMEOUT = 8       # Seconds per probe (extension uses 8000ms)
+FULLSIZE_DISCOVER_TIME_BUDGET = 45  # Max total probe time per source page
 
 # Gateway & Visibility Filtering
 DEFAULT_FILTER_HIDDEN_LINKS = True
@@ -86,9 +106,13 @@ GATEWAY_TEXT_PATTERNS = [
     "подтверждаю возраст", "принимаю условия"
 ]
 GATEWAY_OVERLAY_SELECTORS = [
-    ".age-gate", ".age-warning", "#consent-modal", ".overlay-consent", 
-    ".popup-wrapper", "#agreement", ".modal-content", "#disclaimer",
-    ".agreement-overlay", ".overlay-wrapper"
+    ".age-gate", ".age-warning", "#consent-modal", ".overlay-consent",
+    ".popup-wrapper", "#agreement", ".agreement-overlay", ".overlay-wrapper"
+]
+# Generic modal/footer selectors that exist on many ordinary sites — only
+# treated as gateway evidence when combined with consent/age text (WP-5.3).
+GATEWAY_GENERIC_OVERLAY_SELECTORS = [
+    ".modal-content", "#disclaimer"
 ]
 
 # Patterns for 'noise' media that shouldn't be counted as main content
@@ -109,6 +133,11 @@ THUMBNAIL_URL_HINTS = [
     "/small/", "/s/", "/preview/", "/lqip/", "w=150", "w=200",
 ]
 SIGNIFICANT_MEDIA_MIN_DIMENSION = 100 # Minimum width/height if specified in HTML
+
+# Minimum dimension (px) for a <link rel=icon/apple-touch-icon> to be kept;
+# smaller sizes (57..152 family that vBulletin emits as a dozen <link> tags)
+# are dropped at parse time instead of reaching the download queue.
+APPLE_TOUCH_ICON_MIN_DIM = 180
 
 # Session state filename
 SESSION_STATE_FILENAME = "last_session.pkl"
@@ -171,15 +200,23 @@ SETTING_STAY_IN_DOMAIN = "stay_in_domain"
 SETTING_USE_PATTERNS = "use_patterns"
 SETTING_CUSTOM_PATTERN_PATH = "custom_pattern_path"
 SETTING_IMAGUS_SIEVE_PATH = "imagus_sieve_path"
+# JS engine for Imagus sieve JS rules ("static" = Python converter only,
+# "deno" = execute JS rules via a Deno subprocess worker). Default stays
+# "static" so behaviour is unchanged until the user opts in.
+SETTING_JS_ENGINE = "js_engine"
 SETTING_PROCESS_JS = "process_js"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
 SETTING_FILTER_HIDDEN_LINKS = "filter_hidden_links"
+SETTING_FILTER_JUNK = "filter_junk"  # P2-lite ad/tracker/junk URL classifier
 SETTING_STOP_WORDS = "stop_words"
 
 # Filter settings keys
 SETTING_MAX_DOWNLOAD_SPEED = "max_download_speed" # in KB/s, 0 for unlimited
 SETTING_PAGE_TIMEOUT = "page_timeout" # Timeout for page loading/parsing
+SETTING_ENABLED_IMAGE_FORMATS = "enabled_image_formats"
+SETTING_ENABLED_VIDEO_FORMATS = "enabled_video_formats"
+SETTING_ENABLED_AUDIO_FORMATS = "enabled_audio_formats"
 
 # Default settings dictionary structure (used by SettingsDialog to save/load)
 DEFAULT_SETTINGS_VALUES = {
@@ -200,13 +237,18 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_USE_PATTERNS: DEFAULT_USE_PATTERNS,
     SETTING_CUSTOM_PATTERN_PATH: "",
     SETTING_IMAGUS_SIEVE_PATH: "",
+    SETTING_JS_ENGINE: "static",
     SETTING_PROCESS_JS: DEFAULT_PROCESS_JS,
     # SETTING_PROCESS_DYNAMIC: DEFAULT_PROCESS_DYNAMIC, # Removed
     SETTING_BYPASS_COOKIE_CONSENT: DEFAULT_BYPASS_COOKIE_CONSENT,
     SETTING_BYPASS_JS_REDIRECTS: DEFAULT_BYPASS_JS_REDIRECTS,
+    SETTING_FILTER_JUNK: True,  # P2-lite junk classifier (precision-first + allowlist)
     SETTING_STOP_WORDS: DEFAULT_STOP_WORDS,
     SETTING_MAX_DOWNLOAD_SPEED: 0, # KB/s
     SETTING_PAGE_TIMEOUT: DEFAULT_PAGE_TIMEOUT,
+    # NOTE: SETTING_ENABLED_*_FORMATS defaults are injected below via
+    # DEFAULT_SETTINGS_VALUES.update() because the format lists are defined
+    # after this dict in the file.
 }
 
 # Parser Error Statuses
@@ -251,6 +293,20 @@ AUDIO_EXTENSIONS = [
 
 # Trash Media Extensions - Should be skipped for downloading but followed as triggers/links
 TRASH_MEDIA_EXTENSIONS = [".gif", ".ico", ".svg", ".cur"]
+
+# Enabled-format allowlists (Settings -> Filters). Users may enable formats that
+# are disabled by default (GIF/SVG/ICO/CUR are almost always decorative junk).
+# Defaults preserve historical behavior: those formats stay disabled.
+DEFAULT_ENABLED_IMAGE_FORMATS = [
+    ".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tiff",
+]
+DEFAULT_ENABLED_VIDEO_FORMATS = list(VIDEO_EXTENSIONS) + [".m3u8", ".mpd"]  # + streaming manifests
+DEFAULT_ENABLED_AUDIO_FORMATS = list(AUDIO_EXTENSIONS)
+
+# Inject format-allowlist defaults now that the lists are defined.
+DEFAULT_SETTINGS_VALUES[SETTING_ENABLED_IMAGE_FORMATS] = DEFAULT_ENABLED_IMAGE_FORMATS
+DEFAULT_SETTINGS_VALUES[SETTING_ENABLED_VIDEO_FORMATS] = DEFAULT_ENABLED_VIDEO_FORMATS
+DEFAULT_SETTINGS_VALUES[SETTING_ENABLED_AUDIO_FORMATS] = DEFAULT_ENABLED_AUDIO_FORMATS
 
 KNOWN_FILE_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS + AUDIO_EXTENSIONS + [
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", 

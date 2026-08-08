@@ -8,12 +8,10 @@ JSON parser for extracting media files from JSON APIs
 import re
 import json
 import logging
-import asyncio
 from typing import Dict, Any, List, Tuple, Optional, Set
 from urllib.parse import urlparse, urljoin
 
-from src.parser.webpage_parser import WebpageParser, HAS_BROTLI
-from src.parser.utils import is_image_url, is_media_url, normalize_url, is_trash_media, format_proxy_url
+from src.parser.utils import is_image_url, is_media_url, format_proxy_url, is_format_allowed
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -165,15 +163,14 @@ class JSONWebpageParser:
             if self._looks_like_url(value):
                 # Make absolute URL
                 abs_url = urljoin(self.url, value)
-                # Determine media type
-                if is_trash_media(abs_url):
-                    # Skip trash media but keep as link
+                # Determine media type (used to pick the right format allowlist)
+                media_type = self._guess_media_type(abs_url)
+                if not is_format_allowed(abs_url, media_type, self.settings):
+                    # Disabled format (e.g. GIF/SVG by default) — keep as link
                     self.links.add(abs_url)
                 elif is_image_url(abs_url):
                     self.media_files.append(("image", abs_url, {"source": f"json-{path}", "path": path}))
                 elif is_media_url(abs_url):
-                    # Try to determine media type from URL
-                    media_type = self._guess_media_type(abs_url)
                     self.media_files.append((media_type, abs_url, {"source": f"json-{path}", "path": path}))
                 else:
                     # Add as link for further processing
@@ -191,8 +188,8 @@ class JSONWebpageParser:
                     url_value = item["url"]
                     if isinstance(url_value, str) and self._looks_like_url(url_value):
                         abs_url = urljoin(self.url, url_value)
-                        if is_media_url(abs_url) and not is_trash_media(abs_url):
-                            media_type = self._guess_media_type(abs_url)
+                        media_type = self._guess_media_type(abs_url)
+                        if is_media_url(abs_url) and is_format_allowed(abs_url, media_type, self.settings):
                             attrs = {k: v for k, v in item.items() if k != "url"}
                             attrs["source"] = f"json-{path}"
                             attrs["path"] = path
@@ -270,9 +267,11 @@ class JSONWebpageParser:
         # Check for known video platforms from constants
         if any(platform in url_lower for platform in K.VIDEO_PLATFORM_INDICATORS):
             return "video"
-            
-        # Default to generic file
-        return "file"
+
+        # Unknown extension but is_media_url matched (CDN path, media query…):
+        # most such URLs are images; parser_manager stats/filenames only know
+        # image/video, and "file" fell through to a wrong .mp4 default name.
+        return "image"
 
     def get_media_files(self) -> List[Tuple[str, str, Dict[str, Any]]]:
         """

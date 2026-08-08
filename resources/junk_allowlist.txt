@@ -1,0 +1,14 @@
+# Junk-filter allowlist (P2-lite)
+#
+# Domains listed here are NEVER classified as ads/trackers/junk, no matter
+# what the filter rules say. Add a host here if you deliberately scrape a
+# site whose content is served from an "ad-looking" subdomain or CDN.
+#
+# One domain per line. Leading dots are ignored (both example.com and
+# .example.com match the domain and all its subdomains).
+#
+# Example:
+#   myadserver.example-gallery.com
+#
+# The file lives next to the app executable (junk_allowlist.txt). Editing it
+# takes effect on the next parse run — no restart needed.

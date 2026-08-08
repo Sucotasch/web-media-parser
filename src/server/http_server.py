@@ -8,10 +8,9 @@ Runs on localhost:19876 (configurable). Accepts JSON commands from
 the browser extension to add tasks to the queue and report status.
 """
 
-import json
 import logging
 import threading
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable
 
 from aiohttp import web
 
@@ -60,15 +59,31 @@ class ExtensionServer:
             await self._runner.cleanup()
         logger.info("Extension API server stopped")
 
-    def _cors_headers(self):
-        return {
-            "Access-Control-Allow-Origin": "*",
+    def _is_trusted_origin(self, request) -> bool:
+        """Browser-originated requests must come from the Chrome extension.
+
+        Requests without an Origin header (curl, scripts, tests) are treated as
+        local clients and allowed. This blocks CSRF from arbitrary web pages,
+        which previously could POST /api/tasks because CORS was `*`.
+        """
+        origin = request.headers.get("Origin", "")
+        if not origin:
+            return True
+        return origin.startswith("chrome-extension://")
+
+    def _cors_headers(self, request=None):
+        origin = request.headers.get("Origin", "") if request is not None else ""
+        headers = {
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type",
         }
+        # Echo the extension origin instead of `*` so browser responses stay readable
+        if origin.startswith("chrome-extension://"):
+            headers["Access-Control-Allow-Origin"] = origin
+        return headers
 
     async def _handle_cors(self, request):
-        return web.Response(status=204, headers=self._cors_headers())
+        return web.Response(status=204, headers=self._cors_headers(request))
 
     async def _handle_status(self, request):
         """GET /api/status — returns current parsing status."""
@@ -79,7 +94,7 @@ class ExtensionServer:
             except Exception as e:
                 logger.error(f"Error getting status: {e}")
                 status = {"error": str(e)}
-        return web.json_response(status, headers=self._cors_headers())
+        return web.json_response(status, headers=self._cors_headers(request))
 
     async def _handle_queue(self, request):
         """GET /api/queue — returns current task queue."""
@@ -90,7 +105,7 @@ class ExtensionServer:
             except Exception as e:
                 logger.error(f"Error getting queue: {e}")
                 status = {"error": str(e)}
-        return web.json_response(status, headers=self._cors_headers())
+        return web.json_response(status, headers=self._cors_headers(request))
 
     async def _handle_add_tasks(self, request):
         """POST /api/tasks — add media URLs to the queue.
@@ -105,10 +120,14 @@ class ExtensionServer:
             "settings": {}  // optional override
         }
         """
+        if not self._is_trusted_origin(request):
+            logger.warning(f"Rejected cross-origin request from {request.headers.get('Origin', '')}")
+            return web.Response(status=403, text="Forbidden", headers=self._cors_headers(request))
+
         try:
             body = await request.json()
         except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400, headers=self._cors_headers())
+            return web.json_response({"error": "Invalid JSON"}, status=400, headers=self._cors_headers(request))
 
         urls = body.get("urls", [])
         one_shot = body.get("one_shot", False)
@@ -116,14 +135,14 @@ class ExtensionServer:
         cookies = body.get("cookies", "")
 
         if not urls:
-            return web.json_response({"error": "No URLs provided"}, status=400, headers=self._cors_headers())
+            return web.json_response({"error": "No URLs provided"}, status=400, headers=self._cors_headers(request))
 
         if self.add_tasks_callback:
             try:
                 result = self.add_tasks_callback(urls, one_shot, user_agent=user_agent, cookies=cookies)
-                return web.json_response({"ok": True, "added": len(urls), **(result or {})}, headers=self._cors_headers())
+                return web.json_response({"ok": True, "added": len(urls), **(result or {})}, headers=self._cors_headers(request))
             except Exception as e:
                 logger.error(f"Error adding tasks from extension: {e}")
-                return web.json_response({"error": str(e)}, status=500, headers=self._cors_headers())
+                return web.json_response({"error": str(e)}, status=500, headers=self._cors_headers(request))
 
-        return web.json_response({"error": "No callback registered"}, status=503, headers=self._cors_headers())
+        return web.json_response({"error": "No callback registered"}, status=503, headers=self._cors_headers(request))

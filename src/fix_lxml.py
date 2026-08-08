@@ -5,7 +5,6 @@
 Fix for lxml.html.clean issue in requests-html
 """
 
-import sys
 import importlib.util
 
 # Предотвращаем ошибку lxml.html.clean

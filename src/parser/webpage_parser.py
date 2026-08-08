@@ -6,27 +6,23 @@ Webpage parser class for extracting media files and links from webpages
 """
 
 import re
-import os
-import time
 import json
 import asyncio
 import logging
-import mimetypes
 import yarl
-from typing import Set, List, Tuple, Dict, Any, Optional, Union
+from typing import List, Tuple, Dict, Any, Optional
 from urllib.parse import urlparse, urljoin 
 
-import filetype 
 try:
-    import brotli 
+    import brotli  # noqa: F401 — side-effect import; aiohttp needs it to decode br
     HAS_BROTLI = True 
 except ImportError:
     HAS_BROTLI = False
 
 from src.parser.utils import (
-    is_image_url, is_media_url, is_valid_url, get_domain, 
-    is_same_domain, normalize_url, is_trash_media, format_proxy_url,
-    is_banner_or_ad
+    is_image_url, is_media_url, get_domain,
+    normalize_url, is_trash_media, format_proxy_url,
+    is_banner_or_ad, is_format_allowed, is_same_domain
 )
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K 
@@ -166,8 +162,18 @@ class WebpageParser:
                 async with self.session.get(self.url, headers=request_specific_headers, cookies=cookies, timeout=request_timeout_config, proxy=proxy_url) as response:
                     http_status = response.status
                     if http_status == 429:
-                        # Rate limited — backoff and retry
-                        retry_after = int(response.headers.get("Retry-After", 5))
+                        # Rate limited — backoff and retry.
+                        # Retry-After may be seconds or an HTTP-date (RFC 7231).
+                        raw_retry_after = response.headers.get("Retry-After", "5")
+                        try:
+                            retry_after = max(0, int(raw_retry_after))
+                        except ValueError:
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                from datetime import datetime, timezone
+                                retry_after = max(0, int((parsedate_to_datetime(raw_retry_after) - datetime.now(timezone.utc)).total_seconds()))
+                            except Exception:
+                                retry_after = 5
                         logger.warning(f"HTTP 429 Rate limited for {self.url}, retry after {retry_after}s")
                         if attempt < max_retries:
                             await asyncio.sleep(retry_after)
@@ -185,6 +191,16 @@ class WebpageParser:
                         if attempt < max_retries: continue
                         return None, K.PARSER_HTTP_ERROR_5XX, msg, http_status
                     
+                    # Binary media guard: if a "webpage" actually answers with an
+                    # image/video/audio payload (photo hosts 302 image URLs to a
+                    # CDN), do NOT read megabytes + run lxml/JS analysis on it —
+                    # that hangs the parser (observed: imx.to JPEG shell) and
+                    # blocks the domain semaphore. Report a clean empty parse.
+                    resp_ct = (response.headers.get("Content-Type") or "").lower()
+                    if resp_ct.startswith(("image/", "video/", "audio/")):
+                        logger.debug(f"Binary media content ({resp_ct}) for {self.url} — skipping HTML parse")
+                        return "", K.PARSER_SUCCESS, "Binary media content, not HTML", http_status
+
                     content_bytes = await response.read()
                     break # Success with aiohttp
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -204,7 +220,10 @@ class WebpageParser:
                 loop = asyncio.get_event_loop()
                 
                 # Capture headers to pass into the synchronous call
-                fb_headers = {"User-Agent": K.DEFAULT_USER_AGENT}
+                # Use the configured UA — request headers override the session's
+                # defaults, so a hardcoded default would silently replace the
+                # user's custom User-Agent.
+                fb_headers = {"User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT)}
                 if request_specific_headers.get("Referer"):
                     fb_headers["Referer"] = request_specific_headers["Referer"]
                 
@@ -505,6 +524,9 @@ class WebpageParser:
                     # Create a copy of attrs for each variant to avoid shared state mutations
                     variant_attrs = attrs.copy()
                     variant_attrs["is_cdn"] = self._is_cdn_url(abs_url, "img")
+                    # Soft thumbnail hint — marks attrs for priority (deprioritize), never hard-filter
+                    if any(h in abs_url.lower() for h in K.THUMBNAIL_URL_HINTS):
+                        variant_attrs["likely_thumbnail"] = True
                     
                     # 2. Extract media only if significant (not trash)
                     significant = self._is_significant_media("image", abs_url, variant_attrs)
@@ -512,12 +534,12 @@ class WebpageParser:
 
                     if is_interstitial_retry and not significant:
                         # Loosen rules for interstitial recovery, but still filter trash
-                        if not is_trash_media(abs_url) and not any(p in abs_url.lower() for p in K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS):
+                        if is_format_allowed(abs_url, "image", self.settings) and not any(p in abs_url.lower() for p in K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS):
                              logger.debug(f"Loosening significance rules for interstitial recovery: {abs_url}")
                              significant = True
 
                     has_parent_webpage_link = False
-                    if significant and not is_trash_media(abs_url):
+                    if significant and is_format_allowed(abs_url, "image", self.settings):
                         # Check if this thumbnail has a parent <a> link to a webpage
                         # If so, skip the thumbnail — the linked page will be crawled for fullsize
                         is_interstitial_retry = self.context.get("interstitial_retry", False)
@@ -528,10 +550,16 @@ class WebpageParser:
                             link_abs_url = urljoin(self.url, link_url)
                             if link_abs_url.startswith(("http://", "https://")) and link_abs_url != abs_url:
                                 if not is_image_url(link_abs_url) and not is_trash_media(link_abs_url):
-                                    has_parent_webpage_link = True
-                                    # Add the linked page for crawling
-                                    if not is_interstitial_retry or link_abs_url != self.url:
-                                        self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 15.0}
+                                    # Only defer to the linked page when it is on the SAME domain.
+                                    # With stay_in_domain, an external parent link (e.g.
+                                    # imx.to/i/... hosting thumbnails on image.imx.to) would be
+                                    # dropped by the out-of-domain filter later — the thumbnail
+                                    # would be lost entirely. In that case keep the thumbnail.
+                                    if is_same_domain(link_abs_url, self.url):
+                                        has_parent_webpage_link = True
+                                        # Add the linked page for crawling
+                                        if not is_interstitial_retry or link_abs_url != self.url:
+                                            self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 15.0}
 
                         if not has_parent_webpage_link:
                             self.media_files.append(("image", abs_url, variant_attrs))
@@ -552,14 +580,14 @@ class WebpageParser:
                                 continue
 
                             if is_image_url(link_abs_url):
-                                if not is_trash_media(link_abs_url):
+                                if is_format_allowed(link_abs_url, "image", self.settings):
                                     link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
                                     if self._is_significant_media("image", link_abs_url, link_attrs):
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
                                 else:
                                     self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
                             elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
-                                if not is_trash_media(link_abs_url):
+                                if is_format_allowed(link_abs_url, "image", self.settings):
                                     link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
                                     if self._is_significant_media("image", link_abs_url, link_attrs):
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
@@ -582,12 +610,22 @@ class WebpageParser:
                 abs_url = urljoin(self.url, href)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"rel": link_tag.get("rel", []), "sizes": link_tag.get("sizes", ""), "type": link_tag.get("type", "")}
-                    # Filter small favicons (16x16, 32x32) but allow larger apple-touch-icons
-                    sizes = str(attrs.get("sizes", ""))
-                    is_small_icon = "apple-touch-icon" not in str(attrs.get("rel", [])) and (
-                        "16x16" in sizes or "32x32" in sizes or "48x48" in sizes or not sizes
-                    )
-                    if not is_small_icon or self._is_significant_media("image", abs_url, attrs):
+                    # Icons are never page content. Two independent gates:
+                    # (1) numeric sizes — drop the 57..152 family that vBulletin
+                    # emits as a dozen separate <link> tags (observed: 12 favicon
+                    # failures per page in the download queue); (2) full
+                    # significance filter — drops "apple-touch-icon"/"icon"-
+                    # named URLs even at 180x180+. A large icon whose URL is not
+                    # icon-named (e.g. /logo.png) still has to pass both.
+                    sizes = str(attrs.get("sizes", "")).strip().lower()
+                    max_dim = 0
+                    for dim in re.findall(r"(\d+)x(\d+)", sizes):
+                        try:
+                            max_dim = max(max_dim, int(dim[0]), int(dim[1]))
+                        except ValueError:
+                            pass
+                    is_small_icon = max_dim < K.APPLE_TOUCH_ICON_MIN_DIM if max_dim else True
+                    if not is_small_icon and self._is_significant_media("image", abs_url, attrs):
                         self.media_files.append(("image", abs_url, attrs)); found += 1
         
         for meta_tag in soup.find_all("meta", property=re.compile(r"og:image|twitter:image")):
@@ -613,7 +651,12 @@ class WebpageParser:
                 url = source_data["url"]; abs_url = urljoin(self.url, url)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"width": video_tag.get("width", ""), "height": video_tag.get("height", ""), "poster": video_tag.get("poster", ""), "type": source_data["type"], "is_cdn": self._is_cdn_url(abs_url, "video")}
-                    self.media_files.append(("video", abs_url, attrs)); found += 1
+                    # WP-2.3: direct video files go through the full significance filter
+                    # (blocks tiny/ad players); embeds are handled separately below to
+                    # avoid the image-oriented SIGNIFICANT_MEDIA_IGNORE_PATTERNS
+                    # (e.g. "youtube") dropping legit platform embeds.
+                    if self._is_significant_media("video", abs_url, attrs):
+                        self.media_files.append(("video", abs_url, attrs)); found += 1
 
         for iframe_tag in soup.find_all("iframe"):
             src = iframe_tag.get("src", "") or iframe_tag.get("data-src", "") 
@@ -623,7 +666,10 @@ class WebpageParser:
                     platform = self._get_video_platform(abs_url)
                     if platform:
                         attrs = {"width": iframe_tag.get("width", ""), "height": iframe_tag.get("height", ""), "platform": platform, "type": "embed"}
-                        self.media_files.append(("video", abs_url, attrs)); found += 1
+                        # Embeds: format + ad/tracker URL check only — full significance
+                        # would drop youtube/vimeo embeds via SIGNIFICANT_MEDIA_IGNORE_PATTERNS.
+                        if is_format_allowed(abs_url, "video", self.settings) and not is_banner_or_ad(abs_url, attrs):
+                            self.media_files.append(("video", abs_url, attrs)); found += 1
         
         for meta_tag in soup.find_all("meta", property=re.compile(r"og:video|twitter:player")):
             content = meta_tag.get("content")
@@ -631,7 +677,8 @@ class WebpageParser:
                 abs_url = urljoin(self.url, content)
                 if abs_url.startswith(("http://", "https://")):
                     attrs = {"property": meta_tag.get("property", ""), "source": "meta", "platform": self._get_video_platform(abs_url)}
-                    self.media_files.append(("video", abs_url, attrs)); found += 1
+                    if is_format_allowed(abs_url, "video", self.settings) and not is_banner_or_ad(abs_url, attrs):
+                        self.media_files.append(("video", abs_url, attrs)); found += 1
         logger.info(f"Found {found} videos on {self.url}")
 
     async def _extract_links(self, soup: BeautifulSoup) -> None: 
@@ -711,6 +758,13 @@ class WebpageParser:
         if found:
             logger.info(f"Found {found} media URLs from JSON-LD on {self.url}")
 
+    def _select_one_safe(self, soup, selector: str):
+        """soup.select_one() that never raises on malformed CSS selectors."""
+        try:
+            return soup.select_one(selector)
+        except Exception:
+            return None
+
     def _is_element_visible(self, element: Any) -> bool:
         """Heuristic to check if an element is hidden via CSS (honeypot/bot-trap)"""
         hidden_keywords = K.VISIBILITY_HIDDEN_KEYWORDS
@@ -744,8 +798,8 @@ class WebpageParser:
 
     def _is_significant_media(self, media_type: str, url: str, attrs: Dict[str, Any]) -> bool:
         """Heuristic to filter out icons, avatars, and UI elements"""
-        # 1. Filter by extension (centralized)
-        if is_trash_media(url):
+        # 1. Filter by extension (centralized, settings-driven format allowlist)
+        if not is_format_allowed(url, media_type, self.settings):
             return False
             
         url_lower = url.lower()
@@ -754,19 +808,30 @@ class WebpageParser:
         if is_banner_or_ad(url, attrs):
             return False
             
-        # 3. Filter by common noise patterns in URL
-        ignore_patterns = K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS
-        if any(p in url_lower for p in ignore_patterns):
-            return False
-            
-        # 4. Filter by explicit dimensions if present in HTML
-        try:
-            width = int(attrs.get("width", 1000))
-            height = int(attrs.get("height", 1000))
-            if width < K.SIGNIFICANT_MEDIA_MIN_DIMENSION or height < K.SIGNIFICANT_MEDIA_MIN_DIMENSION:
+        # 3. Filter by common noise patterns in URL. These are IMAGE-oriented
+        # (icons/social/trackers); direct video file paths must not be dropped
+        # by them (e.g. "load-movie.mp4" contains "ad-"). Video noise is
+        # handled by is_banner_or_ad + dimensions; embeds are filtered in
+        # _extract_videos separately.
+        if media_type != "video":
+            ignore_patterns = K.SIGNIFICANT_MEDIA_IGNORE_PATTERNS
+            if any(p in url_lower for p in ignore_patterns):
                 return False
-        except (ValueError, TypeError):
-            pass
+            
+        # 4. Filter by explicit dimensions if present in HTML.
+        # _get_best_image_url stores parsed width/height under attrs["dimensions"]
+        # (a dict), while the <picture> path passes a raw width attribute at the
+        # top level. Support both so the min-dimension filter stays alive for
+        # every caller (mirrors is_banner_or_ad).
+        dims = attrs.get("dimensions") if isinstance(attrs.get("dimensions"), dict) else {}
+        width = dims.get("width", attrs.get("width", 0))
+        height = dims.get("height", attrs.get("height", 0))
+        if width or height:
+            try:
+                if 0 < int(width) < K.SIGNIFICANT_MEDIA_MIN_DIMENSION or 0 < int(height) < K.SIGNIFICANT_MEDIA_MIN_DIMENSION:
+                    return False
+            except (ValueError, TypeError):
+                pass
             
         return True
 
@@ -776,12 +841,29 @@ class WebpageParser:
         # A page is suspicious if it has < 5 images AND contains gateway keywords or overlays
         
         text_content = soup.get_text().lower()
-        overlay_keywords = [
-            "confirm your age", "18 years old", "adult content", "войти", "подтвердите", "18 лет",
-            "proceed", "leave", "enter", "over 18", "agree", "confirm", "i agree"
-        ]
-        is_suspicious = len(self.media_files) < 5 or any(kw in text_content for kw in overlay_keywords)
-        
+
+        # WP-5.3 gateway suspicion: require an unambiguous overlay element or an
+        # age phrase. Generic modal/footer selectors (.modal-content, #disclaimer)
+        # appear on many ordinary sites, so they only count when consent text is
+        # present. Bare consent words alone trigger only when media is absent.
+        has_overlay = any(self._select_one_safe(soup, sel) for sel in K.GATEWAY_OVERLAY_SELECTORS)
+        has_generic_overlay = any(
+            self._select_one_safe(soup, sel) for sel in K.GATEWAY_GENERIC_OVERLAY_SELECTORS
+        )
+        has_age_phrase = any(kw in text_content for kw in (
+            "confirm your age", "18 years", "over 18", "adult content",
+            "мне есть 18", "старше 18", "вход только",
+        ))
+        consent_phrase = any(kw in text_content for kw in (
+            "i agree", "cookie", "согласен", "accept", "agree"
+        ))
+        is_suspicious = (
+            has_overlay
+            or has_age_phrase
+            or (has_generic_overlay and consent_phrase)
+            or (len(self.media_files) < K.GATEWAY_MIN_MEDIA_THRESHOLD and consent_phrase)
+        )
+
         if not is_suspicious:
             return None
             

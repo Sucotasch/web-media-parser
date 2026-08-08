@@ -7,13 +7,16 @@ Shared asynchronous HTTP client session manager
 
 import aiohttp
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+from src import constants as K
 
 logger = logging.getLogger(__name__)
 
-# Try to import brotli for content-encoding support
+# Try to import brotli for content-encoding support.
+# noqa below: side-effect import — aiohttp needs the module present to decode br.
 try:
-    import brotli
+    import brotli  # noqa: F401
     HAS_BROTLI = True
     logger.info("Brotli support detected.")
 except ImportError:
@@ -51,10 +54,13 @@ class AsyncClientManager:
         """
         self.settings = settings
         self._session: Optional[aiohttp.ClientSession] = None
+        # Align defaults with src/constants.py (page_timeout, connect, sock_read)
+        # instead of local hard-coded values that drifted from the settings keys.
+        page_timeout = self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT)
         self._timeout_config = aiohttp.ClientTimeout(
-            total=self.settings.get("page_timeout", 60),
-            connect=self.settings.get("connect_timeout", 20), # Default connect timeout
-            sock_read=self.settings.get("sock_read_timeout", self.settings.get("page_timeout", 60)) # Default socket read timeout
+            total=page_timeout,
+            connect=self.settings.get("connect_timeout", K.DEFAULT_CONNECT_TIMEOUT),
+            sock_read=self.settings.get("sock_read_timeout", K.DEFAULT_SOCK_READ_TIMEOUT)
         )
 
     def _get_default_headers(self) -> Dict[str, str]:
@@ -94,27 +100,11 @@ class AsyncClientManager:
         """
         if self._session is None or self._session.closed:
             logger.info("Creating new aiohttp.ClientSession.")
-            # Define connector arguments based on Brotli support
-            connector_args = {}
-            if HAS_BROTLI:
-                # aiohttp typically handles brotli automatically if installed and ClientSession is created without specific connector.
-                # However, explicitly using TCPConnector with ssl=False if needed for specific environments.
-                # For general cases, aiohttp's default connector is usually fine.
-                # If issues arise with SSL verification on some sites:
-                # connector = aiohttp.TCPConnector(ssl=False)
-                # self._session = aiohttp.ClientSession(connector=connector, ...)
-                pass # aiohttp handles brotli by default if available
-
-            # Create session with or without explicit TCPConnector for brotli
-            # Let aiohttp handle brotli by default.
-            # If specific SSL handling is needed (e.g. self-signed certs on local dev),
-            # a custom TCPConnector can be passed:
-            # connector = aiohttp.TCPConnector(ssl=False) # Example: disable SSL verification
-            # self._session = aiohttp.ClientSession(connector=connector, ...)
+            # aiohttp handles brotli automatically when installed; no custom
+            # connector is needed (removed dead connector_args branch).
             self._session = aiohttp.ClientSession(
                 timeout=self._timeout_config,
                 headers=self._get_default_headers(),
-                # connector_owner=False # If passing a shared connector
             )
             logger.info(f"New aiohttp.ClientSession created. Brotli enabled in session: {HAS_BROTLI and self._session.headers.get('Accept-Encoding','').lower().startswith('gzip, deflate, br')}")
         return self._session
@@ -142,4 +132,3 @@ class AsyncClientManager:
         """
         await self.close()
 
-from typing import Optional # Add this if not already present at the top

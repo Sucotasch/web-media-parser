@@ -16,8 +16,8 @@ import logging
 import hashlib
 
 import aiofiles
+import aiohttp
 import threading
-import traceback
 from typing import Dict, Any, Set, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 
@@ -36,11 +36,14 @@ from src.parser.utils import (
     is_webpage_url,
     is_same_domain,
     normalize_url,
+    format_proxy_url,
+    is_format_allowed,
     should_skip_crawl_url,
     # is_image_url, # Not used directly
     # is_video_url # Not used directly
 )
 from src.parser.shared_session import AsyncClientManager
+from src.parser import junk_filter
 from src.app_paths import task_state_path
 from src import constants as K # Import constants
 
@@ -89,10 +92,27 @@ class ParserManager(QObject):
         if self.settings.get(K.SETTING_USE_PATTERNS, K.DEFAULT_USE_PATTERNS):
             custom_pattern_path = self.settings.get(K.SETTING_CUSTOM_PATTERN_PATH, K.DEFAULT_SETTINGS_VALUES[K.SETTING_CUSTOM_PATTERN_PATH])
             imagus_sieve_path = self.settings.get(K.SETTING_IMAGUS_SIEVE_PATH, K.DEFAULT_SETTINGS_VALUES[K.SETTING_IMAGUS_SIEVE_PATH])
+            js_engine = None
+            if self.settings.get(K.SETTING_JS_ENGINE, "static") == "deno":
+                try:
+                    from src.parser.js_engine import DenoJsEngine
+                    js_engine = DenoJsEngine()
+                    if js_engine.available():
+                        logger.info(f"Deno JS engine enabled (bin: {js_engine.bin_path()})")
+                    else:
+                        logger.warning(
+                            "Deno JS engine requested but no deno binary/worker found — "
+                            "falling back to static pattern parsing"
+                        )
+                        js_engine = None
+                except Exception as e:
+                    logger.warning(f"Failed to init Deno JS engine: {e}")
+                    js_engine = None
             self.pattern_manager = SitePatternManager(
                 enable_built_in=True, 
                 custom_pattern_path=custom_pattern_path,
-                imagus_sieve_path=imagus_sieve_path
+                imagus_sieve_path=imagus_sieve_path,
+                js_engine=js_engine
             )
             logger.info("Using SitePatternManager for pattern transformations")
 
@@ -325,6 +345,12 @@ class ParserManager(QObject):
             self._had_critical_error = True
         finally:
             logger.info("_main_task finished.")
+            # Shut down the Deno JS worker (if any) — terminates the subprocess.
+            if self.pattern_manager is not None and self.pattern_manager.js_engine is not None:
+                try:
+                    self.pattern_manager.js_engine.shutdown()
+                except Exception as e:
+                    logger.error(f"Error shutting down Deno JS engine: {e}")
             # Close shared session AFTER gather — all workers are stopped at this point
             self._shared_downloader_session = None
             try:
@@ -447,21 +473,169 @@ class ParserManager(QObject):
             links_found = parse_result[0]
             media_files_found = parse_result[1]
             
-            # Extract and sync cookies to the shared downloader session (domain-scoped)
+            # Extract and sync cookies to the shared downloader session (domain-scoped).
+            # The shared requests.Session is used concurrently by downloader threads;
+            # guard cookie-jar writes with the session lock attached at creation.
             cookies = parse_result[5]
             if cookies and self._shared_downloader_session:
                 logger.debug(f"Syncing {len(cookies)} cookies from parser to shared downloader session")
                 domain = urlparse(url).hostname
-                for name, value in cookies.items():
-                    self._shared_downloader_session.cookies.set(name, value, domain=domain, path="/")
+                cookie_lock = getattr(self._shared_downloader_session, "_cookie_lock", None)
+                if cookie_lock:
+                    cookie_lock.acquire()
+                try:
+                    for name, value in cookies.items():
+                        self._shared_downloader_session.cookies.set(name, value, domain=domain, path="/")
+                finally:
+                    if cookie_lock:
+                        cookie_lock.release()
 
             if parse_result[2] != K.PARSER_SUCCESS:
                 logger.error(f"Error parsing {url}: {parse_result[3]}")
         return links_found, media_files_found
 
+    async def _discover_linked_fullsize(self, links, page_url, session):
+        """Sieve link->url->res fullsize discovery for thumbnail-transition links.
+
+        Mirrors the extension's discoverFullsize: for each from_image link that
+        matches a sieve `link` rule, apply the rule's `url` template (string
+        transform; content after " :" is POSTed form data, e.g. imx.to
+        'imgContinue='), fetch the page, and extract fullsize URLs via the
+        rule's `res` regex(es) with an <img src> fallback.
+
+        Returns (discovered_media, resolved_thumbnails, consumed_links):
+          - discovered_media: (media_type, url, attrs) items for the download queue
+          - resolved_thumbnails: thumbnail URLs whose fullsize was found
+            (drop them from the page's media batch)
+          - consumed_links: transition links handled here (do NOT queue them
+            for crawling — they are lookups, not content)
+        """
+        if self.pattern_manager is None or not links:
+            return [], set(), set()
+        discovered = []
+        resolved_thumbnails = set()
+        consumed = set()
+        sem = asyncio.Semaphore(K.FULLSIZE_DISCOVER_CONCURRENCY)
+        timeout = aiohttp.ClientTimeout(total=K.FULLSIZE_DISCOVER_TIMEOUT)
+        proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
+        # Resource guard, not a content cap: all from_image links are probed
+        # (a gallery with 500 thumbnails resolves all 500), but a page whose
+        # hosts are dead/slow cannot hold the worker forever.
+        deadline = time.monotonic() + K.FULLSIZE_DISCOVER_TIME_BUDGET
+
+        async def probe(link_url, ctx):
+            rule_match = self.pattern_manager.get_link_rule(link_url)
+            if not rule_match:
+                return  # No sieve rule for this host — leave to the normal crawl path
+            rule, match = rule_match
+            link_groups = [match.group(0)]
+            link_groups += [match.group(i) for i in range(1, match.re.groups + 1)]
+            transformed = self.pattern_manager.apply_link_url_transform(
+                rule, match, page_url
+            )
+
+            def _res_usable():
+                # A res field is usable if it's a plain regex OR a JS
+                # expression and the DOM engine is available (P1).
+                res_field = rule.get('res')
+                pats = res_field if isinstance(res_field, list) else [res_field]
+                for p in pats:
+                    if not isinstance(p, str) or not p.strip():
+                        continue
+                    if not p.lstrip().startswith(':'):
+                        return True
+                    if (self.pattern_manager.js_engine is not None
+                            and self.pattern_manager.js_engine.dom_available()):
+                        return True
+                return False
+
+            if not transformed and not _res_usable():
+                # Catch-all rules with unusable JS url+res only (e.g.
+                # [MediaGrabber]) match every URL but offer no usable lookup —
+                # leave the link to the normal crawl path instead of
+                # consuming it blindly.
+                return
+            consumed.add(link_url)
+            if transformed:
+                fetch_url, post_data = transformed
+            else:
+                # No url transform, but the rule has a usable res: probe the
+                # linked page itself (extension behaviour).
+                fetch_url, post_data = link_url, None
+            thumb = ctx.get("thumbnail_url")
+            try:
+                headers = {"Accept": "text/html"}
+                if post_data:
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    resp = await session.post(fetch_url, data=post_data, headers=headers,
+                                              timeout=timeout, proxy=proxy_url)
+                else:
+                    resp = await session.get(fetch_url, headers=headers,
+                                             timeout=timeout, proxy=proxy_url)
+                content_type = resp.headers.get("Content-Type", "") or ""
+                if "image/" in content_type or "video/" in content_type:
+                    final_url = str(resp.url)
+                    media_type = "video" if "video/" in content_type else "image"
+                    discovered.append((media_type, final_url, {"source": "link-direct"}))
+                    if thumb:
+                        resolved_thumbnails.add(thumb)
+                    return
+                if "text/html" not in content_type:
+                    return
+                html = await resp.text()
+                for u in self.pattern_manager.extract_res_urls(
+                        rule, html, page_url=page_url, groups=link_groups, href=link_url):
+                    if not is_format_allowed(u, "image", self.settings):
+                        continue
+                    discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
+                    if thumb:
+                        resolved_thumbnails.add(thumb)
+            except Exception as e:
+                logger.debug(f"Fullsize discovery failed for {link_url}: {e}")
+
+        async def limited(link_url, ctx):
+            async with sem:
+                if time.monotonic() >= deadline:
+                    # Budget exhausted — remaining links fall back to their
+                    # thumbnails; nothing is lost, just not upgraded.
+                    logger.debug("Fullsize discovery time budget exhausted; remaining links fall back to thumbnails")
+                    return
+                await probe(link_url, ctx)
+
+        await asyncio.gather(*[limited(u, c) for u, c in links], return_exceptions=True)
+        if discovered:
+            logger.info(f"Fullsize discovery: {len(discovered)} media from {len(links)} linked pages on {page_url}")
+        return discovered, resolved_thumbnails, consumed
+
     async def _process_parser_results(self, url: str, depth: int, 
                                       links_data: Any, media_files: List[Tuple[str, str, Dict[str, Any]]],
-                                      original_url_context: Dict[str, Any]):
+                                      original_url_context: Dict[str, Any], session=None):
+        # Fullsize discovery: resolve thumbnail-transition links (from_image)
+        # via the sieve link->url->res chain BEFORE queueing media, so external
+        # image hosts (imx.to etc.) yield fullsize originals instead of being
+        # dropped by stay-in-domain checks. Resolved thumbnails are removed
+        # from the media batch (fullsize wins); consumed links are not crawled.
+        consumed_links = set()
+        if (self.pattern_manager is not None and not self.one_shot
+                and session is not None and isinstance(links_data, dict)):
+            from_image_links = [
+                (u, c) for u, c in links_data.items()
+                if c.get("from_image") and u.startswith(("http://", "https://"))
+                # Only external transitions (image-host viewer pages) go through
+                # the sieve lookup. Same-domain thumbnail links keep the normal
+                # crawl path: WebpageParser handles lazy/data-src galleries far
+                # better than the res/img-scan fallback.
+                and not is_same_domain(u, self.start_url)
+            ]
+            if from_image_links:
+                discovered, resolved_thumbs, consumed_links = await self._discover_linked_fullsize(
+                    from_image_links, url, session
+                )
+                if resolved_thumbs:
+                    media_files = [m for m in media_files if m[1] not in resolved_thumbs]
+                if discovered:
+                    media_files = list(media_files) + discovered
+
         await self._process_media_files(media_files, url)
         await self._update_queue_priorities(url, media_files)
 
@@ -478,17 +652,28 @@ class ParserManager(QObject):
             elif isinstance(links_data, set): # From JSONWebpageParser
                 for disc_url in links_data: urls_to_queue.append((disc_url, {}))
 
-            # Cap per-page links: sort by priority, keep top N
+            # Cap per-page links — "excavation" only. from_image links are
+            # media lookups (thumbnail->fullsize transitions) and are never
+            # content-capped: a gallery with >max_links thumbnails must not
+            # lose any of them. Unconsumed lookups (no sieve rule) are still
+            # bounded downstream by the queue's pathological-URL guards,
+            # processed_urls dedup, search depth and the page limit.
             max_links = self.settings.get("max_links_per_page", K.DEFAULT_MAX_LINKS_PER_PAGE)
-            if max_links > 0 and len(urls_to_queue) > max_links:
-                urls_to_queue.sort(
-                    key=lambda x: float(x[1].get("priority", 0)),
-                    reverse=True
-                )
-                urls_to_queue = urls_to_queue[:max_links]
-                logger.debug(f"Capped links per page to {max_links} (had {len(links_data)} total)")
+            if max_links > 0:
+                excavation = [(u, c) for u, c in urls_to_queue if not c.get("from_image")]
+                lookups = [(u, c) for u, c in urls_to_queue if c.get("from_image")]
+                if len(excavation) > max_links:
+                    excavation.sort(
+                        key=lambda x: float(x[1].get("priority", 0)),
+                        reverse=True
+                    )
+                    excavation = excavation[:max_links]
+                    logger.debug(f"Capped excavation links per page to {max_links} (had {len(excavation) + len(lookups)} total; {len(lookups)} media lookups kept)")
+                urls_to_queue = excavation + lookups
 
             for disc_url_str, link_spec_ctx in urls_to_queue:
+                if disc_url_str in consumed_links:
+                    continue
                 abs_disc_url = disc_url_str
                 if not abs_disc_url.startswith(("http://", "https://")):
                     abs_disc_url = urljoin(url, abs_disc_url)
@@ -498,8 +683,12 @@ class ParserManager(QObject):
                     logger.debug(f"Skipping blocked domain for URL {abs_disc_url} (Domain: {disc_domain})")
                     continue
                 
+                # stay-in-domain restricts "excavation" (following page links to
+                # find new content) only. Media URLs and thumbnail transitions
+                # (from_image) are media lookups and are never domain-restricted.
+                is_media_lookup = link_spec_ctx.get("from_image") or is_media_url(abs_disc_url)
                 if self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN) and \
-                   not is_same_domain(abs_disc_url, self.start_url): 
+                   not is_media_lookup and not is_same_domain(abs_disc_url, self.start_url): 
                     logger.debug(f"Skipping out-of-domain link: {abs_disc_url} (Original start: {self.start_url})")
                     continue
                 
@@ -567,10 +756,14 @@ class ParserManager(QObject):
                 try:
                     is_json = self._determine_parser_type(current_url)
                     links_found, media_files_found = await self._invoke_parser(current_url, session, is_json, context)
-                    await self._process_parser_results(current_url, depth, links_found, media_files_found, context)
                 finally:
                     if domain:
                         sem.release()
+                # Fullsize discovery + media queueing probe OTHER domains (image
+                # hosts) — intentionally outside the source-domain semaphore so
+                # a page with many linked pages cannot stall parsing of the
+                # source domain.
+                await self._process_parser_results(current_url, depth, links_found, media_files_found, context, session)
             except Exception as e:
                 logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
                 if current_url not in self.processed_urls: self.processed_urls.add(current_url)
@@ -590,6 +783,14 @@ class ParserManager(QObject):
             try:
                 abs_url = urljoin(source_url, url) if not (url.startswith("http://") or url.startswith("https://")) else url
                 abs_url = normalize_url(abs_url)
+                # P2-lite final gate: drop ad/tracker media URLs that slipped
+                # past the HTML-level checks (e.g. sieve fullsize discovery
+                # results pointing at ad CDNs). Allowlist-aware; the item is
+                # skipped before stats are touched so progress stays correct.
+                if (self.settings.get(K.SETTING_FILTER_JUNK, True)
+                        and junk_filter.is_ad_url(abs_url, source_url)):
+                    logger.debug(f"Filtered ad/junk media URL: {abs_url}")
+                    continue
                 async with self._processed_lock:
                     if abs_url in self.downloaded_files: continue 
                     self.downloaded_files.add(abs_url) 
@@ -841,13 +1042,18 @@ class ParserManager(QObject):
         if media_type == "image": priority *= 2.0
         elif media_type == "video": priority *= 3.0
         source_type = attrs.get("source", "")
-        if "fullsize" in source_type or "original" in source_type: priority *= 3.0
+        if "fullsize" in source_type or "original" in source_type or source_type in ("sieve-res", "link-direct"):
+            priority *= 3.0
         elif "parent-link" in source_type: priority *= 2.5
         if any(p in url.lower() for p in ["/full/", "/large/", "/original/", "fullsize", "highres"]): priority *= 2.0
         if source_url == self.start_url: priority *= 3.0 
         if "dimensions" in attrs:
             w, h = attrs["dimensions"].get("width",0), attrs["dimensions"].get("height",0)
             if w > 0 and h > 0: priority *= min(1.0 + ((w * h) / 1000000), 3.0) 
+        # Soft thumbnail hint (WP-2.1): deprioritize, never drop — the fullsize
+        # transform or the parent-link page should be preferred when available.
+        if attrs.get("likely_thumbnail"):
+            priority *= 0.5
         return priority
     
     def get_stats(self) -> Dict[str, int]: return self.stats.copy()

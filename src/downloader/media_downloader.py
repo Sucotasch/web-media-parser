@@ -6,16 +6,14 @@ Media downloader class for downloading media files
 """
 
 import os
-import re
 import time
 import threading
 from urllib.parse import urlparse
 import logging
 import requests
-from src.parser.utils import is_trash_media, format_proxy_url
+from src.parser.utils import format_proxy_url, is_format_allowed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from requests.cookies import RequestsCookieJar
 from src import constants as K  # Import constants
 
 logger = logging.getLogger(__name__)
@@ -49,6 +47,9 @@ def create_shared_downloader_session(settings: dict) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    # The session is shared across downloader threads while the parser thread
+    # may write cookies to the jar. Guard cookie-jar writes with this lock.
+    session._cookie_lock = threading.Lock()
     # Only stable, file-invariant headers are set at session level.
     session.headers.update({
         "User-Agent": settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
@@ -168,14 +169,43 @@ class MediaDownloader:
             # If "none": no Referer header added
         return headers
 
-    def download(self, timeout=None, retries=None): # retries param is less used now session handles it
-        try:
-            # Use specific timeout if provided, else from settings, else default constant
-            current_timeout = timeout if timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
-            return self._do_download(custom_timeout=current_timeout)
-        except Exception as e:
-            logger.error(f"Download failed for {self.filepath}: {str(e)}", exc_info=True)
-            return {"success": False, "error": str(e)}
+    # Error substrings that indicate a transient network/server problem worth
+    # retrying. Everything else (content filters, size checks, manual abort) is final.
+    _RETRYABLE_ERROR_HINTS = (
+        "network error",
+        "timed out",
+        "connection",
+        "http error: 5",
+        "http error: 429",
+    )
+
+    def download(self, timeout=None, retries=None):
+        """Download with a bounded, user-configurable retry loop.
+
+        The shared session keeps urllib3 Retry(total=0) so the app's Stop button
+        stays responsive; transient failures are retried here instead, honoring
+        the Retry Count setting (and 0 = no retries, e.g. probation domains).
+        """
+        current_timeout = timeout if timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
+        retries_left = retries if retries is not None else self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
+        attempt = 0
+        while True:
+            if self.stop_event and self.stop_event.is_set():
+                return {"success": False, "error": "Download manually aborted"}
+            try:
+                result = self._do_download(custom_timeout=current_timeout)
+            except Exception as e:
+                logger.error(f"Download failed for {self.filepath}: {str(e)}", exc_info=True)
+                result = {"success": False, "error": str(e)}
+            if result["success"] or retries_left <= 0:
+                return result
+            err_lower = (result.get("error") or "").lower()
+            if not any(hint in err_lower for hint in self._RETRYABLE_ERROR_HINTS):
+                return result  # content filter / size / abort — final
+            retries_left -= 1
+            attempt += 1
+            logger.info(f"Retrying download ({attempt}/{retries_left + attempt}) for {self.url}: {result.get('error')}")
+            time.sleep(0.5 * attempt)
 
     def _ensure_unique_filepath_at_destination(self, current_filepath: str) -> str:
         with _filename_lock:
@@ -195,8 +225,8 @@ class MediaDownloader:
         try:
             self.filepath = self._ensure_unique_filepath_at_destination(self.filepath)
             
-            # 1. Final Safety Check: Filter out trash media formats
-            if is_trash_media(self.url):
+            # 1. Final Safety Check: filter out disabled media formats (settings-driven)
+            if not is_format_allowed(self.url, self.media_type, self.settings):
                 return {"success": False, "error": "Filtered as trash media (GIF/ICO/SVG)"}
 
             # 2. Blacklist check for non-media webpage extensions
@@ -215,7 +245,11 @@ class MediaDownloader:
             per_req_hdrs = self._get_per_request_headers()
 
             try:
-                response_head = self.session.head(self.url, headers=per_req_hdrs, timeout=timeout_to_use)
+                # MUST follow redirects: photo hosts (imx.to etc.) 302 image URLs to
+                # a CDN host. requests.head() defaults to allow_redirects=False, so
+                # without this a valid image was misdetected as an HTML shell page
+                # ("Webpage/script content") and the item was failed + re-parsed.
+                response_head = self.session.head(self.url, headers=per_req_hdrs, timeout=timeout_to_use, allow_redirects=True)
                 response_head.raise_for_status()
                 content_length = int(response_head.headers.get("Content-Length", 0))
                 content_type = response_head.headers.get("Content-Type", "").lower()
@@ -260,6 +294,15 @@ class MediaDownloader:
             logger.info(f"Starting single-threaded download: {os.path.basename(self.filepath)}")
             response_get = self.session.get(self.url, headers=per_req_hdrs, stream=True, timeout=timeout_to_use)
             response_get.raise_for_status()
+
+            # Some servers reject HEAD (405/403). When HEAD never succeeded,
+            # validate the GET response too so an HTML error/login page is
+            # never saved as media.
+            if response_head is None:
+                get_content_type = (response_get.headers.get("Content-Type") or "").lower()
+                if any(t in get_content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
+                    response_get.close()
+                    return {"success": False, "error": f"Webpage/script content (Content-Type: {get_content_type})"}
 
             if content_length == 0:
                 content_length = int(response_get.headers.get("Content-Length", 0))

@@ -44,6 +44,12 @@ def create_backup():
         "venv",
         "env",
         ".env",
+        # Sensitive / user data — never ship in a backup zip:
+        # settings.json may contain extension cookies & proxy credentials,
+        # task_queue.json tracks personal URLs, sessions/ holds crawl state.
+        "settings.json",
+        "task_queue.json",
+        "sessions",
     ]
     
     print(f"Creating backup: {backup_path}")
@@ -62,8 +68,9 @@ def create_backup():
             
             # Add files
             for file in files:
-                # Skip the backup file itself and any other backups
-                if file.endswith(".zip") and "backup" in file:
+                # Skip the backup file itself, any other backups, and
+                # explicitly excluded files (e.g. settings.json, task_queue.json)
+                if (file.endswith(".zip") and "backup" in file) or file in exclude:
                     continue
                     
                 file_path = os.path.join(root, file)

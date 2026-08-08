@@ -182,3 +182,13 @@ downloads/
 settings.json
 site_patterns.json
 test_patterns.html
+
+# Runtime state (may contain cookies/credentials/personal data)
+sessions/
+*.pkl
+*.log
+Log.txt
+Errors.txt
+
+# Generated Deno npm cache (happy-dom) — populated by build_exe.py
+src/parser/js_engine/deno_cache/
