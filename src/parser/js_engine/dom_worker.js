@@ -17,18 +17,154 @@
 
 import { Window } from "npm:happy-dom@15.11.7";
 
-function shimSelf(href, groups) {
-  // Minimal `this` for res/url rules: the matched link anchor. Fields the
-  // extension provides (this.node etc.) are absent -> rules using them throw
-  // -> caught -> error -> fail-open (same as extension page-context limits).
+// Find the real element the rule was invoked on, so `this.node` is a live
+// DOM node (happy-dom) instead of null. The extension passes the hovered
+// link anchor; we reconstruct it from the context: match an <a> whose href
+// equals the probe link URL, else an <img> whose src equals one of the
+// regex groups (the thumbnail URL). Deliberately NO blind "first element"
+// fallback: in the discovery flow the fetched page (html) is the image-host
+// wrapper, which rarely contains the probe link's own anchor — returning the
+// first <a>/<img> would hand rules a logo/nav element and produce WRONG
+// URLs instead of a clean fail-open. Returns null when nothing matches.
+function findNode(doc, href, groups) {
+  try {
+    const norm = (u) => String(u || "").trim().replace(/\/$/, "");
+    const want = norm(href);
+    if (want) {
+      for (const a of doc.querySelectorAll("a[href]")) {
+        const h = norm(a.getAttribute("href"));
+        if (h === want) return a;
+        // relative href resolves against the document URL
+        try {
+          if (new URL(h, doc.baseURI).href === new URL(want, doc.baseURI).href) return a;
+        } catch (_) {}
+      }
+    }
+    const gs = Array.isArray(groups) ? groups.map(norm).filter(Boolean) : [];
+    for (const g of gs) {
+      for (const img of doc.querySelectorAll("img[src]")) {
+        const s = norm(img.getAttribute("src"));
+        if (s === g) return img;
+        try {
+          if (new URL(s, doc.baseURI).href === new URL(g, doc.baseURI).href) return img;
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+// this.find({href|src, ...}) — the extension searches the document for an
+// element matching a URL and returns it (or its resolved href/src). Rules
+// use it as `this.find({href: u}) || u`; return the resolved URL so the
+// fallback chain works.
+function findInDoc(doc, opts) {
+  try {
+    if (!opts || typeof opts !== "object") return null;
+    const norm = (u) => String(u || "").trim();
+    if (opts.href) {
+      const want = norm(opts.href);
+      for (const a of doc.querySelectorAll("a[href]")) {
+        const h = norm(a.getAttribute("href"));
+        if (h === want) return want;
+        try {
+          if (new URL(h, doc.baseURI).href === new URL(want, doc.baseURI).href) return want;
+        } catch (_) {}
+      }
+    }
+    if (opts.src) {
+      const want = norm(opts.src);
+      for (const img of doc.querySelectorAll("img[src]")) {
+        const s = norm(img.getAttribute("src"));
+        if (s === want) return want;
+        try {
+          if (new URL(s, doc.baseURI).href === new URL(want, doc.baseURI).href) return want;
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+function shimSelf(doc, href, groups) {
+  // `this` for res rules. this.node/TRG is a Proxy over the matched element
+  // that emulates the extension's hovered thumbnail semantics:
+  //   - this.node.src            -> first <img> child's src (1.org-pp)
+  //   - this.node.closest('a')   -> anchor of that img (Google_Images)
+  //   - this.node.querySelector  -> container lookup (CNN-m-pp)
+  // Unhandled properties fall through to the anchor/img element; writes
+  // (this.node.IMGS_* = ...) land on the real element. Anything heavier
+  // (this.set/prepare/getImages, IMGS_ext_data wiring) stays absent -> the
+  // rule throws -> caught -> fail-open.
+  const anchor = findNode(doc, href, groups);
+  const img = anchor
+    ? (anchor.tagName === "IMG" ? anchor
+       : (anchor.querySelector && anchor.querySelector("img[src]")) || null)
+    : null;
+  // No element matched: fall back to the DOCUMENT, not to an arbitrary first
+  // element. querySelector/querySelectorAll then work from a sane root
+  // (CNN-m-pp finds the page image); src/closest/parentNode are guarded and
+  // return null (clean fail-open) instead of garbage from a logo/nav node.
+  const target = anchor || img || doc;
+  const node = new Proxy(target, {
+    get(t, prop) {
+      if (typeof prop !== "string") return t[prop];
+      if (prop === "src") {
+        return img
+          ? (img.src || img.getAttribute("src") || null)
+          : (anchor ? anchor.getAttribute("src") || null : null);
+      }
+      if (prop === "href") {
+        if (anchor) return anchor.href || anchor.getAttribute("href") || "";
+        return "";
+      }
+      if (prop === "querySelector") {
+        return typeof t.querySelector === "function" ? (sel) => t.querySelector(sel) : null;
+      }
+      if (prop === "querySelectorAll") {
+        return typeof t.querySelectorAll === "function" ? (sel) => t.querySelectorAll(sel) : null;
+      }
+      // Element-only methods (closest/matches/getAttribute): when the target
+      // is the Document fallback they are absent — return a stub that yields
+      // null so `this.node.closest('a')?.href` chains resolve cleanly instead
+      // of throwing TypeError and relying on the catch-all fail-open.
+      if (prop === "closest") {
+        return typeof t.closest === "function" ? (sel) => t.closest(sel) : () => null;
+      }
+      if (prop === "matches") {
+        return typeof t.matches === "function" ? (sel) => t.matches(sel) : () => null;
+      }
+      if (prop === "tagName") return t.tagName || "A";
+      if (prop === "parentNode") return t.parentNode || null;
+      if (prop === "previousElementSibling") return t.previousElementSibling || null;
+      if (prop === "getAttribute") {
+        return typeof t.getAttribute === "function" ? (name) => t.getAttribute(name) : () => null;
+      }
+      const v = t[prop];
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+    set(t, prop, val) {
+      t[prop] = val;
+      return true;
+    },
+    has(t, prop) {
+      return prop in t;
+    },
+  });
   return {
-    href: href || "",
-    node: null,
-    TRG: null,
-    tagName: "A",
-    getAttribute: () => null,
-    querySelector: () => null,
-    find: null,
+    href: href || node.href || "",
+    node: node,
+    TRG: node,
+    tagName: node.tagName,
+    getAttribute: (name) => node.getAttribute(name),
+    querySelector: (sel) => node.querySelector(sel),
+    querySelectorAll: (sel) => node.querySelectorAll(sel),
+    closest: (sel) => node.closest(sel),
+    matches: (sel) => node.matches(sel),
+    parentNode: node.parentNode,
+    previousElementSibling: node.previousElementSibling,
+    src: node.src,
+    find: (opts) => findInDoc(doc, opts),
     set: null,
     prepare: null,
     getImages: null,
@@ -91,7 +227,7 @@ function handle(line) {
       "document", "window", "URL", "location", "$",
       '"use strict";\n' + code,
     );
-    const self = shimSelf(href, $);
+    const self = shimSelf(doc, href, $);
     const result = normalize(fn.call(self, doc, win, win.URL, win.location, $));
     return JSON.stringify({ id, result });
   } catch (e) {

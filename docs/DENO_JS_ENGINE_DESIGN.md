@@ -1,7 +1,7 @@
 # Deno как лёгкий JS-движок — анализ и дизайн интеграции
 
 > **Дата:** 2026-08-07 (обновлено 2026-08-08)
-> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P2-full (adblocker)/P3 (curl_cffi)/P4 (JS-гейты) — отложены; P5 (CF-PoW) — отклонён (тупик).
+> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P2-full (adblocker)/P3 (curl_cffi)/P4 (JS-гейты) — отложены; P5 (CF-PoW) — отклонён (тупик).
 >
 > **Боевая проверка (2026-08-08, deno включён):** запуск без видимых ошибок; fullsize-дискавери дал 1940 media (было 0); DOM rule errors 0 (было 21 — фикс `$._`); окна deno.exe больше не появляются (CREATE_NO_WINDOW). Поздние фиксы: `$._` (сырой текст страницы, Imagus-конвенция) + рекурсивное расплющивание вложенных массивов в dom_worker.js; CREATE_NO_WINDOW/start_new_session в engine.py.
 > **Контекст:** `Audit.md` (полный ревью), `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` (рабочий план улучшений).
@@ -126,6 +126,11 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            массивы; офлайн-кэш npm бандлится в bin/deno_cache/npm
 [✓] P2-lite junk_filter.py — ad/трекер/форумный хром, allowlist, финальный гейт,
            отсечка иконок на парсинге (фильтр junk: дефолт on)
+[✓] P1.5     this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил
+           (a-якорь по href, img по группам), this.find({href|src}), guards на
+           querySelector/closest/src; фолбэк на document (не первый элемент),
+           стубы () => null на Document — чистый fail-open. Fetch/XHR (110) и
+           IMGS_ext_data (86) — асинхронные, вне синхронного пайплайна.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
 [ ] P3       curl_cffi impersonation как HTTP-движок (по появлению реальных блоков)
 [ ] P4       JS-обход интерстициальных прокладок (отложено — sieve-POST цепочка
@@ -136,8 +141,9 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
 **Боевые фиксы после первого запуска с Deno (2026-08-08):**
 - `CREATE_NO_WINDOW` (Windows) / `start_new_session` (Unix) в обоих `Popen` — иначе каждое `deno run` открывало видимое консольное окно на всю задачу.
 - `$._ = htmlStr` в dom_worker.js — Imagus-конвенция: res-правила читают сырой текст загруженной страницы (`$._.match(...)`); без этого 504 правила давали `reading 'match'` и fullsize-дискавери = 0. Плюс рекурсивное расплющивание вложенных массивов (`[[['#url']]]`) со снятием `#`-маркера.
+- P1.5: `this.node` — поиск элемента в DOM (a[href] по URL из контекста exact/relative, img[src] по группам regex); Proxy-шим: `src` от первого img внутри, `closest/querySelector` от якоря; фолбэк на `document` с стубами `() => null` — правила вроде Google_Images (`closest('a')`) и CNN-m-pp (`querySelector('img')`) работают, а при отсутствии матча — честный null без мусорных URL лого/навигации.
 
-Тесты: `tests/test_js_engine.py` (20, включая `$._`, вложенные массивы, CREATE_NO_WINDOW, fail-open), `tests/test_junk_filter.py` (31), иконки в `tests/test_js_processing.py`. Смоук: 141 passed, 1 skipped; боевой запуск — 1940 media через fullsize-дискавери, 0 DOM-ошибок.
+Тесты: `tests/test_js_engine.py` (26, включая `$._`, вложенные массивы, CREATE_NO_WINDOW, fail-open, P1.5 this.node/find/фолбэк), `tests/test_junk_filter.py` (31), иконки в `tests/test_js_processing.py`. Смоук: 147 passed, 1 skipped; боевой запуск — 1940 media через fullsize-дискавери, 0 DOM-ошибок.
 
 ---
 

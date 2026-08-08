@@ -227,6 +227,102 @@ def test_dom_res_nested_array_flat():
         engine.shutdown()
 
 
+# --- P1.5: this.node (live DOM element shim) ------------------------------
+
+NODE_HTML = """<html><body>
+<div class="g"><a href="https://h/view/1">
+  <img src="https://h/t/1.jpg" width="640" height="480">
+</a></div>
+<div class="g"><a href="https://h/view/2">
+  <img src="https://h/t/2.jpg" width="640" height="480">
+</a></div>
+</body></html>"""
+
+
+def test_dom_res_this_node_closest():
+    # this.node must be the matched anchor so closest('a') resolves its href
+    # (pattern: Google_Images `n.closest('a')?.href`).
+    engine = _dom_engine_or_skip()
+    try:
+        code = "return this.node.closest('a')?.href"
+        assert engine.run_dom_js(code, NODE_HTML, "https://h/gal", [],
+                                 "https://h/view/1") == ["https://h/view/1"]
+    finally:
+        engine.shutdown()
+
+
+def test_dom_res_this_node_query_selector():
+    # this.node.querySelector('img') must return the anchor's thumbnail
+    # (pattern: CNN-m-pp `this.node.querySelector('img')?.src`).
+    engine = _dom_engine_or_skip()
+    try:
+        code = "return this.node.querySelector('img')?.src"
+        assert engine.run_dom_js(code, NODE_HTML, "https://h/gal", [],
+                                 "https://h/view/2") == ["https://h/t/2.jpg"]
+    finally:
+        engine.shutdown()
+
+
+def test_dom_res_this_node_src_via_groups():
+    # this.node.src resolves when the img src matches a regex group
+    # (pattern: 1.org-pp `[i.thumbnailUrl,...].includes(this.node.src)`).
+    engine = _dom_engine_or_skip()
+    try:
+        code = "return this.node.src"
+        assert engine.run_dom_js(code, NODE_HTML, "https://h/gal",
+                                 ["https://h/view/1", "https://h/t/1.jpg"],
+                                 "https://h/view/1") == ["https://h/t/1.jpg"]
+    finally:
+        engine.shutdown()
+
+
+def test_dom_res_this_find_href():
+    # this.find({href}) searches the document and returns the resolved URL
+    # (pattern: `this.find({ href: u }) || u`).
+    engine = _dom_engine_or_skip()
+    try:
+        code = "return this.find({ href: 'https://h/view/1' }) || 'fallback'"
+        assert engine.run_dom_js(code, NODE_HTML, "https://h/gal", [], "") == [
+            "https://h/view/1"]
+        # missing URL -> null -> rule falls back
+        code2 = "return this.find({ href: 'https://h/nope' }) || 'fallback'"
+        assert engine.run_dom_js(code2, NODE_HTML, "https://h/gal", [], "") == [
+            "fallback"]
+    finally:
+        engine.shutdown()
+
+
+def test_dom_res_this_node_doc_fallback():
+    # No element matched href/groups: this.node falls back to the DOCUMENT,
+    # NOT to an arbitrary first <a>/<img>. querySelector from the doc root
+    # still works (CNN-m-pp container lookups), while closest/src return null
+    # (clean fail-open) instead of garbage URLs from a logo/nav element.
+    engine = _dom_engine_or_skip()
+    try:
+        # document.querySelector('img') resolves the page's first image
+        code = "return this.node.querySelector('img')?.src"
+        assert engine.run_dom_js(code, NODE_HTML, "https://h/gal", [], "") == [
+            "https://h/t/1.jpg"]
+        # no blind first-anchor fallback -> no wrong href, clean fail-open
+        code2 = "return this.node.closest('a')?.href"
+        assert engine.run_dom_js(code2, NODE_HTML, "https://h/gal", [], "") is None
+        code3 = "return this.node.src"
+        assert engine.run_dom_js(code3, NODE_HTML, "https://h/gal", [], "") is None
+    finally:
+        engine.shutdown()
+
+
+def test_dom_res_this_node_still_fails_open_without_any():
+    # A page with no links/images -> this.node null -> rule returns null.
+    engine = _dom_engine_or_skip()
+    try:
+        code = "return this.node.closest('a')?.href"
+        assert engine.run_dom_js(code, "<html><body>none</body></html>",
+                                 "https://h/gal", [], "") is None
+    finally:
+        engine.shutdown()
+
+
 def test_extract_res_urls_js_branch():
     # SitePatternManager.extract_res_urls must evaluate JS res rules through
     # the DOM engine and fall back to the img scan otherwise.
