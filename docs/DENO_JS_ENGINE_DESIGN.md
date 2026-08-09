@@ -1,7 +1,7 @@
 # Deno как лёгкий JS-движок — анализ и дизайн интеграции
 
-> **Дата:** 2026-08-07 (обновлено 2026-08-08)
-> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P2-full (adblocker)/P3 (curl_cffi)/P4 (JS-гейты) — отложены; P5 (CF-PoW) — отклонён (тупик).
+> **Дата:** 2026-08-07 (обновлено 2026-08-10)
+> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P3 РЕАЛИЗОВАН (2026-08-10) + P3-esc (авто-эскалация на 403/5xx). P4 (JS-гейты: consent/age подтверждения) — ДИЗАЙН ЗАФИКСИРОВАН (2026-08-10, см. §7); внедрение по плану. P2-full — отложен; P5 (CF-PoW) — отклонён (тупик).
 >
 > **Боевая проверка (2026-08-08, deno включён):** запуск без видимых ошибок; fullsize-дискавери дал 1940 media (было 0); DOM rule errors 0 (было 21 — фикс `$._`); окна deno.exe больше не появляются (CREATE_NO_WINDOW). Поздние фиксы: `$._` (сырой текст страницы, Imagus-конвенция) + рекурсивное расплющивание вложенных массивов в dom_worker.js; CREATE_NO_WINDOW/start_new_session в engine.py.
 > **Контекст:** `Audit.md` (полный ревью), `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` (рабочий план улучшений).
@@ -158,8 +158,10 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            локальным блокирующим сервером (requests 403 / curl 200): без
            эскалации fail, с эскалацией файл скачан. 173 passed, 1 skipped.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
-[ ] P4       JS-обход интерстициальных прокладок (отложено — sieve-POST цепочка
-           уже закрывает imx-стиль continue)
+[ ] P4       JS-обход интерстициальных прокладок — ДИЗАЙН ЗАФИКСИРОВАН (2026-08-10):
+           consent/age-гейты через статическое извлечение consent-кук из JS
+           (всегда) + точечный DOM-клик по кнопке через gateway_worker.js
+           (при js_engine=deno). См. §7. Внедрение по плану.
 [x] P5       старый CF-JS-PoW (отклонён — тупик против Turnstile)
 ```
 
@@ -173,7 +175,62 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
 
 ---
 
-## 5. Анти-паттерны (не делать)
+## 7. P4 — JS-гейты: consent/age-подтверждения (дизайн, 2026-08-10)
+
+> **Цель:** обход «простых запросов подтверждений» — кнопки «I agree / Agree / Yes / Согласен / Принимаю» — которые закрывают контент. До P4 обработка покрывала только cookie-преинжект + кнопки с href/form (GET/POST). Чисто JS-кнопки (`onclick` без URL) полностью пропускались: кандидат в `_handle_gateways` попадал только `if href:`.
+
+### 7.1 Что уже работает (по коду, до P4)
+1. **Cookie-преинжект** (`webpage_parser._get_content`): ~16 хардкод-кук (`cookieconsent_status`, `gdpr_accepted`, `CookieConsent`, `age_verified`, `over18`…) на каждый aiohttp-запрос (`bypass_cookie_consent`, дефолт on).
+2. **Gateway-детекция** (`_handle_gateways`): «подозрительность» = overlay-селектор (`.age-gate`, `#consent-modal`, `.overlay-consent`…), age-фраза, или generic-overlay + consent-слова, или `<GATEWAY_MIN_MEDIA_THRESHOLD` медиа + consent-слова. Затем сбор кандидатов из `a/button/input` по `GATEWAY_TEXT_PATTERNS` + блэклист legal/terms/privacy.
+3. **Bypass** (`_execute_bypass`): GET/POST по найденному URL через sync-сессию (Referer + UA), при `status<400` — куки синхронизируются в aiohttp, media/links очищаются, страница перепарсивается (лимит 3 попытки).
+
+### 7.2 Дыры (подтверждено по коду)
+- **JS-only кнопки не обрабатываются**: `<button onclick="document.cookie='age=18';location.reload()">` — нет href → кандидат отбрасывается (`if href:`).
+- `onclick`-regex ищет только URL-литерал; `document.cookie=...` и вызовы функций (`setCookie`, `acceptCookies`) не извлекаются.
+- Кнопки, **мутирующие DOM без reload**, неразрешимы повторным fetch (заглушка вернётся снова).
+- `div/span[onclick]` не сканируются вовсе (только `a/button/input`).
+- Успешный bypass не помогает **другим страницам того же домена** (куки живут только в `_sync_session` парсера; для скачивания синкаются в shared-session с domain-scope, но для парсинга следующей страницы не применяются).
+
+### 7.3 Дизайн (два уровня + кэш)
+
+**Уровень 1 — статическое извлечение consent-кук из JS (Python, всегда):**
+- Расширить сканирование: `a/button/input` + элементы с `onclick`/`onmousedown`/`onkeypress` (в т.ч. `div/span`).
+- Парсинг обработчика: `document.cookie\s*=\s*["']name=value...["']` → только первая `name=value` до `;`; вызовы `setCookie/createCookie/acceptCookies/...` → поиск определения в inline `<script>` и парсинг тела на `document.cookie`-присваивания; детект `location.reload()`/`location.href=` → флаг «нужен рефетч».
+- Применение кук в `_sync_session` → существующий цикл перепарсинга (limit 3) срабатывает без изменений.
+- **Защита от ложных срабатываний:** скоуп кандидатов по overlay-контейнеру, когда он найден (не сканировать всю страницу); расширенный блэклист `login/signin/register/logout/account/password/email/checkout/cart`; скип форм с `input[type=password]`; только сильное совпадение текста для JS-клика.
+
+**Уровень 2 — точечный DOM-клик через `gateway_worker.js` (js_engine=deno):**
+- **Отдельный воркер-процесс** (не делит `_dom_lock` с sieve — клик на 5с не блокирует res-правила других страниц).
+- Протокол: `{"op":"gateway_click", "html":..., "pageUrl":..., "textPatterns":[...], "overlaySelectors":[...], "timeout":5000}`.
+- Воркер: Window с `enableJavaScriptEvaluation:true` → `document.write(html)` → **перехват ДО клика** (`location.reload` stub + флаг, `location.href` setter-перехват) → поиск кнопки по паттернам (внутри overlay) → `.click()` → `waitUntilComplete()` с бюджетом → чтение `document.cookie` (до/после) + `document.documentElement.outerHTML` → `{cookies, html_after, redirect, reload_requested}`.
+- Python: `cookies`/`reload_requested` → инжект + рефетч; `html_after` существенно изменился (overlay исчез) → **парсим локально, без повторного fetch**.
+
+**Consent-кэш по доменам (ParserManager):** `_consent_cookies[domain] = {name: value}`; инжект в парсер через settings/контекст при `_invoke_parser`; дополнение после успешного bypass. Превращает «разовую удачу» в «обход один раз на домен» (все треды форума).
+
+### 7.4 Трудности и меры
+
+| Трудность | Мера |
+|---|---|
+| Функция в **внешнем** `<script src>` | Не находится статически → fallback на уровень 2 или fail-open |
+| Куки со спецсимволами/`this` в обработчике | Только первая `name=value`; `this`-зависимые → уровень 2 или пропуск |
+| `location.reload()`/`location.href=` в happy-dom инициирует навигацию | Перехват ДО клика (stub + флаг) |
+| Внешние `<script src>` не загрузятся (нет `--allow-net`) | Фича: согласия обычно inline; undefined-функция → молчаливый fail-open |
+| Тяжёлая страница → eval > 2с | Отдельный таймаут клика (5с), отдельный воркер-процесс (sieve не страдает) |
+| Произвольный JS в воркере (беск. цикл, `Deno.exit`) | Без `--allow-*`; таймаут убивает процесс; Python пересоздаёт |
+| Асинхронные обработчики (`setTimeout`) | `waitUntilComplete()` с бюджетом |
+| Shadow DOM / iframe-виджеты (OneTrust/Cookiebot) | Вне скоупа — known limitation |
+| Циклы | `_js_gateway_tried` (1 клик/страницу) + общий лимит 3 → карантин не затронут |
+| Ложные срабатывания (login/sign-in) | Overlay-скоуп + блэклист + скип password-форм + сильное совпадение текста |
+
+### 7.5 Тесты
+- Unit: статический парсер кук (inline-функция, document.cookie, reload-флаг, блэклист, password-форм скип).
+- Unit: gateway_worker click на синтетической HTML с кнопкой (куки после клика, html_after, reload_requested).
+- Integration: локальный сервер с JS-гейтом (по образцу `_tmp_esc_e2e.py`) — клик → контент доступен.
+
+### 7.6 Сборка
+- `build_exe.py`: копировать `src/parser/js_engine/gateway_worker.js` → `bin/gateway_worker.js` рядом с `dom_worker.js` (happy-dom кэш общий).
+
+
 
 | Нельзя | Почему |
 |---|---|
