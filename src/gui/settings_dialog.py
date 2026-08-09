@@ -445,6 +445,23 @@ class SettingsDialog(QDialog):
         self.proxy_edit.setToolTip("Proxy server (host:port). Prepend http:// if needed.")
         http_grid.addWidget(self.proxy_edit, 5, 1)
 
+        # HTTP engine (P3): aiohttp (default) vs curl_cffi browser impersonation.
+        # Applies to the sync paths (parser fallback + gateway bypass + media
+        # downloader); the primary async page fetch always uses aiohttp.
+        http_grid.addWidget(QLabel("HTTP Engine:"), 6, 0)
+        self.http_engine_combo = QComboBox()
+        self.http_engine_combo.addItem("Aiohttp (default)", "aiohttp")
+        self.http_engine_combo.addItem("curl_cffi (browser TLS)", "curl_cffi")
+        self.http_engine_combo.setToolTip(
+            "HTTP engine for downloads and fallback fetches. 'Aiohttp' uses the "
+            "standard Python TLS stack (default). 'curl_cffi' impersonates a real "
+            "browser TLS fingerprint (JA3/JA4/HTTP2) which avoids blocking by "
+            "CDNs that reject non-browser clients. Note: with curl_cffi the "
+            "custom User-Agent is ignored (the impersonated profile provides its "
+            "own). Falls back to aiohttp if curl_cffi is not installed."
+        )
+        http_grid.addWidget(self.http_engine_combo, 6, 1)
+
         http_layout.addWidget(http_group)
 
         # Logging tab
@@ -676,6 +693,11 @@ class SettingsDialog(QDialog):
         self.timeout_spin.setValue(self.settings.get("timeout", 30))
         self.retry_count_spin.setValue(self.settings.get("retry_count", 3))
         self.proxy_edit.setText(self.settings.get("proxy", ""))
+        http_engine_val = self.settings.get(
+            K.SETTING_HTTP_ENGINE, K.DEFAULT_SETTINGS_VALUES.get(K.SETTING_HTTP_ENGINE, "aiohttp")
+        )
+        http_idx = self.http_engine_combo.findData(http_engine_val)
+        self.http_engine_combo.setCurrentIndex(http_idx if http_idx >= 0 else 0)
 
         # Logging
         self.log_to_file_check.setChecked(self.settings.get("log_to_file", False))
@@ -736,6 +758,7 @@ class SettingsDialog(QDialog):
         settings["timeout"] = self.timeout_spin.value()
         settings["retry_count"] = self.retry_count_spin.value()
         settings["proxy"] = self.proxy_edit.text().strip()
+        settings[K.SETTING_HTTP_ENGINE] = self.http_engine_combo.currentData() or "aiohttp"
 
         # Logging
         settings["log_to_file"] = self.log_to_file_check.isChecked()
@@ -824,6 +847,15 @@ class SettingsDialog(QDialog):
             val = settings.get(key, "")
             if isinstance(val, str):
                 settings[key] = val.replace("\r", "").replace("\n", "")
+        # Normalize http_engine to a known engine (aiohttp default); a corrupt
+        # settings.json can't smuggle an arbitrary engine value.
+        if settings.get(K.SETTING_HTTP_ENGINE) not in ("aiohttp", "curl_cffi"):
+            settings[K.SETTING_HTTP_ENGINE] = K.DEFAULT_HTTP_ENGINE
+        # http_impersonate is passed through as-is: profile availability is
+        # version-dependent (new Chrome profiles ship with each curl_cffi
+        # release), so validity is enforced fail-open at session creation in
+        # src/parser/http_engine.create_sync_session, not by a brittle
+        # hardcoded whitelist here.
         # Normalize stop_words to a list of non-empty stripped strings.
         # Protects against a corrupted settings.json where stop_words is a
         # string (iterating chars) or contains non-string items.

@@ -204,6 +204,16 @@ SETTING_IMAGUS_SIEVE_PATH = "imagus_sieve_path"
 # "deno" = execute JS rules via a Deno subprocess worker). Default stays
 # "static" so behaviour is unchanged until the user opts in.
 SETTING_JS_ENGINE = "js_engine"
+# HTTP engine for the SYNC paths (parser fallback + gateway bypass + media
+# downloader). "aiohttp" keeps the historical requests/urllib3 stack;
+# "curl_cffi" impersonates a real browser TLS fingerprint (JA3/JA4/HTTP2)
+# via libcurl-impersonate — the async primary page fetch always stays aiohttp.
+# Default stays "aiohttp" so behaviour is unchanged until the user opts in.
+SETTING_HTTP_ENGINE = "http_engine"
+DEFAULT_HTTP_ENGINE = "aiohttp"
+# Impersonation profile for curl_cffi ("chrome" auto-tracks the latest).
+SETTING_HTTP_IMPERSONATE = "http_impersonate"
+DEFAULT_HTTP_IMPERSONATE = "chrome"
 SETTING_PROCESS_JS = "process_js"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
@@ -238,6 +248,8 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_CUSTOM_PATTERN_PATH: "",
     SETTING_IMAGUS_SIEVE_PATH: "",
     SETTING_JS_ENGINE: "static",
+    SETTING_HTTP_ENGINE: DEFAULT_HTTP_ENGINE,
+    SETTING_HTTP_IMPERSONATE: DEFAULT_HTTP_IMPERSONATE,
     SETTING_PROCESS_JS: DEFAULT_PROCESS_JS,
     # SETTING_PROCESS_DYNAMIC: DEFAULT_PROCESS_DYNAMIC, # Removed
     SETTING_BYPASS_COOKIE_CONSENT: DEFAULT_BYPASS_COOKIE_CONSENT,

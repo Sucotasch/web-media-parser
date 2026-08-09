@@ -60,6 +60,10 @@ def build_exe():
         "--hidden-import=src.core.task_item",
         "--hidden-import=src.core.task_queue_manager",
         "--hidden-import=src.app_paths",
+        # P3: curl_cffi (browser TLS impersonation for downloads/fallback).
+        # The libcurl-impersonate DLLs live inside the wheel; --collect-all
+        # pulls both the Python package and its binary data next to the exe.
+        "--collect-all=curl_cffi",
         # Exclude unused
         "--exclude-module=PyQt6",
         "--exclude-module=matplotlib",

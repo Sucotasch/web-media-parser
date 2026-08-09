@@ -20,7 +20,8 @@
 - **Age-gate / Gateway** — нажатие кнопок «Мне есть 18», «I agree» и аналогичных
 - **JS-редиректы** — обнаружение и переход по JavaScript-редиректам (до 5 редиректов)
 - **HTTP 429** — автоматический backoff с учётом `Retry-After` заголовка
-- **Fallback aiohttp → requests** — если сервер блокирует асинхронные запросы, используется sync `requests` с полным набором браузерных заголовков
+- **Fallback aiohttp → requests/curl_cffi** — если сервер блокирует асинхронные запросы, используется sync `requests` (или `curl_cffi` с браузерным TLS-отпечатком) с полным набором браузерных заголовков
+- **HTTP Engine (curl_cffi)** — опциональная имперсонация браузерного TLS-отпечатка (JA3/JA4/HTTP2) для скачивания и фолбэк-загрузок (см. [HTTP Engine (curl_cffi)](#http-engine-curl_cffi))
 
 ### Система паттернов
 - **Встроенные паттерны** — готовые правила для популярных сайтов
@@ -210,6 +211,7 @@ dist/WebMediaParser/
 | Retry Count | 3 | Повторные попытки при ошибке |
 | Proxy | — | Прокси в формате `host:port` |
 | **JS Engine** | Static | `Static` (по умолчанию) / `Deno` — см. [JS Engine (Deno)](#js-engine-deno) |
+| **HTTP Engine** | Aiohttp | `Aiohttp` (по умолчанию) / `curl_cffi` — см. [HTTP Engine (curl_cffi)](#http-engine-curl_cffi) |
 | Filter Ads/Junk | ✓ | Пропускать рекламные/tracker URL (allowlist-совместимо) |
 
 ### Logging
@@ -242,6 +244,25 @@ dist/WebMediaParser/
 
 ---
 
+## HTTP Engine (curl_cffi)
+
+Обычные Python-HTTP клиенты (`aiohttp`, `requests`) используют OpenSSL-стек, чей TLS-отпечаток (JA3/JA4 — без GREASE-токенов, без HTTP/2, python-User-Agent) легко распознаётся как «не браузер». Продвинутая защита (Cloudflare, Akamai, DataDome) может блокировать **на уровне TLS-рукопожатия**, ещё до проверки заголовков. Движок **`curl_cffi`** линкует патченный libcurl (curl-impersonate), воспроизводящий точный TLS/HTTP2-отпечаток реального браузера.
+
+### Что даёт
+- **Имперсонация браузера** при скачивании медиа и фолбэк-загрузке страниц — CDN видят «настоящий Chrome» (профиль `chrome` обновляется автоматически)
+- Работает там, где `requests`-фолбэк не помогает: блок происходит на handshake, а не на заголовках
+- **Fail-open**: если curl_cffi не установлен или профиль не поддерживается — автоматический откат на `requests` с одним предупреждением в логе
+
+### Как включить
+*Settings → HTTP → HTTP Engine → curl_cffi (browser TLS)*. Основной асинхронный путь остаётся `aiohttp`; движок применяется к sync-путям (скачивание, фолбэк, гейтвеи).
+
+### Ограничения (осознанные)
+- **Не обходит** Cloudflare Turnstile / Managed Challenge и JS-челленджи (нужен реальный браузер); для них помогают cookies расширения + Deno + прокси
+- При включённой имперсонации **кастомный User-Agent игнорируется** — профиль предоставляет согласованный набор заголовков (UA + Sec-CH-UA), и его переопределение нарушило бы отпечаток
+- Применимо только к sync-путям; асинхронный fetch страниц остаётся на aiohttp (проверен, быстр)
+
+---
+
 ## Архитектура
 
 ```
@@ -263,6 +284,7 @@ main.py
 │   ├── site_pattern_manager.py — паттерны + Imagus Sieve (JS правила → Deno/Static)
 │   ├── js_engine/           — Deno JS движок: engine.py, worker.js (P0), dom_worker.js (P1)
 │   ├── junk_filter.py       — классификатор ad/трекер/форумный хром (P2-lite)
+│   ├── http_engine.py       — выбор HTTP движка (P3): aiohttp vs curl_cffi impersonation
 │   ├── shared_session.py     — aiohttp.ClientSession
 │   └── utils.py              — is_media_url, normalize_url, is_banner_or_ad
 │
@@ -326,6 +348,7 @@ main.py
 
 - **PySide6** — GUI-фреймворк
 - **aiohttp** — асинхронные HTTP-запросы
+- **curl_cffi** — опциональная имперсонация браузерного TLS (HTTP Engine)
 - **BeautifulSoup 4** + **lxml** — парсинг HTML
 - **filetype** — определение типов медиа
 - **requests** — fallback для TLS-блокировок

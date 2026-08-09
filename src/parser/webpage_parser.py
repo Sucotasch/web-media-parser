@@ -219,11 +219,14 @@ class WebpageParser:
                 logger.info(f"Using sync fallback (requests) for {self.url}")
                 loop = asyncio.get_event_loop()
                 
-                # Capture headers to pass into the synchronous call
-                # Use the configured UA — request headers override the session's
-                # defaults, so a hardcoded default would silently replace the
-                # user's custom User-Agent.
-                fb_headers = {"User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT)}
+                # Capture headers to pass into the synchronous call.
+                # UA is only set for the plain requests path — an impersonated
+                # curl_cffi session already carries the browser UA from its
+                # profile, and overriding it would break the TLS fingerprint.
+                fb_headers = {}
+                from src.parser import http_engine
+                if not http_engine.engine_uses_curl(self.settings):
+                    fb_headers["User-Agent"] = self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT)
                 if request_specific_headers.get("Referer"):
                     fb_headers["Referer"] = request_specific_headers["Referer"]
                 
@@ -298,33 +301,46 @@ class WebpageParser:
         return any(re.search(pattern, url, re.IGNORECASE) for pattern in patterns)
 
     def _get_sync_session(self):
-        """Lazy-loader for a persistent sync session to maintain cookies during bypass"""
+        """Lazy-loader for a persistent sync session to maintain cookies during bypass
+
+        P3: honors http_engine. With curl_cffi the session impersonates a real
+        browser TLS fingerprint (impersonate=chrome). Because curl_cffi sets
+        browser-consistent headers (UA/Sec-CH-UA/Accept) from the profile, the
+        manual header block below is only applied to the plain requests path;
+        overriding User-Agent on an impersonated session would defeat the JA3
+        fingerprint.
+        """
         if self._sync_session is None:
-            import requests
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
+            from src.parser import http_engine
             from src.parser.utils import format_proxy_url
             
-            self._sync_session = requests.Session()
-            # Disable internal retries to allow immediate termination via UI Stop button 
-            adapter = HTTPAdapter(max_retries=Retry(total=0, connect=None, read=None, redirect=None, status=None))
-            self._sync_session.mount("http://", adapter)
-            self._sync_session.mount("https://", adapter)
-            # Pre-set standard headers (match aiohttp session for consistent fingerprint)
-            self._sync_session.headers.update({
-                "User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
-                "Accept-Language": self.settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept": K.DEFAULT_ACCEPT_HEADER,
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Upgrade-Insecure-Requests": "1",
-                "DNT": "1",
-            })
+            if http_engine.engine_uses_curl(self.settings):
+                self._sync_session = http_engine.create_sync_session(self.settings)
+            else:
+                import requests
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                
+                self._sync_session = requests.Session()
+                # Disable internal retries to allow immediate termination via UI Stop button 
+                adapter = HTTPAdapter(max_retries=Retry(total=0, connect=None, read=None, redirect=None, status=None))
+                self._sync_session.mount("http://", adapter)
+                self._sync_session.mount("https://", adapter)
+                # Pre-set standard headers (match aiohttp session for consistent fingerprint)
+                self._sync_session.headers.update({
+                    "User-Agent": self.settings.get(K.SETTING_USER_AGENT, K.DEFAULT_USER_AGENT),
+                    "Accept-Language": self.settings.get(K.SETTING_ACCEPT_LANGUAGE, K.DEFAULT_ACCEPT_LANGUAGE),
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Accept": K.DEFAULT_ACCEPT_HEADER,
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1",
+                    "DNT": "1",
+                })
             
-            # Apply proxy if configured
+            # Apply proxy if configured (both engines support session.proxies)
             proxy_url = format_proxy_url(self.settings.get(K.SETTING_PROXY))
             if proxy_url:
                 self._sync_session.proxies = {"http": proxy_url, "https": proxy_url}
@@ -350,8 +366,13 @@ class WebpageParser:
         method = action.get('method', 'GET').upper()
         form_tag = action.get('form_tag')
         
-        # Prepare headers (Crucial: Include Referer to satisfy security checks)
-        headers = {"User-Agent": K.DEFAULT_USER_AGENT, "Referer": self.url}
+        # Prepare headers (Crucial: Include Referer to satisfy security checks).
+        # UA only for the plain requests path — an impersonated curl_cffi
+        # session already carries its browser UA from the profile.
+        from src.parser import http_engine
+        headers = {"Referer": self.url}
+        if not http_engine.engine_uses_curl(self.settings):
+            headers["User-Agent"] = K.DEFAULT_USER_AGENT
         
         # Collect data if it's a form
         data = {}

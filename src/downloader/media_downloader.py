@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import logging
 import requests
 from src.parser.utils import format_proxy_url, is_format_allowed
+from src.parser import http_engine
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from src import constants as K  # Import constants
@@ -26,12 +27,37 @@ _filename_lock = threading.Lock()
 
 
 def create_shared_downloader_session(settings: dict) -> requests.Session:
-    """Create a single shared requests.Session for all MediaDownloader instances.
+    """Create a single shared download session for all MediaDownloader instances.
+
+    Honors the http_engine setting (P3): when "curl_cffi" (and curl_cffi is
+    installed) the session impersonates a real browser TLS fingerprint
+    (impersonate="chrome") — CDNs that block on JA3/JA4 then serve media
+    instead of refusing. When "aiohttp" (default) a plain requests.Session is
+    built exactly as before.
 
     One session enables TCP/TLS keep-alive connection reuse across file downloads.
     INTERNAL RETRIES ARE DISABLED (total=0) to ensure the application Stop button
     works immediately by preventing urllib3 from hanging in long retry loops.
     """
+    if http_engine.engine_uses_curl(settings):
+        session = http_engine.create_sync_session(settings)
+        http_engine.attach_cookie_lock(session)
+        # curl_cffi sets browser-consistent headers (UA/Sec-CH-UA/Accept) from
+        # the impersonation profile — overriding User-Agent would defeat the
+        # fingerprint. Proxy is applied as on the requests path.
+        proxy_url = format_proxy_url(settings.get(K.SETTING_PROXY))
+        if proxy_url:
+            session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url
+            }
+            logger.info(f"Shared downloader session (curl_cffi) configured with proxy: {proxy_url}")
+        logger.info(
+            "Shared downloader session created (curl_cffi impersonate=%s, 0 internal retries).",
+            http_engine.impersonate_profile(settings),
+        )
+        return session
+
     session = requests.Session()
     # Use standard cookie jar instead of _NullCookieJar to allow site-specific cookies (e.g. Age Verification)
     # Standard CookieJar handles domain scoping automatically.
@@ -106,6 +132,29 @@ class MediaDownloader:
         )
 
     def _create_session(self):
+        # P3: when http_engine=curl_cffi the local session impersonates a real
+        # browser TLS fingerprint. urllib3 retry mounting is requests-only; the
+        # app-level retry loop in download() covers retries for both engines
+        # (and the shared session used in real runs keeps total=0 anyway).
+        if http_engine.engine_uses_curl(self.settings):
+            session = http_engine.create_sync_session(self.settings)
+            headers = {}
+            if self.media_type == "image":
+                headers["Accept"] = K.DEFAULT_ACCEPT_IMAGE_HEADER
+            elif self.media_type == "video":
+                headers["Accept"] = K.DEFAULT_ACCEPT_VIDEO_HEADER
+            else:
+                headers["Accept"] = K.DEFAULT_ACCEPT_HEADER
+            if self.source_url:
+                referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
+                if referrer_policy == "origin":
+                    parsed_source = urlparse(self.source_url)
+                    headers["Referer"] = f"{parsed_source.scheme}://{parsed_source.netloc}"
+                elif referrer_policy == "auto":
+                    headers["Referer"] = self.source_url
+            session.headers.update(headers)
+            return session
+
         session = requests.Session()
         retry_strategy = Retry(
             total=self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT),
@@ -264,7 +313,7 @@ class MediaDownloader:
                     min_size_for_type = min_img_size_kb if self.media_type == "image" else min_vid_size_kb
                     if min_size_for_type > 0 and size_kb < min_size_for_type:
                         return {"success": False, "error": f"File too small ({size_kb:.2f}KB < {min_size_for_type}KB)"}
-            except requests.exceptions.RequestException as e:
+            except http_engine.NETWORK_ERROR_EXCEPTIONS as e:
                 logger.warning(f"HEAD request failed for {self.url}: {str(e)}. Will attempt GET.")
 
             mode = "wb"
@@ -362,9 +411,10 @@ class MediaDownloader:
             logger.info(f"Download completed: {os.path.basename(self.filepath)}")
             return {"success": True, "message": "File downloaded successfully"}
 
-        except requests.exceptions.HTTPError as e:
-            return {"success": False, "error": f"HTTP error: {e.response.status_code if e.response else 'Unknown'}"}
-        except requests.exceptions.RequestException as e:
+        except http_engine.HTTP_ERROR_EXCEPTIONS as e:
+            status = getattr(e, "response", None)
+            return {"success": False, "error": f"HTTP error: {getattr(status, 'status_code', 'Unknown')}"}
+        except http_engine.NETWORK_ERROR_EXCEPTIONS as e:
             return {"success": False, "error": f"Network error: {e}"}
         except Exception as e:
             logger.error(f"Generic download error for {self.url}: {str(e)}", exc_info=True)

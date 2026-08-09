@@ -137,8 +137,18 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            + expression-wrapper: IIFE `(()=>{...})()` возвращают значение
            (раньше undefined — голый body не возвращает trailing expression);
            wrapCache — решение кэшируется, двойная компиляция исключена.
+[✓] P3       curl_cffi impersonation как HTTP-движок sync-путей (2026-08-10):
+           http_engine: aiohttp|curl_cffi (дефолт aiohttp), профиль impersonate
+           (дефолт chrome). Основной async-fetch остаётся aiohttp; curl_cffi
+           применяется к фолбэк-загрузке/гейтвеям (webpage_parser sync-сессия)
+           и скачиванию медиа (shared downloader session). Fail-open: нет
+           curl_cffi/невалидный профиль → requests + одно предупреждение.
+           UA не переопределяется на impersonate-сессии (рассинхрон JA3↔UA).
+           Исключения: NETWORK/HTTP_ERROR_EXCEPTIONS покрывают оба движка.
+           Сборка: --collect-all=curl_cffi (libcurl-impersonate статически в
+           _wrapper.pyd). 165 passed, 1 skipped; фингерпринт подтверждён
+           (JA4 t13d1516h2, HTTP/2, браузерный UA); скачивание в бандле OK.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
-[ ] P3       curl_cffi impersonation как HTTP-движок (по появлению реальных блоков)
 [ ] P4       JS-обход интерстициальных прокладок (отложено — sieve-POST цепочка
            уже закрывает imx-стиль continue)
 [x] P5       старый CF-JS-PoW (отклонён — тупик против Turnstile)
