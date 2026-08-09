@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 WORKER_BASENAME = "worker.js"
 DOM_WORKER_BASENAME = "dom_worker.js"
+GATEWAY_WORKER_BASENAME = "gateway_worker.js"
 
 # Timeout for a single JS rule call (seconds). Rules are tiny; this is a
 # safety net against pathological infinite loops inside a sieve rule. Kept
@@ -154,6 +155,21 @@ def _find_dom_worker_script():
     return None
 
 
+def _find_gateway_worker_script():
+    """Locate gateway_worker.js next to this module or bundled next to the exe."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, GATEWAY_WORKER_BASENAME)
+    if os.path.exists(local):
+        return local
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        for cand in (os.path.join(exe_dir, "bin", GATEWAY_WORKER_BASENAME),
+                     os.path.join(exe_dir, GATEWAY_WORKER_BASENAME)):
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
 def _popen_kwargs():
     """Subprocess flags that keep the Deno child invisible and isolated.
 
@@ -198,12 +214,15 @@ class DenoJsEngine:
         self._bin = bin_path or find_deno_bin()
         self._worker = worker_path or _find_worker_script()
         self._dom_worker = _find_dom_worker_script()
+        self._gateway_worker = _find_gateway_worker_script()
         self._deno_cache = _find_deno_cache_dir()
         self._timeout = timeout
         self._proc = None
         self._lock = threading.Lock()
         self._dom_proc = None
         self._dom_lock = threading.Lock()
+        self._gateway_proc = None
+        self._gateway_lock = threading.Lock()
         self._cache = {}
         self._cache_order = []
 
@@ -298,14 +317,61 @@ class DenoJsEngine:
         except Exception:
             pass
 
+    def _ensure_gateway_proc(self):
+        """Spawn the P4 gateway worker (happy-dom, JS evaluation ON).
+
+        Uses the same DENO_DIR npm cache as the DOM worker. Separate process
+        and lock from the DOM worker so a slow gateway click (up to its own
+        timeout) never blocks sieve res/url rules on other pages.
+        """
+        if self._gateway_proc is not None and self._gateway_proc.poll() is None:
+            return self._gateway_proc
+        cmd = [self._bin, "run", "--quiet", self._gateway_worker]
+        env = os.environ.copy()
+        env["DENO_DIR"] = self._deno_cache
+        try:
+            self._gateway_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+                **_popen_kwargs(),
+            )
+        except Exception as e:
+            logger.debug(f"Deno gateway worker spawn failed: {e}")
+            self._gateway_proc = None
+            raise
+        return self._gateway_proc
+
+    def _kill_gateway_proc(self):
+        proc, self._gateway_proc = self._gateway_proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
     def shutdown(self):
-        """Terminate both workers. Safe to call multiple times."""
+        """Terminate all workers. Safe to call multiple times."""
         with self._lock:
             self._kill_proc()
             self._cache.clear()
             self._cache_order.clear()
         with self._dom_lock:
             self._kill_dom_proc()
+        with self._gateway_lock:
+            self._kill_gateway_proc()
 
     # --- cache ----------------------------------------------------------
 
@@ -380,11 +446,14 @@ class DenoJsEngine:
             return None
         return resp.get("result")
 
-    def _read_line_timeout(self, proc, killer=None) -> str | None:
+    def _read_line_timeout(self, proc, killer=None, timeout: float | None = None) -> str | None:
         """Read one stdout line, aborting (and killing the worker) on timeout.
 
         `killer` is a callable that terminates the right process (plain vs
-        DOM worker); defaults to killing the plain worker."""
+        DOM vs gateway worker); defaults to killing the plain worker. `timeout`
+        overrides the instance default (used by the gateway worker, which
+        needs more headroom than a sieve rule call)."""
+        timeout = self._timeout if timeout is None else timeout
         result_holder = [None]
 
         def _reader():
@@ -396,7 +465,7 @@ class DenoJsEngine:
 
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
-        t.join(timeout=self._timeout)
+        t.join(timeout=timeout)
         if t.is_alive():
             # Worker is stuck (infinite loop inside a rule). Kill and re-raise.
             (killer or self._kill_proc)()
@@ -458,3 +527,60 @@ class DenoJsEngine:
             return None
         result = resp.get("result")
         return result if isinstance(result, list) else None
+
+    # --- P4 gateway click mode (consent/age buttons, JS evaluation ON) -----
+
+    def run_gateway_click(self, html: str, page_url: str = "",
+                          text_patterns=None, overlay_selectors=None,
+                          timeout: float = 6.0):
+        """Simulate a click on a consent/age-gate button in happy-dom.
+
+        Unlike the sieve DOM worker (enableJavaScriptEvaluation=false), the
+        gateway worker evaluates the page's JS so the button's onclick handler
+        really runs. Returns a dict {cookies, html_after, redirect,
+        reload_requested} or None (fail-open on any error, including no button
+        found). Bounded: one synchronous call, worker killed on timeout.
+        """
+        if (not self.available() or not self._gateway_worker
+                or not self._deno_cache or not html):
+            return None
+        patterns = [p for p in (text_patterns or []) if isinstance(p, str)]
+        overlays = [s for s in (overlay_selectors or []) if isinstance(s, str)]
+        with self._gateway_lock:
+            try:
+                proc = self._ensure_gateway_proc()
+                request = json.dumps({
+                    "id": 0,
+                    "html": html,
+                    "pageUrl": page_url or "",
+                    "textPatterns": patterns,
+                    "overlaySelectors": overlays,
+                })
+                try:
+                    proc.stdin.write(request + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    self._kill_gateway_proc()
+                    raise
+                resp_line = self._read_line_timeout(
+                    proc, killer=self._kill_gateway_proc, timeout=timeout
+                )
+                if resp_line is None:
+                    raise TimeoutError("Deno gateway worker timed out")
+                resp = json.loads(resp_line)
+                if resp.get("error"):
+                    logger.debug(f"Deno gateway click error: {resp['error'][:160]}")
+                    return None
+                result = resp.get("result")
+                if not isinstance(result, dict):
+                    return None
+                out = {
+                    "cookies": result.get("cookies") or {},
+                    "html_after": result.get("html_after") or "",
+                    "redirect": result.get("redirect"),
+                    "reload_requested": bool(result.get("reload_requested")),
+                }
+                return out
+            except Exception as e:
+                logger.debug(f"Deno gateway click failed ({type(e).__name__}: {e})")
+                return None

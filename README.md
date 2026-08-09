@@ -17,7 +17,7 @@
 
 ### Обход защит и динамического контента
 - **Cookie-consent** — автоматическая установка согласий на использование cookies
-- **Age-gate / Gateway** — нажатие кнопок «Мне есть 18», «I agree» и аналогичных
+- **Age-gate / Gateway** — кнопки «Мне есть 18», «I agree» и аналогичные: статическое извлечение consent-кук из JS-обработчиков (всегда) + точечный DOM-клик через Deno при `js_engine=deno`; обход гейта один раз на домен (кэш кук)
 - **JS-редиректы** — обнаружение и переход по JavaScript-редиректам (до 5 редиректов)
 - **HTTP 429** — автоматический backoff с учётом `Retry-After` заголовка
 - **Fallback aiohttp → requests/curl_cffi** — если сервер блокирует асинхронные запросы, используется sync `requests` (или `curl_cffi` с браузерным TLS-отпечатком) с полным набором браузерных заголовков
@@ -128,6 +128,7 @@ dist/WebMediaParser/
 │   ├── deno.exe
 │   ├── worker.js                      — воркер JS-правил (P0)
 │   ├── dom_worker.js                  — DOM-воркер happy-dom (P1)
+│   ├── gateway_worker.js              — DOM-клик кнопок согласия (P4)
 │   └── deno_cache/                    — офлайн-кэш npm (happy-dom)
 ├── sessions/          (создаётся при первом запуске)
 └── _internal/
@@ -233,6 +234,7 @@ dist/WebMediaParser/
 - **P1** — JS `url`/`res`-правила: загрузка linked-страниц и извлечение fullsize через DOM (happy-dom) и сырой текст страницы (`$._`)
 - **P0.5/P1.5** — `this.node`-эмуляция: правила с `this.node.closest/querySelector/src` дают результат там, где раньше молча падали
 - **Fullsize-дискавери** — переходы thumbnail→страница-оболочка→полноразмерный оригинал (imx.to и др.)
+- **P4 — JS-гейты** — consent/age-кнопки: статический парсер кук из `onclick` (всегда) + клик по кнопке в happy-dom (при `js_engine=deno`); мутированный DOM парсится без повторного fetch
 
 ### Безопасность
 - Воркеры запускаются **без прав** (`--allow-*` не выдаются), скрипты страницы не выполняются — только правила пользователя против DOM
@@ -292,7 +294,7 @@ main.py
 │   ├── webpage_parser.py     — HTML, lazy-load, JS-редиректы, bypass, фильтрация
 │   ├── json_parser.py        — JSON API парсинг
 │   ├── site_pattern_manager.py — паттерны + Imagus Sieve (JS правила → Deno/Static)
-│   ├── js_engine/           — Deno JS движок: engine.py, worker.js (P0), dom_worker.js (P1)
+│   ├── js_engine/           — Deno JS движок: engine.py, worker.js (P0), dom_worker.js (P1), gateway_worker.js (P4)
 │   ├── junk_filter.py       — классификатор ad/трекер/форумный хром (P2-lite)
 │   ├── http_engine.py       — выбор HTTP движка (P3): aiohttp vs curl_cffi impersonation
 │   ├── shared_session.py     — aiohttp.ClientSession

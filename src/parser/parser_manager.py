@@ -125,6 +125,10 @@ class ParserManager(QObject):
             "pages_processed": 0, "images_found": 0, "videos_found": 0,
             "files_downloaded": 0, "files_skipped": 0,
         }
+        # P4: per-domain consent cookies learned from successful gateway
+        # bypasses. Injected into every page of that domain for the rest of
+        # the run — a gateway is bypassed once per domain, not per page.
+        self._consent_cookies: Dict[str, Dict[str, str]] = {}
         self._completed_naturally = False  # True only when parsing finished by itself, not user Stop
         self._had_critical_error = False
         self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
@@ -155,6 +159,7 @@ class ParserManager(QObject):
         }
         self.domain_health.clear()
         self.quarantined_domains.clear()
+        self._consent_cookies.clear()
         self._stop_event.clear()
         self._pause_event.set()
         self.is_running = False
@@ -463,11 +468,18 @@ class ParserManager(QObject):
                 links_found, media_files_found = await p.parse()
         else:
             logger.debug(f"Using WebpageParser for {url}")
+            # P4: inject per-domain consent cookies learned from earlier
+            # gateway bypasses so a gate is crossed once per domain, not per
+            # page. Copy the context dict (queue items are shared).
+            parser_context = dict(context or {})
+            consent = self._consent_cookies.get(get_domain(url))
+            if consent:
+                parser_context["consent_cookies"] = consent
             p = WebpageParser(
                 url=url, settings=self.settings,
                 process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
                 external_session=session, pattern_manager=self.pattern_manager,
-                context=context
+                context=parser_context
             )
             parse_result = await p.parse()
             links_found = parse_result[0]
@@ -477,6 +489,9 @@ class ParserManager(QObject):
             # The shared requests.Session is used concurrently by downloader threads;
             # guard cookie-jar writes with the session lock attached at creation.
             cookies = parse_result[5]
+            if cookies:
+                # P4: remember them per-domain for subsequent pages of this site
+                self._consent_cookies.setdefault(get_domain(url), {}).update(cookies)
             if cookies and self._shared_downloader_session:
                 logger.debug(f"Syncing {len(cookies)} cookies from parser to shared downloader session")
                 domain = urlparse(url).hostname

@@ -96,9 +96,10 @@ def build_exe():
         shutil.copy2(allowlist_src, os.path.join(dist_dir, "junk_allowlist.txt"))
         print("  junk_allowlist.txt (P2-lite template)")
 
-    # Bundle the Deno JS engine workers (P0 sieve worker + P1 DOM worker)
+    # Bundle the Deno JS engine workers (P0 sieve worker + P1 DOM worker + P4 gateway worker)
     worker_src = os.path.join("src", "parser", "js_engine", "worker.js")
     dom_worker_src = os.path.join("src", "parser", "js_engine", "dom_worker.js")
+    gateway_worker_src = os.path.join("src", "parser", "js_engine", "gateway_worker.js")
     if os.path.exists(worker_src):
         bin_dir = os.path.join(dist_dir, "bin")
         os.makedirs(bin_dir, exist_ok=True)
@@ -107,6 +108,9 @@ def build_exe():
         if os.path.exists(dom_worker_src):
             shutil.copy2(dom_worker_src, os.path.join(bin_dir, "dom_worker.js"))
             print("  dom_worker.js (happy-dom, P1)")
+        if os.path.exists(gateway_worker_src):
+            shutil.copy2(gateway_worker_src, os.path.join(bin_dir, "gateway_worker.js"))
+            print("  gateway_worker.js (consent click, P4)")
         # Also bundle the Deno binary so the engine works on any machine.
         deno_bin = os.environ.get("WEB_MEDIA_PARSER_DENO")
         if not deno_bin or not os.path.exists(deno_bin):

@@ -100,8 +100,11 @@ class WebpageParser:
         self.js_redirect_count = 0 
         self._sync_session = None # Lazy-loaded persistent session for fallback
         self._bypass_attempts = 0 # Track bypass attempts to prevent loops
+        self._js_gateway_tried = False  # P4: one DOM-click attempt per page, ever
         self._last_http_status: Optional[int] = None  # For P3 escalation error reporting
         self._escalated_binary: bool = False  # Set when escalation returned binary media
+        self._last_html: Optional[str] = None  # P4: raw HTML for the DOM gateway click
+        self._js_gateway_html: Optional[str] = None  # P4: mutated DOM to parse instead of refetch
 
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
@@ -148,6 +151,23 @@ class WebpageParser:
                         'age_verified': '1', 'vantage': '1', 'over18': '1', 'nw': '1', 'nsfw': '1', 'terms': '1'
                     }
                     cookies.update(consent_cookies)
+                # P4: per-domain consent cookies learned from a prior successful
+                # bypass on this site (ParserManager._consent_cookies) — override
+                # the generic defaults with what the site actually accepted.
+                learned = (self.context or {}).get("consent_cookies")
+                if learned:
+                    cookies.update(learned)
+                # P4: cookies already set on the sync session during an earlier
+                # bypass of THIS page (URL-bypass or JS-bypass). aiohttp's
+                # cookie_jar.update_cookies() is unreliable (it does not retain
+                # cookies for IP hosts and domain-less cookies), so we pass them
+                # explicitly — the requests stack and the aiohttp cookie= param
+                # both carry them reliably.
+                if self._sync_session is not None:
+                    try:
+                        cookies.update(self._sync_session.cookies.get_dict())
+                    except Exception:
+                        pass
                 
                 page_timeout_val = self.settings.get(K.SETTING_PAGE_TIMEOUT, K.DEFAULT_PAGE_TIMEOUT)
                 # VERY Aggressive connect timeout (5 secs max), so we don't hang queues
@@ -494,6 +514,157 @@ class WebpageParser:
         except Exception as e:
             logger.debug(f"Universal bypass execution failed: {e}")
             return False
+
+    # --- P4: JS-only consent/gateway buttons (no href / no form) -------------
+
+    @staticmethod
+    def _extract_consent_cookies_from_js(handler_text: str) -> Tuple[Dict[str, str], bool]:
+        """P4 Level 1: statically extract consent cookies from a JS event handler.
+
+        Handles the common patterns found on consent/age-gate buttons:
+          - direct document.cookie assignments (first name=value pair only)
+          - helper calls: setCookie('n','v'[,...]), createCookie(...)
+          - bare function calls (acceptCookies(), agreeToTerms()) are NOT
+            resolved here (their body lives in a <script> block — see
+            _find_inline_function_body) but their *name* is returned via the
+            callers' function-resolution pass.
+        Returns (cookies, needs_reload). needs_reload is True when the handler
+        calls location.reload()/location.href= — the page must be re-fetched
+        after the cookies are applied.
+        """
+        cookies: Dict[str, str] = {}
+        needs_reload = False
+        if not handler_text:
+            return cookies, needs_reload
+        text = handler_text
+
+        # Direct cookie writes: document.cookie = 'name=value[; ...attrs]'
+        # The quoted value may itself contain a quote (document.cookie="oops='x'") —
+        # use a backreference so the outer pair boundary is the SAME quote char.
+        for m in re.finditer(r"document\.cookie\s*=\s*(['\"])(.*?)\1", text, re.IGNORECASE):
+            pair = m.group(2).split(";", 1)[0].strip()
+            if "=" in pair:
+                name, _, value = pair.partition("=")
+                name = name.strip()
+                # Skip pairs whose value contains a quote — consent cookie
+                # values are simple tokens ("oops='x'" is not a usable pair).
+                if name and "'" not in value and '"' not in value:
+                    cookies[name] = value.strip()
+
+        # Helper-call cookies: setCookie('n','v'[,...]) / createCookie(...)
+        for m in re.finditer(
+            r"(?:setCookie|createCookie|set_cookie)\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]*)['\"]",
+            text, re.IGNORECASE,
+        ):
+            name = m.group(1).strip()
+            if name:
+                cookies[name] = m.group(2).strip()
+
+        # location.reload() / location.href = '...' → page must be re-fetched
+        if re.search(r"location\s*\.\s*(?:reload|href)\s*(?:\(|=)", text, re.IGNORECASE) or \
+           re.search(r"window\s*\.\s*location", text, re.IGNORECASE):
+            needs_reload = True
+
+        return cookies, needs_reload
+
+    def _find_inline_function_body(self, soup, fn_name: str) -> Optional[str]:
+        """P4 Level 1: locate a function body in inline <script> blocks.
+
+        Matches `function fnName(...) {...}`, `const fnName = (...) => {...}`,
+        `var fnName = function(...) {...}` and returns the raw body text.
+        Bounded to 3 script tags and balanced-brace scanning to avoid runaway.
+        """
+        if not fn_name:
+            return None
+        patterns = [
+            re.compile(r"function\s+" + re.escape(fn_name) + r"\s*\([^)]*\)\s*\{"),
+            re.compile(r"(?:const|let|var)\s+" + re.escape(fn_name) + r"\s*=\s*[\w$]*\s*\([^)]*\)\s*=>\s*\{"),
+            re.compile(r"(?:const|let|var)\s+" + re.escape(fn_name) + r"\s*=\s*function\s*\([^)]*\)\s*\{"),
+        ]
+        for script in soup.find_all("script", limit=3):
+            src = script.string or ""
+            for pat in patterns:
+                m = pat.search(src)
+                if not m:
+                    continue
+                # Find the opening brace, then scan balanced braces to the close.
+                brace_start = src.find("{", m.start())
+                if brace_start == -1:
+                    continue
+                depth = 0
+                for i in range(brace_start, len(src)):
+                    ch = src[i]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return src[brace_start + 1:i]
+        return None
+
+    async def _execute_js_bypass(self, action: Dict[str, Any]) -> bool:
+        """P4: apply cookies extracted from a JS-only gateway button.
+
+        Level 1: cookies were already extracted statically during gateway
+        detection (action['cookies']). We apply them to the sync session so
+        the existing re-parse loop picks them up. Returns True when at least
+        one cookie was applied (or the handler requested a reload), False
+        otherwise (nothing to do).
+        """
+        # Cookies were already resolved (static extraction + inline function
+        # bodies) by _handle_gateways when it built this action. Apply them to
+        # the sync session so the re-parse loop picks them up.
+        cookies = action.get("cookies") or {}
+        if not cookies:
+            return False
+
+        session = self._get_sync_session()
+        for name, value in cookies.items():
+            try:
+                session.cookies.set(name, value)
+                logger.info(f"P4 JS consent cookie set: {name}={value}")
+            except Exception as e:
+                logger.debug(f"P4 cookie set failed for {name}: {e}")
+        return True
+
+    async def _try_js_gateway_click(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """P4 Level 2: click the consent button in a real DOM (Deno worker).
+
+        Returns the worker result dict {cookies, html_after, redirect,
+        reload_requested} or None (fail-open: no engine, unavailable, error,
+        or the page already had a DOM click). Bounded: one attempt per page
+        (self._js_gateway_tried) so it can never loop.
+        """
+        if self._js_gateway_tried:
+            return None
+        self._js_gateway_tried = True
+        if self.pattern_manager is None or self.pattern_manager.js_engine is None:
+            return None
+        engine = self.pattern_manager.js_engine
+        if not engine.dom_available():
+            logger.debug("P4: DOM gateway click skipped — Deno DOM worker unavailable")
+            return None
+        html = self._last_html or ""
+        if not html:
+            return None
+        logger.info(f"P4: attempting DOM gateway click for {self.url} via Deno worker")
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: engine.run_gateway_click(
+                    html=html,
+                    page_url=self.url,
+                    text_patterns=[p for p in K.GATEWAY_TEXT_PATTERNS],
+                    overlay_selectors=list(K.GATEWAY_OVERLAY_SELECTORS) + list(K.GATEWAY_GENERIC_OVERLAY_SELECTORS),
+                ),
+            )
+            if result and (result.get("cookies") or result.get("html_after")):
+                logger.info(f"P4: DOM gateway click returned {len(result.get('cookies') or {})} cookies, html_after={len(result.get('html_after') or '')} chars")
+            return result
+        except Exception as e:
+            logger.debug(f"P4: DOM gateway click failed: {e}")
+            return None
 
     def _get_video_platform(self, url: str) -> Optional[str]:
         parsed_url = urlparse(url.lower()); domain = parsed_url.netloc; path = parsed_url.path
@@ -989,11 +1160,34 @@ class WebpageParser:
         patterns = [p.lower() for p in K.GATEWAY_TEXT_PATTERNS]
         keyword_patterns = ["agree", "confirm", "enter", "over18", "accept", "continue", "verify", "18"]
         blacklist_patterns = ["legal", "terms", "tos", "policy", "agreement", "rules", "copyright", "privacy", "help", "about"]
+        avoid_keywords = [k.lower() for k in K.GATEWAY_AVOID_KEYWORDS]
+        
+        # P4: when an unambiguous gateway overlay is present, scope candidate
+        # search to it — a login modal / cookie footer on the same page must
+        # never be clicked as a "consent" action.
+        overlay_root = soup
+        for sel in K.GATEWAY_OVERLAY_SELECTORS:
+            found = self._select_one_safe(soup, sel)
+            if found is not None:
+                overlay_root = found
+                break
         
         # Search for buttons or links
         candidates = []
-        for tag in soup.find_all(['a', 'button', 'input']):
-            if tag.name == 'input' and tag.get('type') != 'submit':
+        js_candidates = []
+        
+        # P4: include JS-only elements (div/span/... with onclick/onmousedown)
+        # in addition to classic a/button/input. De-dupe by element identity.
+        seen = set()
+        classic = overlay_root.find_all(['a', 'button', 'input'])
+        js_elems = overlay_root.find_all(attrs={"onclick": True}) + \
+                   overlay_root.find_all(attrs={"onmousedown": True}) + \
+                   overlay_root.find_all(attrs={"onkeypress": True})
+        for tag in classic + js_elems:
+            if id(tag) in seen:
+                continue
+            seen.add(id(tag))
+            if tag.name == 'input' and tag.get('type') not in (None, 'submit', 'button'):
                 continue
                 
             text = tag.get_text(separator=" ", strip=True).lower()
@@ -1010,6 +1204,14 @@ class WebpageParser:
             attr_match = any(kw in tag_id or kw in tag_classes for kw in keyword_patterns)
             
             if text_match or attr_match:
+                # P4: never treat account/technical sections as a consent action
+                if any(kw in text for kw in avoid_keywords):
+                    continue
+                # P4: skip forms that collect credentials — never auto-submit them
+                parent_form = tag.find_parent('form')
+                if parent_form is not None and parent_form.find("input", {"type": "password"}):
+                    continue
+
                 href = None
                 method = "GET"
                 form_tag = None
@@ -1018,22 +1220,24 @@ class WebpageParser:
                     href = tag.get('href')
                 else:
                     # Check for form parent
-                    parent_form = tag.find_parent('form')
                     if parent_form:
                         href = parent_form.get('action') or self.url
                         method = parent_form.get('method', 'GET').upper()
                         form_tag = parent_form
                 
                 # Check for JS onClick if still no href
-                if not href and tag.get('onclick'):
-                    onclick = tag.get('onclick')
-                    url_match = re.search(r"['\"](?P<url>/[^'\"]+|https?://[^'\"]+)['\"]", onclick)
+                js_handler = (tag.get('onclick') or tag.get('onmousedown') or tag.get('onkeypress')) or ""
+                if not href and js_handler:
+                    url_match = re.search(r"['\"](?P<url>/[^'\"]+|https?://[^'\"]+)['\"]", js_handler)
                     if url_match: href = normalize_url(url_match.group("url"))
 
                 if href:
                     href_lower = href.lower()
                     # Check against blacklist (ignore TOS/Legal pages)
                     is_blacklisted = any(bp in text or bp in href_lower for bp in blacklist_patterns)
+                    # P4: also never navigate to login/sign-up/account sections
+                    if any(kw in href_lower for kw in avoid_keywords):
+                        is_blacklisted = True
                     
                     if is_blacklisted:
                         continue
@@ -1050,12 +1254,54 @@ class WebpageParser:
                         "form_tag": form_tag,
                         "text": text[:30]
                     })
+                elif js_handler and not form_tag:
+                    # P4: pure-JS button — no URL, no form. Only act when the
+                    # text is a strong consent match (avoids random JS buttons).
+                    # Strong = exact match of a long pattern, or a short
+                    # button label that CONTAINS a consent pattern ("I am
+                    # 18+" ⊇ "i am 18"), or a distinctive consent word.
+                    strong_text = bool(text) and (
+                        any(p == text for p in patterns if len(p) > 5)
+                        or (len(text) <= 40 and text_match)
+                        or text in ("agree", "accept", "confirm", "yes", "enter", "ok",
+                                    "согласен", "принимаю", "подтверждаю", "да")
+                    )
+                    if strong_text or attr_match:
+                        cookies, needs_reload = self._extract_consent_cookies_from_js(js_handler)
+                        # Resolve named function bodies from inline scripts
+                        if not cookies:
+                            for fn in re.findall(r"([A-Za-z_$][\w$]*)\s*\(", js_handler):
+                                if fn.lower() in ("if", "for", "while", "switch", "function", "return"):
+                                    continue
+                                body = self._find_inline_function_body(soup, fn)
+                                if body:
+                                    sub_cookies, sub_reload = self._extract_consent_cookies_from_js(body)
+                                    cookies.update(sub_cookies)
+                                    needs_reload = needs_reload or sub_reload
+                        score = 100 if strong_text else 20
+                        js_candidates.append({
+                            "score": score + (10 if attr_match else 0),
+                            "kind": "js",
+                            "js_handler": js_handler,
+                            "cookies": cookies,
+                            "needs_reload": needs_reload,
+                            "text": text[:30]
+                        })
 
         if candidates:
             # Sort by score descending and return the best one
             candidates.sort(key=lambda x: x["score"], reverse=True)
             best = candidates[0]
             logger.info(f"SUCCESS: Selecting gateway {best['method']} action (Score {best['score']}): {best['url']}")
+            return best
+            
+        if js_candidates:
+            js_candidates.sort(key=lambda x: x["score"], reverse=True)
+            best = js_candidates[0]
+            if best.get("cookies"):
+                logger.info(f"P4: Selecting JS consent action (Score {best['score']}): cookies={list(best['cookies'])} reload={best['needs_reload']}")
+            else:
+                logger.info(f"P4: Selecting JS consent action (Score {best['score']}): no static cookies — will try DOM click")
             return best
             
         return None
@@ -1068,7 +1314,16 @@ class WebpageParser:
         if not hasattr(self, '_bypass_attempts'):
             self._bypass_attempts = 0 
 
-        content, error_status, error_message, http_status_code = await self._get_content()
+        # P4: a previous DOM click may have produced a mutated document — parse
+        # it directly instead of re-fetching the same gateway page.
+        if self._js_gateway_html:
+            content = self._js_gateway_html
+            self._js_gateway_html = None
+            error_status, error_message, http_status_code = None, "Success", self._last_http_status
+            logger.info(f"P4: parsing post-click mutated DOM for {self.url} (no re-fetch)")
+        else:
+            content, error_status, error_message, http_status_code = await self._get_content()
+            self._last_html = content if content else None
 
         if error_status: 
             return {}, [], error_status, error_message, http_status_code, None
@@ -1095,19 +1350,51 @@ class WebpageParser:
                 gateway_action = await self._handle_gateways(soup)
                 if gateway_action:
                     self._bypass_attempts += 1
-                    logger.info(f"Gateway Detected. Bypassing attempt {self._bypass_attempts} via: {gateway_action['url']}")
-                    
-                    success = await self._execute_bypass(gateway_action)
+                    success = False
+                    if gateway_action.get("kind") == "js":
+                        # P4: JS-only consent button (no href / no form)
+                        if gateway_action.get("cookies"):
+                            logger.info(f"Gateway Detected. JS consent bypass attempt {self._bypass_attempts} (static cookies)")
+                            success = await self._execute_js_bypass(gateway_action)
+                        if not success:
+                            logger.info(f"Gateway Detected. JS DOM-click attempt {self._bypass_attempts} via Deno worker")
+                            js_result = await self._try_js_gateway_click(gateway_action)
+                            if js_result:
+                                js_cookies = js_result.get("cookies") or {}
+                                html_after = js_result.get("html_after")
+                                needs_fetch = bool(js_result.get("reload_requested") or js_result.get("redirect"))
+                                if js_cookies:
+                                    session = self._get_sync_session()
+                                    for name, value in js_cookies.items():
+                                        try:
+                                            session.cookies.set(name, value)
+                                            logger.info(f"P4 DOM-click cookie set: {name}={value}")
+                                        except Exception as e:
+                                            logger.debug(f"P4 DOM-click cookie set failed for {name}: {e}")
+                                if html_after and not needs_fetch:
+                                    # DOM mutated in place (overlay removed, content
+                                    # revealed) — parse the new document directly.
+                                    self._js_gateway_html = html_after
+                                    success = True
+                                elif js_cookies:
+                                    # Cookie was set (reload/redirect) — re-fetch.
+                                    success = True
+                                else:
+                                    logger.debug("P4 DOM click changed nothing usable")
+                    else:
+                        logger.info(f"Gateway Detected. Bypassing attempt {self._bypass_attempts} via: {gateway_action['url']}")
+                        success = await self._execute_bypass(gateway_action)
                     if success:
-                        logger.info(f"Cookies updated. RE-FETCHING original content: {self.url}")
-                        # Sync bypass cookies to aiohttp session so re-fetch includes them
-                        if self._sync_session:
-                            for c in self._sync_session.cookies:
-                                self.session.cookie_jar.update_cookies(
-                                    {c.name: c.value},
-                                    yarl.URL(f"{urlparse(self.url).scheme}://{urlparse(self.url).netloc}/")
-                                )
-                        # Reset discovered content before re-fetching
+                        if not self._js_gateway_html:
+                            logger.info(f"Cookies updated. RE-FETCHING original content: {self.url}")
+                            # Sync bypass cookies to aiohttp session so re-fetch includes them
+                            if self._sync_session:
+                                for c in self._sync_session.cookies:
+                                    self.session.cookie_jar.update_cookies(
+                                        {c.name: c.value},
+                                        yarl.URL(f"{urlparse(self.url).scheme}://{urlparse(self.url).netloc}/")
+                                    )
+                        # Reset discovered content before re-fetching / re-parsing
                         self.media_files.clear()
                         self.links.clear()
                         # Re-parse the same URL with updated session cookies

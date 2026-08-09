@@ -94,6 +94,22 @@ VISIBILITY_HIDDEN_CLASSES = [
     "hidden", "sr-only", "visually-hidden", "bot-trap", "honeypot", "invisible", "d-none"
 ]
 
+# P4: keywords that mark a candidate as a NON-gateway (login/sign-up/account
+# technical sections). Applied to gateway button text BEFORE scoring so a
+# login modal or account link is never clicked as a "consent" action.
+GATEWAY_AVOID_KEYWORDS = [
+    "login", "sign in", "sign-in", "signin", "register", "sign up", "sign-up",
+    "log out", "logout", "log-out", "account", "password", "email", "username",
+    "checkout", "cart", "donate", "subscribe", "newsletter", "forgot", "support",
+    "help", "faq", "contact", "регистрация", "аккаунт", "пароль",
+    "зарегистрироваться", "корзина", "подписаться",
+]
+# NOTE: deliberately NOT in GATEWAY_AVOID_KEYWORDS: "войти"/"вход" — RU
+# age-gates commonly confirm with «Войти»/«Вход на сайт», which ARE positive
+# matches in GATEWAY_TEXT_PATTERNS. An avoid keyword would silently block them
+# (false negative), so login-vs-consent is disambiguated by the surrounding
+# page (overlay scoping) and the password-form skip instead.
+
 # Common texts on Gateway (Age Verification / Consent) buttons and links
 GATEWAY_TEXT_PATTERNS = [
     # English

@@ -1,7 +1,7 @@
 # Deno как лёгкий JS-движок — анализ и дизайн интеграции
 
 > **Дата:** 2026-08-07 (обновлено 2026-08-10)
-> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P3 РЕАЛИЗОВАН (2026-08-10) + P3-esc (авто-эскалация на 403/5xx). P4 (JS-гейты: consent/age подтверждения) — ДИЗАЙН ЗАФИКСИРОВАН (2026-08-10, см. §7); внедрение по плану. P2-full — отложен; P5 (CF-PoW) — отклонён (тупик).
+> **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P3 РЕАЛИЗОВАН (2026-08-10) + P3-esc (авто-эскалация на 403/5xx). P4 РЕАЛИЗОВАН (2026-08-10, см. §7): JS-гейты consent/age — статическое извлечение consent-кук из onclick/функций (всегда) + точечный DOM-клик через gateway_worker.js (при js_engine=deno; JS-эвалуация включается только в этой операции) + consent-кэш по доменам. Заодно исправлен латентный баг: sync-куки теперь уходят в aiohttp re-fetch явно (cookie_jar.update_cookies ненадёжен для IP/бес-доменных кук). 191 passed, 1 skipped. P2-full — отложен; P5 (CF-PoW) — отклонён (тупик).
 >
 > **Боевая проверка (2026-08-08, deno включён):** запуск без видимых ошибок; fullsize-дискавери дал 1940 media (было 0); DOM rule errors 0 (было 21 — фикс `$._`); окна deno.exe больше не появляются (CREATE_NO_WINDOW). Поздние фиксы: `$._` (сырой текст страницы, Imagus-конвенция) + рекурсивное расплющивание вложенных массивов в dom_worker.js; CREATE_NO_WINDOW/start_new_session в engine.py.
 > **Контекст:** `Audit.md` (полный ревью), `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` (рабочий план улучшений).
@@ -158,10 +158,19 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            локальным блокирующим сервером (requests 403 / curl 200): без
            эскалации fail, с эскалацией файл скачан. 173 passed, 1 skipped.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
-[ ] P4       JS-обход интерстициальных прокладок — ДИЗАЙН ЗАФИКСИРОВАН (2026-08-10):
-           consent/age-гейты через статическое извлечение consent-кук из JS
-           (всегда) + точечный DOM-клик по кнопке через gateway_worker.js
-           (при js_engine=deno). См. §7. Внедрение по плану.
+[x] P4       JS-обход интерстициальных прокладок — РЕАЛИЗОВАН (2026-08-10):
+           consent/age-гейты. Уровень 1 (всегда): статическое извлечение
+           consent-кук из onclick (document.cookie, setCookie/createCookie,
+           inline-функции, location.reload-флаг), JS-кандидаты в
+           _handle_gateways (вкл. div/span[onclick]), overlay-скоуп, блэклист
+           GATEWAY_AVOID_KEYWORDS, скип password-форм. Уровень 2 (deno):
+           gateway_worker.js — happy-dom с JS-эвалуацией только для клика,
+           перехват location.reload/href до клика (без stack-overflow),
+           diffCookies + html_after (мутированный DOM парсится без рефетча).
+           Consent-кэш по доменам в ParserManager (гейт обходится 1 раз/домен).
+           Фикс: sync-куки явно в aiohttp cookie= (cookie_jar ненадёжен).
+           Тесты: tests/test_gateway_bypass.py (18) + e2e с локальным
+           JS-гейтом. 191 passed, 1 skipped.
 [x] P5       старый CF-JS-PoW (отклонён — тупик против Turnstile)
 ```
 
@@ -175,7 +184,7 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
 
 ---
 
-## 7. P4 — JS-гейты: consent/age-подтверждения (дизайн, 2026-08-10)
+## 7. P4 — JS-гейты: consent/age-подтверждения (реализовано 2026-08-10)
 
 > **Цель:** обход «простых запросов подтверждений» — кнопки «I agree / Agree / Yes / Согласен / Принимаю» — которые закрывают контент. До P4 обработка покрывала только cookie-преинжект + кнопки с href/form (GET/POST). Чисто JS-кнопки (`onclick` без URL) полностью пропускались: кандидат в `_handle_gateways` попадал только `if href:`.
 
@@ -191,7 +200,7 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
 - `div/span[onclick]` не сканируются вовсе (только `a/button/input`).
 - Успешный bypass не помогает **другим страницам того же домена** (куки живут только в `_sync_session` парсера; для скачивания синкаются в shared-session с domain-scope, но для парсинга следующей страницы не применяются).
 
-### 7.3 Дизайн (два уровня + кэш)
+### 7.3 Реализация (два уровня + кэш)
 
 **Уровень 1 — статическое извлечение consent-кук из JS (Python, всегда):**
 - Расширить сканирование: `a/button/input` + элементы с `onclick`/`onmousedown`/`onkeypress` (в т.ч. `div/span`).
