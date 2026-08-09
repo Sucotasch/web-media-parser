@@ -117,6 +117,10 @@ class MediaDownloader:
         self.source_url = source_url
         self.stop_event = stop_event
         self.progress_callback = None
+        # P3 auto-escalation state (bounded single attempt per download).
+        self._escalation_tried = False
+        self._escalated_response = None
+        self._escalation_session = None
         # Use provided shared session (preferred) or fall back to a local session
         if shared_session is not None:
             self.session = shared_session
@@ -191,6 +195,57 @@ class MediaDownloader:
         return session
 
     def set_progress_callback(self, callback): self.progress_callback = callback
+
+    # P3 auto-escalation helpers (bounded: at most ONE curl_cffi attempt per
+    # download; the escalation session is created, used once, and closed).
+    def _should_escalate(self, code) -> bool:
+        """True when an HTTP status is an explicit-block signal worth a curl_cffi
+        retry (single source of truth: http_engine.should_escalate)."""
+        return http_engine.should_escalate(self.settings, code)
+
+    def _try_escalate_get(self, headers, timeout) -> bool:
+        """Perform ONE curl_cffi browser-TLS GET and keep the streaming response
+        in self._escalated_response on success. Returns True on success, False
+        otherwise. Bounded by construction: called at most once per download
+        (guarded by self._escalation_tried)."""
+        if getattr(self, "_escalation_tried", False):
+            return False
+        self._escalation_tried = True
+        session = http_engine.create_escalation_session(self.settings)
+        if session is None:
+            return False
+        try:
+            # curl_cffi carries the browser UA/headers from its profile; only
+            # per-request media headers (Accept, Referer) are merged on top.
+            resp = session.get(
+                self.url, headers=headers, timeout=timeout,
+                verify=False, stream=True, allow_redirects=True,
+            )
+            if resp.status_code >= 400:
+                resp.close()
+                logger.debug(f"Escalation GET returned HTTP {resp.status_code} for {self.url}")
+                return False
+            self._escalated_response = resp
+            self._escalation_session = session  # keep alive until stream consumed
+            logger.info(f"Escalation succeeded for {self.url} (HTTP {resp.status_code})")
+            return True
+        except Exception as e:
+            logger.debug(f"Escalation GET failed for {self.url}: {e}")
+            try:
+                session.close()
+            except Exception:
+                pass
+            return False
+
+    def _close_escalation_session(self):
+        """Close the escalation curl session (if any) after the stream is done."""
+        session = getattr(self, "_escalation_session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+            self._escalation_session = None
 
     def _get_per_request_headers(self) -> dict:
         """Build headers that vary per file and must be sent per-request.
@@ -342,7 +397,22 @@ class MediaDownloader:
             
             logger.info(f"Starting single-threaded download: {os.path.basename(self.filepath)}")
             response_get = self.session.get(self.url, headers=per_req_hdrs, stream=True, timeout=timeout_to_use)
-            response_get.raise_for_status()
+            try:
+                response_get.raise_for_status()
+            except http_engine.HTTP_ERROR_EXCEPTIONS as e:
+                # P3 auto-escalation: HTTP 403/5xx on GET is the explicit-block
+                # signal (bot-protection). Try ONE curl_cffi browser-TLS fetch
+                # before failing. Bounded (single attempt, no retry loop) so the
+                # domain-health/quarantine counters in ParserManager stay
+                # unchanged: a successful escalation downloads the file (no
+                # failure counted); a failed one returns the same HTTP error.
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                response_get.close()
+                if not self._should_escalate(code):
+                    return {"success": False, "error": f"HTTP error: {code}"}
+                if not self._try_escalate_get(per_req_hdrs, timeout_to_use):
+                    return {"success": False, "error": f"HTTP error: {code}"}
+                response_get = self._escalated_response
 
             # Some servers reject HEAD (405/403). When HEAD never succeeded,
             # validate the GET response too so an HTML error/login page is
@@ -351,6 +421,7 @@ class MediaDownloader:
                 get_content_type = (response_get.headers.get("Content-Type") or "").lower()
                 if any(t in get_content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
                     response_get.close()
+                    self._close_escalation_session()
                     return {"success": False, "error": f"Webpage/script content (Content-Type: {get_content_type})"}
 
             if content_length == 0:
@@ -363,53 +434,63 @@ class MediaDownloader:
                     os.makedirs(target_dir, exist_ok=True)
                 except OSError as e:
                     logger.error(f"Could not create target directory {target_dir}: {e}", exc_info=True)
+                    self._close_escalation_session()
                     return {"success": False, "error": f"Could not create directory: {e}"}
 
             write_buffer = bytearray()
             temp_path = self.filepath + ".partial"
-            with open(temp_path, mode) as f:
-                start_time = time.time()
-                network_chunk_size = 8192  
-                downloaded_bytes = 0
-                for chunk in response_get.iter_content(chunk_size=network_chunk_size):
-                    if self.stop_event and self.stop_event.is_set():
-                        try: os.remove(temp_path)
-                        except OSError: pass
-                        return {"success": False, "error": "Download manually aborted"}
-                    
-                    if chunk:
-                        write_buffer.extend(chunk)
-                        downloaded_bytes += len(chunk)
-                        if self.progress_callback:
-                            prog = min(100, int((downloaded_bytes / content_length) * 100)) if content_length > 0 else -1
-                            self.progress_callback(prog)
-                        if len(write_buffer) >= K.WRITE_BUFFER_SIZE:
-                            try: f.write(write_buffer); write_buffer.clear()
-                            except Exception as e: return {"success": False, "error": f"Disk write error: {e}"}
-                        if self.rate_limit > 0:
-                            elapsed = time.time() - start_time
-                            expected_time = downloaded_bytes / (self.rate_limit * 1024)
-                            if elapsed < expected_time: time.sleep(expected_time - elapsed)
-                if write_buffer:
-                    try:
-                        f.write(write_buffer)
-                    except Exception as e:
-                        return {"success": False, "error": f"Disk write error: {e}"}
+            try:
+                with open(temp_path, mode) as f:
+                    start_time = time.time()
+                    network_chunk_size = 8192  
+                    downloaded_bytes = 0
+                    for chunk in response_get.iter_content(chunk_size=network_chunk_size):
+                        if self.stop_event and self.stop_event.is_set():
+                            try: os.remove(temp_path)
+                            except OSError: pass
+                            return {"success": False, "error": "Download manually aborted"}
+                        
+                        if chunk:
+                            write_buffer.extend(chunk)
+                            downloaded_bytes += len(chunk)
+                            if self.progress_callback:
+                                prog = min(100, int((downloaded_bytes / content_length) * 100)) if content_length > 0 else -1
+                                self.progress_callback(prog)
+                            if len(write_buffer) >= K.WRITE_BUFFER_SIZE:
+                                try: f.write(write_buffer); write_buffer.clear()
+                                except Exception as e: return {"success": False, "error": f"Disk write error: {e}"}
+                            if self.rate_limit > 0:
+                                elapsed = time.time() - start_time
+                                expected_time = downloaded_bytes / (self.rate_limit * 1024)
+                                if elapsed < expected_time: time.sleep(expected_time - elapsed)
+                    if write_buffer:
+                        try:
+                            f.write(write_buffer)
+                        except Exception as e:
+                            return {"success": False, "error": f"Disk write error: {e}"}
 
-            if content_length > 0:
-                actual_size = os.path.getsize(temp_path)
-                if actual_size != content_length:
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                    return {"success": False, "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
+                if content_length > 0:
+                    actual_size = os.path.getsize(temp_path)
+                    if actual_size != content_length:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                        return {"success": False, "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
 
-            # Atomic rename from .partial to final path
-            os.replace(temp_path, self.filepath)
-            if self.progress_callback: self.progress_callback(100)
-            logger.info(f"Download completed: {os.path.basename(self.filepath)}")
-            return {"success": True, "message": "File downloaded successfully"}
+                # Atomic rename from .partial to final path
+                os.replace(temp_path, self.filepath)
+                if self.progress_callback: self.progress_callback(100)
+                logger.info(f"Download completed: {os.path.basename(self.filepath)}")
+                return {"success": True, "message": "File downloaded successfully"}
+            finally:
+                # Close an escalation curl session (if any) after the stream is
+                # consumed or the download aborted — never leak the session.
+                self._close_escalation_session()
+
+        except http_engine.HTTP_ERROR_EXCEPTIONS as e:
+            status = getattr(e, "response", None)
+            return {"success": False, "error": f"HTTP error: {getattr(status, 'status_code', 'Unknown')}"}
 
         except http_engine.HTTP_ERROR_EXCEPTIONS as e:
             status = getattr(e, "response", None)

@@ -214,6 +214,13 @@ DEFAULT_HTTP_ENGINE = "aiohttp"
 # Impersonation profile for curl_cffi ("chrome" auto-tracks the latest).
 SETTING_HTTP_IMPERSONATE = "http_impersonate"
 DEFAULT_HTTP_IMPERSONATE = "chrome"
+# Auto-escalation (P3): when a request is explicitly blocked (HTTP 403/5xx)
+# on the regular stack, retry ONCE through a curl_cffi browser-TLS session.
+# Bounded by construction (single attempt, no retry loop) so it is invisible
+# to the domain-health/quarantine counters. Default on when curl_cffi is
+# installed; 429 is never escalated (rate-limit backoff already exists).
+SETTING_HTTP_ESCALATE = "http_escalate"
+DEFAULT_HTTP_ESCALATE = True
 SETTING_PROCESS_JS = "process_js"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
@@ -250,6 +257,7 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_JS_ENGINE: "static",
     SETTING_HTTP_ENGINE: DEFAULT_HTTP_ENGINE,
     SETTING_HTTP_IMPERSONATE: DEFAULT_HTTP_IMPERSONATE,
+    SETTING_HTTP_ESCALATE: DEFAULT_HTTP_ESCALATE,
     SETTING_PROCESS_JS: DEFAULT_PROCESS_JS,
     # SETTING_PROCESS_DYNAMIC: DEFAULT_PROCESS_DYNAMIC, # Removed
     SETTING_BYPASS_COOKIE_CONSENT: DEFAULT_BYPASS_COOKIE_CONSENT,

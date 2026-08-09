@@ -148,6 +148,15 @@ UI: вкладка HTTP → «JS Engine: Static / Deno (experimental)» + чек
            Сборка: --collect-all=curl_cffi (libcurl-impersonate статически в
            _wrapper.pyd). 165 passed, 1 skipped; фингерпринт подтверждён
            (JA4 t13d1516h2, HTTP/2, браузерный UA); скачивание в бандле OK.
+[✓] P3-esc  Авто-эскалация на явную блокировку (2026-08-10): при HTTP 403/5xx
+           (после исчерпания ретраев для 5xx) — ОДИН bounded запрос через
+           curl_cffi browser-TLS. Прозрачно для карантина: успех → failures
+           не растёт; провал → та же ошибка/статус, что и без эскалации.
+           429 не эскалируется (rate-limit backoff уже есть); при глобальном
+           http_engine=curl_cffi эскалация отключена (не дублируем curl).
+           Настройка http_escalate (дефолт on, Settings → HTTP). E2E-тест с
+           локальным блокирующим сервером (requests 403 / curl 200): без
+           эскалации fail, с эскалацией файл скачан. 173 passed, 1 skipped.
 [ ] P2-full  Ghostery adblocker (отложено — текущие эвристики покрывают нужды)
 [ ] P4       JS-обход интерстициальных прокладок (отложено — sieve-POST цепочка
            уже закрывает imx-стиль continue)

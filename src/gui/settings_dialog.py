@@ -462,6 +462,22 @@ class SettingsDialog(QDialog):
         )
         http_grid.addWidget(self.http_engine_combo, 6, 1)
 
+        # P3 auto-escalation: one curl_cffi attempt when a request is explicitly
+        # blocked (HTTP 403/5xx). Bounded — single attempt, invisible to the
+        # domain-health/quarantine counters.
+        http_grid.addWidget(QLabel("Escalate on block:"), 7, 0)
+        self.http_escalate_check = QCheckBox()
+        self.http_escalate_check.setChecked(K.DEFAULT_HTTP_ESCALATE)
+        self.http_escalate_check.setToolTip(
+            "When a site answers HTTP 403/5xx (explicit block), retry that one "
+            "request through curl_cffi's browser TLS fingerprint before giving "
+            "up. A single bounded attempt — it never loops, and it is invisible "
+            "to the domain quarantine counters (a successful retry avoids the "
+            "quarantine; a failed one behaves exactly as without escalation). "
+            "Requires curl_cffi installed; 429 is never retried this way."
+        )
+        http_grid.addWidget(self.http_escalate_check, 7, 1)
+
         http_layout.addWidget(http_group)
 
         # Logging tab
@@ -698,6 +714,9 @@ class SettingsDialog(QDialog):
         )
         http_idx = self.http_engine_combo.findData(http_engine_val)
         self.http_engine_combo.setCurrentIndex(http_idx if http_idx >= 0 else 0)
+        self.http_escalate_check.setChecked(
+            self.settings.get(K.SETTING_HTTP_ESCALATE, K.DEFAULT_HTTP_ESCALATE)
+        )
 
         # Logging
         self.log_to_file_check.setChecked(self.settings.get("log_to_file", False))
@@ -759,6 +778,7 @@ class SettingsDialog(QDialog):
         settings["retry_count"] = self.retry_count_spin.value()
         settings["proxy"] = self.proxy_edit.text().strip()
         settings[K.SETTING_HTTP_ENGINE] = self.http_engine_combo.currentData() or "aiohttp"
+        settings[K.SETTING_HTTP_ESCALATE] = self.http_escalate_check.isChecked()
 
         # Logging
         settings["log_to_file"] = self.log_to_file_check.isChecked()
@@ -856,6 +876,10 @@ class SettingsDialog(QDialog):
         # release), so validity is enforced fail-open at session creation in
         # src/parser/http_engine.create_sync_session, not by a brittle
         # hardcoded whitelist here.
+        # http_escalate must stay a bool (corrupt settings.json can't flip it
+        # into a truthy string).
+        if not isinstance(settings.get(K.SETTING_HTTP_ESCALATE), bool):
+            settings[K.SETTING_HTTP_ESCALATE] = K.DEFAULT_HTTP_ESCALATE
         # Normalize stop_words to a list of non-empty stripped strings.
         # Protects against a corrupted settings.json where stop_words is a
         # string (iterating chars) or contains non-string items.

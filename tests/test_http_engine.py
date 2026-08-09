@@ -16,6 +16,7 @@ Covers:
 import sys
 import os
 import pytest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -179,3 +180,146 @@ def test_local_downloader_session_default_is_requests():
     import requests
     assert isinstance(dl.session, requests.Session)
     dl.session.close()
+
+
+# --- P3 auto-escalation (bounded single attempt on explicit block) -----------
+
+def test_should_escalate_statuses():
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg", settings={}
+    )
+    # 403 and 5xx are explicit-block signals -> escalate
+    assert dl._should_escalate(403) is True
+    assert dl._should_escalate(500) is True
+    assert dl._should_escalate(503) is True
+    # 429 (rate limit) and other 4xx are never escalated
+    assert dl._should_escalate(429) is False
+    assert dl._should_escalate(404) is False
+    assert dl._should_escalate(401) is False
+    assert dl._should_escalate(None) is False
+
+
+def test_should_escalate_disabled_by_setting():
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg",
+        settings={K.SETTING_HTTP_ESCALATE: False},
+    )
+    assert dl._should_escalate(403) is False
+
+
+def test_should_escalate_off_when_engine_is_curl(monkeypatch):
+    """No escalation when the primary engine is already curl_cffi — the block
+    happened on curl itself; a second curl session is a wasted duplicate."""
+    monkeypatch.setattr(http_engine, "CURL_CFFI_AVAILABLE", True)
+    monkeypatch.setattr(http_engine, "_curl_requests", type("M", (), {"Session": lambda **k: None})())
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg",
+        settings={K.SETTING_HTTP_ENGINE: "curl_cffi"},
+    )
+    assert dl._should_escalate(403) is False
+    assert dl._should_escalate(503) is False
+    assert http_engine.should_escalate({K.SETTING_HTTP_ENGINE: "curl_cffi"}, 403) is False
+    assert http_engine.should_escalate({K.SETTING_HTTP_ENGINE: "aiohttp"}, 403) is True
+    assert http_engine.should_escalate({}, 429) is False
+
+
+def test_escalate_get_is_single_attempt(monkeypatch):
+    """_try_escalate_get is bounded: called once per download, guarded."""
+    if not http_engine.CURL_CFFI_AVAILABLE:
+        pytest.skip("curl_cffi not installed")
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg", settings={}
+    )
+    dl.session = MagicMock()
+
+    class FakeResp:
+        status_code = 200
+        def close(self):
+            pass
+
+    fake_session = MagicMock()
+    fake_session.get.return_value = FakeResp()
+
+    def fake_create(settings):
+        return fake_session
+
+    monkeypatch.setattr(http_engine, "create_escalation_session", fake_create)
+    monkeypatch.setattr(dl, "_escalation_tried", False)
+    first = dl._try_escalate_get({}, 10)
+    second = dl._try_escalate_get({}, 10)  # must be a no-op (guarded)
+    assert first is True
+    assert second is False
+    assert fake_session.get.call_count == 1
+    assert dl._escalation_tried is True
+    dl._close_escalation_session()
+
+
+def test_escalate_get_fails_open_when_curl_missing(monkeypatch):
+    """Escalation without curl_cffi returns False — caller fails through."""
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg", settings={}
+    )
+    monkeypatch.setattr(dl, "_escalation_tried", False)
+    monkeypatch.setattr(http_engine, "create_escalation_session", lambda s: None)
+    assert dl._try_escalate_get({}, 10) is False
+
+
+def test_escalate_get_rejects_http_error(monkeypatch):
+    """Escalation GET answering 4xx/5xx returns False (no success)."""
+    if not http_engine.CURL_CFFI_AVAILABLE:
+        pytest.skip("curl_cffi not installed")
+    dl = MediaDownloader(
+        url="https://example.com/i.jpg", filepath="/tmp/i.jpg", settings={}
+    )
+    dl.session = MagicMock()
+    monkeypatch.setattr(dl, "_escalation_tried", False)
+
+    class FakeResp403:
+        status_code = 403
+        def close(self):
+            pass
+
+    fake_session = MagicMock()
+    fake_session.get.return_value = FakeResp403()
+    monkeypatch.setattr(http_engine, "create_escalation_session", lambda s: fake_session)
+    assert dl._try_escalate_get({}, 10) is False
+    assert dl._escalation_tried is True  # still counted — single attempt
+
+
+def test_webpage_parser_escalate_disabled_returns_none():
+    """Parser escalation returns (None, status, False) immediately when disabled."""
+    import asyncio
+    from src.parser.webpage_parser import WebpageParser
+    p = WebpageParser(
+        url="https://example.com/",
+        settings={K.SETTING_HTTP_ESCALATE: False},
+        process_js=False,
+        external_session=MagicMock(),
+    )
+    out = asyncio.run(p._try_escalate_fetch())
+    assert out == (None, None, False)
+
+
+def test_webpage_parser_escalate_binary_flag(monkeypatch):
+    """Escalation returning image/* sets is_binary=True (content-type, not bytes)."""
+    if not http_engine.CURL_CFFI_AVAILABLE:
+        pytest.skip("curl_cffi not installed")
+    import asyncio
+    from src.parser.webpage_parser import WebpageParser
+    p = WebpageParser(
+        url="https://example.com/",
+        settings={},
+        process_js=False,
+        external_session=MagicMock(),
+    )
+
+    class FakeResp:
+        status_code = 200
+        headers = {"Content-Type": "image/jpeg"}
+        content = b""
+
+    fake_session = MagicMock()
+    fake_session.get.return_value = FakeResp()
+    monkeypatch.setattr(http_engine, "create_escalation_session", lambda s: fake_session)
+    out = asyncio.run(p._try_escalate_fetch())
+    assert out == (b"", 200, True)

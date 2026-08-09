@@ -71,6 +71,47 @@ def impersonate_profile(settings: Dict[str, Any]) -> str:
     return settings.get(K.SETTING_HTTP_IMPERSONATE, DEFAULT_IMPERSONATE) or DEFAULT_IMPERSONATE
 
 
+def should_escalate(settings: Dict[str, Any], code) -> bool:
+    """True when an HTTP status is an explicit-block signal worth one curl_cffi
+    retry: 403 (canonical block) or 5xx (bot-protection often answers 5xx to
+    non-browser TLS). 429 is never escalated — rate-limit backoff already exists
+    and a different TLS fingerprint cannot help. Also never escalates when the
+    primary engine is already curl_cffi (the block happened on curl itself; a
+    second curl session is a wasted duplicate request).
+    """
+    if not settings.get(K.SETTING_HTTP_ESCALATE, K.DEFAULT_HTTP_ESCALATE):
+        return False
+    if engine_uses_curl(settings):
+        return False
+    if code is None:
+        return False
+    return code == 403 or 500 <= code < 600
+
+
+def create_escalation_session(settings: Dict[str, Any]):
+    """Create a curl_cffi session for explicit-block escalation (P3 auto-fallback).
+
+    Unlike create_sync_session this does NOT depend on the global http_engine
+    setting: it is used as a bounded second chance when a request was explicitly
+    blocked (HTTP 403/5xx) on the regular stack. Returns None when curl_cffi is
+    unavailable so callers can fail through to their normal error path.
+
+    Bounded by construction: callers must attempt AT MOST ONE request through
+    this session and then close it — never retry through it. This keeps the
+    escalation invisible to the domain-health/quarantine counters (a successful
+    escalation never reaches the failure counter; a failed one returns the same
+    error as if no escalation had been attempted).
+    """
+    if not CURL_CFFI_AVAILABLE:
+        return None
+    profile = impersonate_profile(settings)
+    try:
+        return _curl_requests.Session(impersonate=profile)
+    except Exception as e:  # pragma: no cover - depends on curl_cffi version
+        logger.warning(f"curl_cffi escalation session unavailable ({e})")
+        return None
+
+
 def create_sync_session(settings: Dict[str, Any]):
     """Create a requests-compatible sync Session honoring http_engine.
 

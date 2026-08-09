@@ -100,6 +100,8 @@ class WebpageParser:
         self.js_redirect_count = 0 
         self._sync_session = None # Lazy-loaded persistent session for fallback
         self._bypass_attempts = 0 # Track bypass attempts to prevent loops
+        self._last_http_status: Optional[int] = None  # For P3 escalation error reporting
+        self._escalated_binary: bool = False  # Set when escalation returned binary media
 
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
@@ -117,6 +119,7 @@ class WebpageParser:
         max_retries = self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
         content_bytes = None
         http_status = None
+        escalation_tried = False  # P3: one curl_cffi attempt on explicit block, ever
         
         # 1. Very fast aiohttp attempt (or two)
         for attempt in range(max_retries + 1):
@@ -181,6 +184,25 @@ class WebpageParser:
                         msg = f"Rate limited (429) after {max_retries+1} attempts for {self.url}"
                         logger.error(msg)
                         return None, K.PARSER_HTTP_ERROR_4XX, msg, http_status
+                    elif http_status == 403:
+                        # P3 auto-escalation: 403 is the canonical "explicit block"
+                        # signal — try ONE curl_cffi browser-TLS fetch before
+                        # giving up. Bounded (single attempt, no retry loop) so it
+                        # is invisible to the domain-health/quarantine counters: a
+                        # successful escalation never reaches the failure counter;
+                        # a failed one returns the same 4xx error as today.
+                        msg = f"Client HTTP error {http_status} for {self.url}"
+                        block_status = http_status
+                        from src.parser import http_engine as _he
+                        if _he.should_escalate(self.settings, http_status):
+                            logger.info(f"HTTP 403 (block?) for {self.url} — escalating to curl_cffi...")
+                            content_bytes, http_status, is_binary = await self._try_escalate_fetch()
+                            escalation_tried = True
+                            if content_bytes is not None:
+                                self._escalated_binary = is_binary
+                                break
+                        logger.error(msg)
+                        return None, K.PARSER_HTTP_ERROR_4XX, msg, block_status
                     elif 400 <= http_status < 500:
                         msg = f"Client HTTP error {http_status} for {self.url}"
                         logger.error(msg)
@@ -189,6 +211,18 @@ class WebpageParser:
                         msg = f"Server HTTP error {http_status} for {self.url}"
                         logger.error(msg)
                         if attempt < max_retries: continue
+                        # P3 auto-escalation on 5xx (after retries exhausted):
+                        # bot-protection often answers 5xx to non-browser TLS.
+                        from src.parser import http_engine as _he2
+                        if not escalation_tried and _he2.should_escalate(self.settings, http_status):
+                            server_status = http_status
+                            logger.info(f"HTTP {server_status} for {self.url} after retries — escalating to curl_cffi...")
+                            content_bytes, http_status, is_binary = await self._try_escalate_fetch()
+                            escalation_tried = True
+                            if content_bytes is not None:
+                                self._escalated_binary = is_binary
+                                break
+                            return None, K.PARSER_HTTP_ERROR_5XX, msg, server_status
                         return None, K.PARSER_HTTP_ERROR_5XX, msg, http_status
                     
                     # Binary media guard: if a "webpage" actually answers with an
@@ -214,7 +248,7 @@ class WebpageParser:
                 return None, K.PARSER_UNKNOWN_ERROR, msg, None
 
         # 2. Fallback to requests if aiohttp couldn't fetch bytes (TLS fingerprint / block)
-        if not content_bytes:
+        if not content_bytes and not escalation_tried:
             try:
                 logger.info(f"Using sync fallback (requests) for {self.url}")
                 loop = asyncio.get_event_loop()
@@ -246,6 +280,12 @@ class WebpageParser:
                 logger.error(f"Fallback failed for {self.url}: {fb_err}")
                 return None, K.PARSER_NETWORK_ERROR, f"Fallback failed: {str(fb_err)}", http_status
 
+        if getattr(self, "_escalated_binary", False) and content_bytes == b"":
+            # Escalation returned binary media — clean empty parse, mirroring
+            # the aiohttp binary-media guard above. (An empty HTML/body is NOT
+            # binary: _try_escalate_fetch only sets the flag on image/video/
+            # audio Content-Type.)
+            return "", K.PARSER_SUCCESS, "Binary media content, not HTML", http_status
         if not content_bytes:
             return None, K.PARSER_NETWORK_ERROR, "Failed to retrieve content bytes after all attempts", http_status
 
@@ -273,6 +313,62 @@ class WebpageParser:
                 return await self._get_content() 
         
         return decoded_content, None, "Success", http_status 
+
+    async def _try_escalate_fetch(self) -> Tuple[Optional[bytes], Optional[int], bool]:
+        """P3 auto-escalation: fetch self.url ONCE through a curl_cffi browser-TLS
+        session when the regular stack was explicitly blocked (HTTP 403/5xx).
+
+        Returns (content_bytes, http_status, is_binary) on success (is_binary
+        True for image/video/audio payloads), (None, http_status, False) on
+        failure. Bounded by construction — exactly one attempt, no retry loop —
+        so the caller's domain-health/quarantine accounting is unchanged (a
+        failed escalation returns the same error the caller would have produced
+        without it). Returns (None, status, False) immediately when curl_cffi is
+        unavailable or http_escalate is disabled.
+        """
+        if not self.settings.get(K.SETTING_HTTP_ESCALATE, K.DEFAULT_HTTP_ESCALATE):
+            return None, self._last_http_status, False
+        from src.parser import http_engine
+        session = http_engine.create_escalation_session(self.settings)
+        if session is None:
+            return None, self._last_http_status, False
+        try:
+            loop = asyncio.get_running_loop()
+            headers = {}
+            source_url = self.settings.get("_source_url")
+            if source_url and source_url != self.url:
+                headers["Referer"] = source_url
+
+            def _esc_fetch():
+                # Aggressive timeout: escalation is a bonus, never a hang.
+                resp = session.get(
+                    self.url, headers=headers, timeout=10,
+                    allow_redirects=True, verify=False,
+                )
+                return resp
+
+            resp = await loop.run_in_executor(None, _esc_fetch)
+            status = resp.status_code
+            self._last_http_status = status
+            if status >= 400:
+                logger.debug(f"Escalation fetch returned HTTP {status} for {self.url}")
+                return None, status, False
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            body = resp.content
+            if content_type.startswith(("image/", "video/", "audio/")):
+                logger.debug(f"Escalation got binary media ({content_type}) for {self.url}")
+                return b"", status, True
+            if body:
+                logger.info(f"Escalation succeeded for {self.url} (HTTP {status}, {len(body)} bytes)")
+            return body, status, False
+        except Exception as e:
+            logger.debug(f"Escalation fetch failed for {self.url}: {e}")
+            return None, self._last_http_status, False
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     async def _detect_encoding(self, content_bytes: bytes) -> str:
         if content_bytes.startswith(b"\xef\xbb\xbf"): return "utf-8-sig"
