@@ -704,7 +704,19 @@ class WebpageParser:
 
         if width_str and height_str:
             try:
-                width_val, height_val = int(width_str), int(height_str)
+                # Strip a trailing unit ("78px" -> 78); sites commonly emit
+                # width/height with a px suffix, and int("78px") would raise,
+                # silently dropping the dimensions attribute so UI icons
+                # (e.g. /img/messenger-cam.png at 78px) bypass the
+                # min-dimension filter in _is_significant_media.
+                # Only absolute px (and pt) are meaningful as a dimension;
+                # relative units (%/em) raise -> dimension filter stays
+                # fail-open for them, exactly as before.
+                def _parse_dim(raw):
+                    raw = str(raw).strip().lower()
+                    raw = re.sub(r"(?:px|pt)$", "", raw).strip()
+                    return int(raw)
+                width_val, height_val = _parse_dim(width_str), _parse_dim(height_str)
                 attributes["dimensions"] = {"width": width_val, "height": height_val}
                 high_quality_threshold = max(800, min_img_width * 2) 
                 for c in candidates:
@@ -1129,27 +1141,59 @@ class WebpageParser:
         # A page is suspicious if it has < 5 images AND contains gateway keywords or overlays
         
         text_content = soup.get_text().lower()
+        # F6: an age phrase is only a gate signal on MEDIA-POOR pages and must
+        # not come from footer/legal boilerplate. Ordinary content pages carry
+        # 18+ record-keeping notices ("18 years", "adult content" — e.g. the
+        # §2257 disclaimer) in their <footer>; treating that as a gateway made
+        # every viewer page trip the bypass loop (observed: 457 false
+        # "Potential gateway detected" -> 3 bypass attempts and 4x re-parses
+        # per page). Real age gates are stubs: they hide the content
+        # (media-poor by definition) and usually use an explicit overlay
+        # (.age-gate etc.), which still triggers directly below.
+        media_poor = len(self.media_files) < K.GATEWAY_MIN_MEDIA_THRESHOLD
+        has_age_phrase = False
+        if media_poor:
+            # Age-phrase scan text with footer/legal boilerplate stripped (the
+            # §2257 "18 years" notice sits in <footer>/disclaimer elements on
+            # ordinary pages). Only computed for media-poor pages — the clause
+            # it feeds requires media_poor anyway, so content pages skip the
+            # extra tree passes entirely.
+            age_scan_text = text_content
+            for el in soup.find_all(["footer", "aside"]) + \
+                     soup.find_all(class_=re.compile(r"disclaimer|2257|record-?keep|legal", re.IGNORECASE)) + \
+                     soup.find_all(id=re.compile(r"disclaimer|2257|record-?keep|legal", re.IGNORECASE)):
+                # get_text() without a separator matches the way text_content
+                # was built above (soup.get_text() concatenates with no
+                # separator), so the replace actually removes it. All
+                # occurrences are removed — duplicated boilerplate (e.g.
+                # mobile + desktop disclaimer variants) must not leave a copy
+                # in the scan text.
+                el_text = el.get_text().lower()
+                if el_text:
+                    age_scan_text = age_scan_text.replace(el_text, " ")
+            has_age_phrase = any(kw in age_scan_text for kw in (
+                "confirm your age", "18 years", "over 18", "adult content",
+                "мне есть 18", "старше 18", "вход только",
+            ))
 
-        # WP-5.3 gateway suspicion: require an unambiguous overlay element or an
-        # age phrase. Generic modal/footer selectors (.modal-content, #disclaimer)
-        # appear on many ordinary sites, so they only count when consent text is
-        # present. Bare consent words alone trigger only when media is absent.
+        # WP-5.3 gateway suspicion: require an unambiguous overlay element, an
+        # age phrase on a media-poor page, or consent text combined with a
+        # generic modal/footer selector / media absence. Generic modal/footer
+        # selectors (.modal-content, #disclaimer) appear on many ordinary
+        # sites, so they only count when consent text is present. Bare consent
+        # words alone trigger only when media is absent.
         has_overlay = any(self._select_one_safe(soup, sel) for sel in K.GATEWAY_OVERLAY_SELECTORS)
         has_generic_overlay = any(
             self._select_one_safe(soup, sel) for sel in K.GATEWAY_GENERIC_OVERLAY_SELECTORS
         )
-        has_age_phrase = any(kw in text_content for kw in (
-            "confirm your age", "18 years", "over 18", "adult content",
-            "мне есть 18", "старше 18", "вход только",
-        ))
         consent_phrase = any(kw in text_content for kw in (
             "i agree", "cookie", "согласен", "accept", "agree"
         ))
         is_suspicious = (
             has_overlay
-            or has_age_phrase
+            or (media_poor and has_age_phrase)
             or (has_generic_overlay and consent_phrase)
-            or (len(self.media_files) < K.GATEWAY_MIN_MEDIA_THRESHOLD and consent_phrase)
+            or (media_poor and consent_phrase)
         )
 
         if not is_suspicious:
@@ -1428,15 +1472,68 @@ class WebpageParser:
             return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code, None
 
 
+    def _is_preview_transition(self, elem) -> bool:
+        """True if this element is a thumbnail image wrapped in a link to a
+        PAGE (thumbnail -> viewer/fullsize transition), so its own URL is a
+        preview, not the content.
+
+        Mirrors the parent-link logic in _extract_images: an <img> whose
+        parent <a href> points at a webpage (not a media file) is a gallery
+        thumbnail whose fullsize lives on the linked page. Dynamic-content
+        scans (lazy data-src, data-* attributes, JS regex) must not queue such
+        previews as media — the linked page is crawled and yields the real
+        image (observed: 444 t1.pictoa previews queued per viewer page, 244 of
+        them rejected as 'File too small').
+        """
+        if elem is None or getattr(elem, "name", None) != "img":
+            return False
+        parent_a = elem.find_parent("a", href=True)
+        if not parent_a or not self._is_element_visible(parent_a):
+            return False
+        link_abs = urljoin(self.url, parent_a.get("href", ""))
+        if not link_abs.startswith(("http://", "https://")):
+            return False
+        # A link straight to a media file is not a transition — it IS the media.
+        if is_image_url(link_abs) or is_media_url(link_abs):
+            return False
+        return True
+
     async def _handle_dynamic_content(self, soup: BeautifulSoup) -> None:
         # The check `if not self.process_js: return` is no longer strictly needed here
         # because the call to this method is already gated by self.process_js.
         # However, keeping it doesn't harm and adds an extra layer of safety if called from elsewhere.
         try:
             if not self.process_js: return 
+            # Pre-collect the URLS of thumbnail->page transitions so every
+            # dynamic scan below (lazy data-src, data-* attributes, JS regex)
+            # can skip previews that will be resolved as fullsize when the
+            # linked page is crawled. Without this the three scans each re-add
+            # the same preview URLs as media (observed: 444 t1.pictoa previews
+            # in the download queue, 244 rejected 'File too small' — junk that
+            # churns HEAD requests and inflates the queue).
+            preview_urls = set()
+            for img in soup.find_all("img"):
+                if not self._is_preview_transition(img):
+                    continue
+                for attr in ("src", "data-src", "data-lazy-src", "data-original",
+                             "data-lazy", "data-srcset", "data-lazy-srcset"):
+                    val = img.get(attr)
+                    if not val:
+                        continue
+                    for piece in val.split(","):
+                        piece = piece.strip().split()[0] if piece.strip() else ""
+                        if piece and is_media_url(piece):
+                            preview_urls.add(urljoin(self.url, piece))
+            if preview_urls:
+                logger.debug(f"Skipping {len(preview_urls)} thumbnail-transition preview URLs on {self.url}")
+
             for script_tag in soup.find_all("script"):
-                if script_tag.string: self._extract_media_from_js(script_tag.string)
+                if script_tag.string: self._extract_media_from_js(script_tag.string, preview_urls)
             for elem in soup.find_all(True): 
+                if self._is_preview_transition(elem):
+                    # Skip data-* extraction on preview thumbnails — the URL is
+                    # a transition thumbnail, not page content.
+                    continue
                 for framework, pattern in self.JS_PATTERNS["framework_patterns"].items():
                     if re.search(pattern, str(elem)): self._process_framework_element(elem, framework)
                 for attr_name in elem.attrs:
@@ -1446,6 +1543,8 @@ class WebpageParser:
                     url_val = elem.get(data_attr_pattern)
                     if url_val and is_media_url(url_val): 
                         abs_url = urljoin(self.url, url_val)
+                        if abs_url in preview_urls:
+                            continue
                         attrs = {"source": f"lazy-data-{data_attr_pattern}"}
                         media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
                         if self._is_significant_media(media_type, abs_url, attrs):
@@ -1453,7 +1552,8 @@ class WebpageParser:
         except Exception as e:
             logger.error(f"Error in static JS/dynamic content analysis for {self.url}: {str(e)}", exc_info=True)
 
-    def _extract_media_from_js(self, js_content: str) -> None:
+    def _extract_media_from_js(self, js_content: str, preview_urls: set = None) -> None:
+        preview_urls = preview_urls or set()
         for pattern_type, patterns in self.JS_PATTERNS.items():
             if pattern_type in ["image_sources", "video_sources", "data_attributes"]:
                 media_hint = "image" if "image" in pattern_type else "video" if "video" in pattern_type else "image" 
@@ -1462,6 +1562,8 @@ class WebpageParser:
                         url = match.group(1) 
                         if url and url.startswith(("http://", "https://", "/")) and is_media_url(url):
                             abs_url = urljoin(self.url, url)
+                            if abs_url in preview_urls:
+                                continue
                             attrs = {"source": f"js-static-{pattern_type}"}
                             if self._is_significant_media(media_hint, abs_url, attrs):
                                 self.media_files.append((media_hint, abs_url, attrs))

@@ -223,6 +223,71 @@ def test_plain_page_with_consent_word_not_suspicious():
     assert action is None
 
 
+# --- F6: age-phrase false positives ---------------------------------------
+
+
+def test_footer_age_disclaimer_with_media_not_suspicious():
+    # The exact pictoa false positive: a viewer page with real media whose
+    # footer carries an 18+ record-keeping notice ("18 years", "adult
+    # content"). Must NOT be treated as a gateway — the age clause requires a
+    # media-poor page.
+    html = """<html><body>
+      <img src="/content/photo-1.jpg" width="640" height="480">
+      <img src="/content/photo-2.jpg" width="640" height="480">
+      <footer>
+        <p>All models are 18 years or older. This site contains adult content.</p>
+      </footer>
+    </body></html>"""
+    parser, soup = _make_parser(html)
+    asyncio.run(parser._extract_images(soup))
+    action = asyncio.run(parser._handle_gateways(soup))
+    assert action is None
+
+
+def test_media_rich_age_phrase_not_suspicious():
+    # Age phrase in the page body on a page that already yielded media — a
+    # content page, not a gate.
+    html = """<html><body>
+      <img src="/content/photo-1.jpg" width="640" height="480">
+      <p>For adults 18 years and older. Adult content.</p>
+      <img src="/content/photo-2.jpg" width="640" height="480">
+    </body></html>"""
+    parser, soup = _make_parser(html)
+    asyncio.run(parser._extract_images(soup))
+    action = asyncio.run(parser._handle_gateways(soup))
+    assert action is None
+
+
+def test_footer_age_disclaimer_without_media_not_suspicious():
+    # Media-poor page whose ONLY age phrase sits in footer boilerplate next to
+    # a confirm link: the §2257 notice must not turn the footer link into a
+    # gateway action. Footer/legal boilerplate is stripped from the age scan.
+    html = """<html><body>
+      <footer>
+        <p>All models are 18 years or older. Adult content.</p>
+        <a href="/enter">I am 18, enter</a>
+      </footer>
+    </body></html>"""
+    parser, soup = _make_parser(html)
+    action = asyncio.run(parser._handle_gateways(soup))
+    assert action is None
+
+
+def test_media_poor_age_gate_still_detected():
+    # Real age gate: media-poor stub page with the age phrase in the body and
+    # a confirm link — must still produce a bypass action.
+    html = """<html><body>
+      <h1>This website contains adult content</h1>
+      <p>You must be over 18 to enter this site.</p>
+      <a href="/enter">I am over 18, enter</a>
+    </body></html>"""
+    parser, soup = _make_parser(html)
+    action = asyncio.run(parser._handle_gateways(soup))
+    assert action is not None
+    # _handle_gateways returns the raw href; _execute_bypass urljoins it.
+    assert action.get("url") == "/enter"
+
+
 # --- Level 2: Deno gateway worker -----------------------------------------
 
 

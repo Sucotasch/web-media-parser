@@ -35,12 +35,25 @@ class PrioritizedURL:
 class PriorityURLQueue:
     """Intelligent URL queue with priority-based processing"""
 
+    # Page-file extensions stripped from path segments by _path_parts_for_compare
+    # (compiled once — it runs for every priority calculation).
+    _PAGE_EXT_RE = re.compile(r"\.(?:html?|php\d*|aspx?|jsp)$")
+
     def __init__(self, settings: Dict[str, Any] = None):
         self._queue = []
         self._url_scores: Dict[str, float] = {}
         self._domain_scores: Dict[str, float] = {}
         self._url_patterns: Dict[str, int] = {}
         self.settings = settings or {}
+        # F1 crawler fix: URLs already pushed in this task run. put() drops
+        # repeat discovery pushes so every URL is queued once at its shallowest
+        # depth (deep re-discoveries previously won the pop with higher
+        # priority, so pages were parsed at max depth where their links are
+        # dropped — dead-end galleries and premature "natural completion").
+        # Deliberate re-queues are exempt: interstitial_retry (media→webpage
+        # recovery), from_media_item (webpage-looking media re-parse) and
+        # bypass_checks (state restoration).
+        self._seen = set()
         # NOTE: _lock and _not_empty are asyncio primitives.
         # They are created lazily in reset() which is called from
         # ParserManager.start_parsing() after the event loop is running.
@@ -53,6 +66,7 @@ class PriorityURLQueue:
         self._lock = asyncio.Lock()
         self._not_empty = asyncio.Event()
         self._waiters = []
+        self._seen = set()
 
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL"""
@@ -86,6 +100,15 @@ class PriorityURLQueue:
         source_parsed = urlparse(source_url)
         url_domain = url_parsed.netloc.lower()
         source_domain = source_parsed.netloc.lower()
+
+        # Same-domain links are always excavation-eligible regardless of path
+        # prefix: tag/category/section hubs (e.g. /c/brunette-14, /recent,
+        # /popular) hold the most media yet were dropped by the path-relationship
+        # logic below — the crawler declared "done" while content-rich sections
+        # sat one hop away. Noise is already filtered upstream by stop-words and
+        # should_skip_crawl_url; stay_in_domain still bounds the crawl below.
+        if url_domain == source_domain:
+            return True
 
         # Domain check
         if url_domain != source_domain:
@@ -174,6 +197,24 @@ class PriorityURLQueue:
             
         return False
 
+    @classmethod
+    def _path_parts_for_compare(cls, path: str):
+        """Path segments for structural URL comparison.
+
+        Strips a page-file extension (.html/.htm/.php*/.aspx/.jsp) from the
+        last segment so that "/albums/name.html" compares equal to
+        "/albums/name" — album pages with an .html suffix and their viewer
+        pages would otherwise share only the section segment, flattening
+        same-gallery vs foreign-album priorities to the same value.
+        """
+        parts = []
+        for p in (path or "").strip("/").split("/"):
+            if p and cls._PAGE_EXT_RE.search(p):
+                p = cls._PAGE_EXT_RE.sub("", p)
+            if p:
+                parts.append(p)
+        return parts
+
     def _calculate_url_priority(
         self, url: str, depth: int, source_url: str = "", context: dict = None
     ) -> float:
@@ -244,10 +285,17 @@ class PriorityURLQueue:
                 base_priority *= 2.0
                 # Don't log this as it happens for every URL on the same domain
                 
-                # Calculate path similarity (common directory structure)
-                source_parts = [p for p in source_path.split("/") if p]
-                current_parts = [p for p in current_path.split("/") if p]
-                
+                # Normalize path parts for structural comparison: strip a
+                # page-file extension (.html/.htm/.php*/.aspx/.jsp) from the
+                # LAST segment so "/albums/name.html" and "/albums/name" are
+                # the same directory. Without this an album URL ending in
+                # .html made its own viewer pages share only the section
+                # segment with foreign albums — identical priorities, so the
+                # crawler abandoned the start gallery after 1 of 12 viewers
+                # (observed) and ran into other albums instead.
+                source_parts = self._path_parts_for_compare(source_path)
+                current_parts = self._path_parts_for_compare(current_path)
+
                 # Find common path prefix length
                 common_length = 0
                 for i in range(min(len(source_parts), len(current_parts))):
@@ -255,19 +303,62 @@ class PriorityURLQueue:
                         common_length += 1
                     else:
                         break
-                
+
                 # Strong boost for sharing path prefix with original URL
                 if common_length > 0:
                     # The more path components in common, the higher the boost
                     path_similarity_factor = 3.0 + (common_length * 2.0)
                     base_priority *= path_similarity_factor
                     logger.debug(f"Boosting URL with similar path: {url} (common={common_length})")
-                    
-                # Check if this looks like a sibling page of the source URL
-                # (same parent directory but different file/endpoint)
-                if len(source_parts) >= 1 and len(current_parts) >= 1 and common_length == len(source_parts) - 1:
-                    base_priority *= 3.0  # Boost sibling pages
-                    logger.debug(f"Boosting sibling page: {url}")
+
+                # NOTE: `source_url` here is the EFFECTIVE source — put()
+                # substitutes context['start_url'] into it for stay-in-domain
+                # enforcement, so every link in the crawl compares against the
+                # START page, not the page it was actually found on. That is
+                # correct for the relationship gate and the "near the start"
+                # path-similarity factor above, but it must NOT feed the
+                # structural same-gallery boost below: once the crawler has
+                # left the start gallery, sibling viewers of ANY other album
+                # share only the section segment with the start URL, so the
+                # boost silently never fires and gallery completion is left to
+                # the drift of _domain_scores (observed: a foreign album
+                # drained 2 of 12 viewers while another, discovered a moment
+                # later with a marginally higher domain score, drained all 12
+                # first). The structural boost therefore compares against the
+                # REAL page the link came from (context['source_url']), which
+                # _process_parser_results sets to the currently parsed page.
+                gallery_source = context.get("source_url") or source_url
+                gallery_source_path = urlparse(gallery_source).path.lower()
+                gallery_parts = self._path_parts_for_compare(gallery_source_path)
+
+                # F5 same-gallery boost — structural and site-agnostic, no
+                # site-specific patterns. The gallery a page belongs to is a
+                # DIRECTORY of item pages in its URL tree:
+                #   * CHILD of the source path (album page -> its viewer/item
+                #     pages, e.g. /albums/NAME/53000424.html) is unambiguously
+                #     the same gallery/thread — strongest boost.
+                #   * SIBLING at the same depth sharing the parent directory
+                #     (viewer -> next viewer of the same gallery, thread page
+                #     1 -> page 2) — moderate boost.
+                # This replaces the old unconditional
+                # "common_length == len(source_parts) - 1" sibling boost,
+                # which rated foreign-album links as high as the own gallery's
+                # viewers and let the crawler run to other albums before
+                # finishing the current one.
+                if gallery_parts and current_parts:
+                    is_child_of_source = (
+                        len(current_parts) > len(gallery_parts)
+                        and current_parts[:len(gallery_parts)] == gallery_parts
+                    )
+                    if is_child_of_source:
+                        base_priority *= 6.0
+                        logger.debug(f"Boosting same-gallery child of source: {url}")
+                    elif (
+                        len(current_parts) == len(gallery_parts) >= 2
+                        and current_parts[:-1] == gallery_parts[:-1]
+                    ):
+                        base_priority *= 2.0
+                        logger.debug(f"Boosting same-gallery sibling: {url}")
         
         # Domain reputation
         domain = self._get_domain(url)
@@ -439,6 +530,16 @@ class PriorityURLQueue:
             return
 
         async with self._lock:
+            # F1 dedup: one queue entry per URL per task run. Deliberate
+            # re-queues (interstitial_retry / from_media_item / bypass_checks
+            # state restoration) are exempt — they are re-parses, not
+            # link-discovery duplicates.
+            ctx = context or {}
+            if not bypass_checks and not ctx.get("interstitial_retry") and not ctx.get("from_media_item"):
+                if url in self._seen:
+                    logger.debug(f"Duplicate URL skipped in queue (dedup): {url[:120]}")
+                    return
+            self._seen.add(url)
             if bypass_checks:
                 # Use a default or provided priority if bypassing
                 priority = context.get('priority', 1.0) if context else 1.0

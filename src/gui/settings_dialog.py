@@ -28,7 +28,7 @@ import json
 import os
 import logging
 import src.constants as K
-from src.app_paths import settings_path as _settings_path
+from src.app_paths import settings_path as _settings_path, get_app_dir
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,9 @@ class SettingsDialog(QDialog):
             "downloader_threads": K.DEFAULT_DOWNLOADER_THREADS,
             "max_download_speed": 0,
             "threads_per_file": K.DEFAULT_THREADS_PER_FILE,
-            # Remember last used directory
-            "last_download_dir": os.path.expanduser("~"),
+            # Remember last used directory — default is the app folder so the
+            # program never writes to / depends on the user profile (portable).
+            "last_download_dir": os.path.join(get_app_dir(), "downloads"),
             "user_agent": K.DEFAULT_USER_AGENT,
             "referrer": "auto",
             "accept_language": K.DEFAULT_ACCEPT_LANGUAGE,
@@ -155,7 +156,10 @@ class SettingsDialog(QDialog):
         # Page timeout
         parser_grid.addWidget(QLabel("Page Timeout (sec):"), 2, 0)
         self.page_timeout_spin = QSpinBox()
-        self.page_timeout_spin.setRange(10, 300)
+        # Range matches sanitize_settings() (5..600). A lower bound of 10
+        # prevented users from setting aggressive timeouts for fast sites
+        # (thousands of pages × 10 s stalls the crawl); 5 s is the floor.
+        self.page_timeout_spin.setRange(5, 600)
         self.page_timeout_spin.setToolTip("Timeout for page loading (seconds)")
         parser_grid.addWidget(self.page_timeout_spin, 2, 1)
 
@@ -552,7 +556,7 @@ class SettingsDialog(QDialog):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Custom Pattern File",
-            os.path.expanduser("~"),
+            get_app_dir(),
             "JSON Files (*.json)",
         )
         
@@ -567,7 +571,7 @@ class SettingsDialog(QDialog):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Imagus Sieve File",
-            os.path.expanduser("~"),
+            get_app_dir(),
             "JSON Files (*.json)",
         )
         
@@ -727,7 +731,22 @@ class SettingsDialog(QDialog):
         Get settings from UI elements
         """
         settings = {}
-        
+
+        # Commit any in-progress spinbox edits BEFORE reading values. Typing a
+        # new value and pressing Enter (the dialog's default Save button) does
+        # not move focus out of the spinbox, so value() would return the OLD
+        # value — the user's change silently never persisted (file kept the
+        # previous setting, e.g. page_timeout 30). interpretText() validates
+        # the typed text and applies it to the widget's value first.
+        for spin in (
+            self.search_depth_spin, self.page_limit_spin, self.page_timeout_spin,
+            self.min_image_width_spin, self.min_image_height_spin,
+            self.min_image_size_spin, self.min_video_size_spin,
+            self.parser_threads_spin, self.downloader_threads_spin,
+            self.threads_per_file_spin, self.timeout_spin, self.retry_count_spin,
+        ):
+            spin.interpretText()
+
         # Parser settings
         settings["search_depth"] = self.search_depth_spin.value()
         settings["page_limit"] = self.page_limit_spin.value()
@@ -930,8 +949,10 @@ class SettingsDialog(QDialog):
         return default_settings
 
     def get_last_download_dir(self):
-        """Get the last used download directory"""
-        return self.settings.get("last_download_dir", os.path.expanduser("~"))
+        """Get the last used download directory (default: app folder, portable)."""
+        return self.settings.get(
+            "last_download_dir", os.path.join(get_app_dir(), "downloads")
+        )
 
     def get_settings(self):
         """

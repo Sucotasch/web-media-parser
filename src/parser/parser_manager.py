@@ -120,6 +120,10 @@ class ParserManager(QObject):
         self.download_queue = None  # Created in start_parsing on the correct loop
         self.processed_urls = set()
         self.downloaded_files = set() # Stores URLs of media marked for download to avoid re-processing
+        # F4 crawler fix: source pages that produced at least one successful
+        # download. page_limit counts THESE, not raw file counts — a 50-file
+        # gallery is one source page out of the configured allowance.
+        self._pages_with_downloads = set()
 
         self.stats = {
             "pages_processed": 0, "images_found": 0, "videos_found": 0,
@@ -153,6 +157,7 @@ class ParserManager(QObject):
         self._active_tasks = 0
         self.processed_urls.clear()
         self.downloaded_files.clear()
+        self._pages_with_downloads.clear()
         self.stats = {
             "images_found": 0, "videos_found": 0, "files_downloaded": 0,
             "files_skipped": 0, "pages_processed": 0, "bytes_downloaded": 0
@@ -660,60 +665,72 @@ class ParserManager(QObject):
             self._last_activity_time = time.time()
             return
 
-        if depth < self.max_depth:
-            urls_to_queue = []
-            if isinstance(links_data, dict): # From WebpageParser
-                for disc_url, link_ctx in links_data.items(): urls_to_queue.append((disc_url, link_ctx))
-            elif isinstance(links_data, set): # From JSONWebpageParser
-                for disc_url in links_data: urls_to_queue.append((disc_url, {}))
+        # Depth gate: excavation (following page links to find new content)
+        # stops at max_depth. Media lookups (direct media URLs + from_image
+        # thumbnail→fullsize transitions) are never depth-limited — the same
+        # exemption philosophy as stay-in-domain: a gallery reached deep must
+        # still yield its viewer pages and fullsize images instead of dying as
+        # a silent dead end.
+        can_follow_excavation = depth < self.max_depth
+        urls_to_queue = []
+        if isinstance(links_data, dict): # From WebpageParser
+            for disc_url, link_ctx in links_data.items(): urls_to_queue.append((disc_url, link_ctx))
+        elif isinstance(links_data, set): # From JSONWebpageParser
+            for disc_url in links_data: urls_to_queue.append((disc_url, {}))
 
-            # Cap per-page links — "excavation" only. from_image links are
-            # media lookups (thumbnail->fullsize transitions) and are never
-            # content-capped: a gallery with >max_links thumbnails must not
-            # lose any of them. Unconsumed lookups (no sieve rule) are still
-            # bounded downstream by the queue's pathological-URL guards,
-            # processed_urls dedup, search depth and the page limit.
-            max_links = self.settings.get("max_links_per_page", K.DEFAULT_MAX_LINKS_PER_PAGE)
-            if max_links > 0:
-                excavation = [(u, c) for u, c in urls_to_queue if not c.get("from_image")]
-                lookups = [(u, c) for u, c in urls_to_queue if c.get("from_image")]
-                if len(excavation) > max_links:
-                    excavation.sort(
-                        key=lambda x: float(x[1].get("priority", 0)),
-                        reverse=True
-                    )
-                    excavation = excavation[:max_links]
-                    logger.debug(f"Capped excavation links per page to {max_links} (had {len(excavation) + len(lookups)} total; {len(lookups)} media lookups kept)")
-                urls_to_queue = excavation + lookups
+        # Cap per-page links — "excavation" only. from_image links are
+        # media lookups (thumbnail->fullsize transitions) and are never
+        # content-capped: a gallery with >max_links thumbnails must not
+        # lose any of them. Unconsumed lookups (no sieve rule) are still
+        # bounded downstream by the queue's pathological-URL guards,
+        # processed_urls dedup, search depth and the page limit.
+        max_links = self.settings.get("max_links_per_page", K.DEFAULT_MAX_LINKS_PER_PAGE)
+        if max_links > 0:
+            excavation = [(u, c) for u, c in urls_to_queue if not c.get("from_image")]
+            lookups = [(u, c) for u, c in urls_to_queue if c.get("from_image")]
+            if len(excavation) > max_links:
+                excavation.sort(
+                    key=lambda x: float(x[1].get("priority", 0)),
+                    reverse=True
+                )
+                excavation = excavation[:max_links]
+                logger.debug(f"Capped excavation links per page to {max_links} (had {len(excavation) + len(lookups)} total; {len(lookups)} media lookups kept)")
+            urls_to_queue = excavation + lookups
 
-            for disc_url_str, link_spec_ctx in urls_to_queue:
-                if disc_url_str in consumed_links:
-                    continue
-                abs_disc_url = disc_url_str
-                if not abs_disc_url.startswith(("http://", "https://")):
-                    abs_disc_url = urljoin(url, abs_disc_url)
-                
-                disc_domain = get_domain(abs_disc_url)
-                if disc_domain in self.blocked_domains:
-                    logger.debug(f"Skipping blocked domain for URL {abs_disc_url} (Domain: {disc_domain})")
-                    continue
-                
-                # stay-in-domain restricts "excavation" (following page links to
-                # find new content) only. Media URLs and thumbnail transitions
-                # (from_image) are media lookups and are never domain-restricted.
-                is_media_lookup = link_spec_ctx.get("from_image") or is_media_url(abs_disc_url)
-                if self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN) and \
-                   not is_media_lookup and not is_same_domain(abs_disc_url, self.start_url): 
-                    logger.debug(f"Skipping out-of-domain link: {abs_disc_url} (Original start: {self.start_url})")
-                    continue
-                
-                stop_words_list = self.settings.get(K.SETTING_STOP_WORDS, K.DEFAULT_STOP_WORDS)
-                if should_skip_crawl_url(abs_disc_url, stop_words_list):
-                    logger.debug(f"Skipping non-content link: {abs_disc_url}")
-                    continue
+        for disc_url_str, link_spec_ctx in urls_to_queue:
+            if disc_url_str in consumed_links:
+                continue
+            abs_disc_url = disc_url_str
+            if not abs_disc_url.startswith(("http://", "https://")):
+                abs_disc_url = urljoin(url, abs_disc_url)
+            
+            disc_domain = get_domain(abs_disc_url)
+            if disc_domain in self.blocked_domains:
+                logger.debug(f"Skipping blocked domain for URL {abs_disc_url} (Domain: {disc_domain})")
+                continue
+            
+            # stay-in-domain restricts "excavation" (following page links to
+            # find new content) only. Media URLs and thumbnail transitions
+            # (from_image) are media lookups and are never domain-restricted.
+            is_media_lookup = link_spec_ctx.get("from_image") or is_media_url(abs_disc_url)
+            if self.settings.get(K.SETTING_STAY_IN_DOMAIN, K.DEFAULT_STAY_IN_DOMAIN) and \
+               not is_media_lookup and not is_same_domain(abs_disc_url, self.start_url): 
+                logger.debug(f"Skipping out-of-domain link: {abs_disc_url} (Original start: {self.start_url})")
+                continue
+            
+            stop_words_list = self.settings.get(K.SETTING_STOP_WORDS, K.DEFAULT_STOP_WORDS)
+            if should_skip_crawl_url(abs_disc_url, stop_words_list):
+                logger.debug(f"Skipping non-content link: {abs_disc_url}")
+                continue
 
-                new_ctx = {"source_url": url, "start_url": self.start_url, **link_spec_ctx}
-                await self.url_queue.put(abs_disc_url, depth + 1, url, new_ctx)
+            # Depth gate: excavation stops at max_depth; media lookups
+            # (direct media URLs + from_image transitions) continue — they
+            # are lookups, not content excavation.
+            if not can_follow_excavation and not is_media_lookup:
+                continue
+
+            new_ctx = {"source_url": url, "start_url": self.start_url, **link_spec_ctx}
+            await self.url_queue.put(abs_disc_url, depth + 1, url, new_ctx)
         
         self.stats["pages_processed"] += 1
         self._last_activity_time = time.time()  # Track last activity for idle detection
@@ -731,9 +748,11 @@ class ParserManager(QObject):
                 await self._pause_event.wait()
                 if self._stop_event.is_set(): break
                 continue
-            # Page limit: stop when enough files downloaded (not just parsed)
-            if self.page_limit > 0 and self.stats["files_downloaded"] >= self.page_limit:
-                logger.info(f"Page limit reached: {self.stats['files_downloaded']} files downloaded >= {self.page_limit}")
+            # Page limit: stop after N source pages produced at least one
+            # successful download (matches the settings tooltip — a 50-file
+            # gallery counts as ONE source page, not 50 files).
+            if self.page_limit > 0 and len(self._pages_with_downloads) >= self.page_limit:
+                logger.info(f"Page limit reached: {len(self._pages_with_downloads)} source pages with downloads >= {self.page_limit}")
                 self._completed_naturally = True
                 self._stop_event.set()
                 break
@@ -900,6 +919,9 @@ class ParserManager(QObject):
                 self._last_activity_time = time.time()  # Track last activity for idle detection
                 if result["success"]:
                     self.stats["files_downloaded"] += 1
+                    src = media_item.get("source_url")
+                    if src:
+                        self._pages_with_downloads.add(src)
                     if domain_state["failures"] > 0: domain_state["failures"] = max(0, domain_state["failures"] - 1)
                 else:
                     self.stats["files_skipped"] += 1
@@ -1107,6 +1129,7 @@ class ParserManager(QObject):
                 "quarantine_queue_items": quarantine_queue_items,
                 "processed_urls": list(self.processed_urls),
                 "downloaded_files": list(self.downloaded_files),
+                "pages_with_downloads": list(self._pages_with_downloads),
                 "stats": self.stats, "settings": self.settings, "start_url": self.start_url,
                 "download_path": self.download_path,
                 "domain_health": self.domain_health, "quarantined_domains": list(self.quarantined_domains)
@@ -1151,6 +1174,7 @@ class ParserManager(QObject):
             # Restore sets FIRST so we can filter download_queue
             self.processed_urls = set(state.get("processed_urls", []))
             self.downloaded_files = set(state.get("downloaded_files", []))
+            self._pages_with_downloads = set(state.get("pages_with_downloads", []))
             self.stats = state.get("stats", self.stats)
             self.start_url = state.get("start_url", self.start_url)
             self.domain_health = state.get("domain_health", {})

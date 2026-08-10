@@ -88,15 +88,6 @@ def _path_candidate():
     return shutil.which("deno") or shutil.which("deno.exe")
 
 
-def _media_downloader_candidate():
-    base = os.environ.get("APPDATA") or os.environ.get("HOME") or ""
-    if _is_windows() and base:
-        p = os.path.join(base, "media-downloader", "bin", "deno.exe")
-        if os.path.exists(p):
-            return p
-    return None
-
-
 def _frozen_candidates():
     """Bundled binaries next to the PyInstaller onedir exe."""
     if not getattr(sys, "frozen", False):
@@ -114,8 +105,10 @@ def find_deno_bin():
     for cand in (_env_candidates() + [None]):
         if cand and os.path.exists(cand):
             return cand
-    for cand in [_package_candidate(), _frozen_candidates(),
-                 _media_downloader_candidate(), _path_candidate()]:
+    # NOTE: no %APPDATA% / user-profile lookup here — the app is portable and
+    # must not depend on anything outside its own folder (bundled bin/deno.exe
+    # is checked first) plus explicit env-var / PATH overrides.
+    for cand in [_package_candidate(), _frozen_candidates(), _path_candidate()]:
         if isinstance(cand, list):
             for c in cand:
                 if c and os.path.exists(c):
