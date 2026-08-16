@@ -44,6 +44,9 @@ src/
     priority_url_queue.py
     site_pattern_manager.py  # Site patterns + Imagus Sieve
     pattern_manager.py  # DEPRECATED → use SitePatternManager
+    http_engine.py      # requests vs curl_cffi (browser TLS impersonation) engine; auto-escalates on blocks
+    js_engine/          # Opt-in JS gateway (Deno workers): consent/age-gate bypass, DOM clicks
+    junk_filter.py      # Drops preview/junk media from download queue
     json_parser.py, shared_session.py, utils.py
   downloader/
     media_downloader.py # Single- and multi-thread downloads
@@ -129,11 +132,14 @@ pip install pytest   # if missing from venv
 python -m pytest tests -q
 ```
 
-Current test modules:
+Current test modules include:
 
-- `test_url_detection.py`, `test_js_processing.py`
+- `test_url_detection.py`, `test_js_processing.py`, `test_js_engine.py`
 - `test_pattern_manager.py`, `test_parser_manager_filtering.py`
 - `test_media_downloader.py`, `test_shared_session.py`
+- `test_http_engine.py`, `test_gateway_bypass.py`
+- `test_crawler_frontier.py`, `test_fullsize_discovery.py`
+- `test_format_filter.py`, `test_junk_filter.py`, `test_bugfixes.py`, `test_sec3_fixes.py`
 
 For behavior changes in parser/downloader/queue: add or extend unit tests. GUI flows may need manual verification (`python main.py`).
 
@@ -141,7 +147,7 @@ For behavior changes in parser/downloader/queue: add or extend unit tests. GUI f
 
 ## Dependencies
 
-Canonical list: `requirements.txt` (PySide6, aiohttp, requests, bs4, lxml, filetype, brotli, …).
+Canonical list: `requirements.txt` (PySide6, aiohttp, requests, curl_cffi, bs4, lxml, filetype, brotli, …).
 
 Note: `setup.py` install_requires is **stale** relative to `requirements.txt` — prefer `requirements.txt` for installs and packaging truth.
 
@@ -175,3 +181,6 @@ If `CONTEXT.md` conflicts with code, **trust the code** and update CONTEXT only 
 | Media extraction (images/video/JSON-LD) | `webpage_parser.py` — `_extract_images`, `_extract_videos`, `_extract_jsonld_media` |
 | Crawl filtering (stop words, URL skip) | `src/parser/utils.py` — `should_skip_crawl_url` (segment-aware) |
 | Sieve transforms (thumb→fullsize) | `site_pattern_manager.py` — `transform_image_url` |
+| HTTP engine / TLS impersonation | `src/parser/http_engine.py` (requests ↔ curl_cffi escalation) |
+| JS gateway (Deno, consent/age bypass) | `src/parser/js_engine/engine.py` + `gateway_worker.js` / `dom_worker.js` |
+| Junk/preview media filtering | `src/parser/junk_filter.py` |
