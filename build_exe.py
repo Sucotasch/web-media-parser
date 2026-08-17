@@ -82,13 +82,15 @@ def build_exe():
         "main.py",
     ])
 
-    # Copy Imagus sieve files next to the exe
+    # Copy the newest Imagus sieve file next to the exe (PAT-2). Shipping all
+    # of them would load 1600+ rules with ~157 conflicting duplicates.
     print("Copying Imagus sieve files...")
     dist_dir = os.path.join("dist", "WebMediaParser")
-    for filename in os.listdir("."):
-        if filename.startswith("Imagus_sieve") and filename.endswith(".json"):
-            shutil.copy2(filename, os.path.join(dist_dir, filename))
-            print(f"  {filename}")
+    sieve_files = [f for f in os.listdir(".") if f.startswith("Imagus_sieve") and f.endswith(".json")]
+    if sieve_files:
+        newest = max(sieve_files, key=os.path.getmtime)
+        shutil.copy2(newest, os.path.join(dist_dir, newest))
+        print(f"  {newest}")
 
     # Junk-filter allowlist template (P2-lite), next to the exe for editing
     allowlist_src = os.path.join("resources", "junk_allowlist.txt")

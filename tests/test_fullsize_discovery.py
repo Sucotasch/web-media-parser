@@ -24,8 +24,9 @@ from src.parser.priority_url_queue import PriorityURLQueue
 from src.parser.parser_manager import ParserManager
 from src import constants as K
 
-SIEVE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                     "Imagus_sieve_2026.04.01_849.json")
+from helpers import MockGUILogHandler, SIEVE_PATH
+
+SIEVE = SIEVE_PATH  # TST-5: single canonical sieve snapshot (July)
 IMX_LINK = "https://imx.to/i/6xt7ux"
 IMX_THUMB = "https://image.imx.to/u/t/2026/08/02/6xt7ux.jpg"
 IMX_FULL = "https://image.imx.to/u/i/2026/08/02/6xt7ux.jpg"
@@ -89,22 +90,17 @@ class TestDomainExemptions(unittest.TestCase):
             "https://other-site.com/page", "https://vipergirls.to/threads/123", {}))
 
 
-class MockGUILogHandler:
-    def __init__(self, *args, **kwargs): pass
-    def info(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): pass
-    def debug(self, msg): pass
-
-
 class TestDiscoveryIntegration(unittest.TestCase):
     """ParserManager._discover_linked_fullsize end-to-end with a fake session."""
 
     class FakeResp:
+        """async-CM response fake (CORE-2: _discover_linked_fullsize wraps the
+        response in `async with`, so fakes must implement __aenter__/__aexit__)."""
         def __init__(self, html=None, ct="text/html", url=None):
             self._html = html
             self._ct = ct
             self.url = url
+            self.closed = False
 
         @property
         def headers(self):
@@ -112,6 +108,13 @@ class TestDiscoveryIntegration(unittest.TestCase):
 
         async def text(self):
             return self._html
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self.closed = True
+            return False
 
     def _make_manager(self):
         settings = {
@@ -154,7 +157,8 @@ class TestDiscoveryIntegration(unittest.TestCase):
     def test_discover_link_direct_image_response(self):
         pm = self._make_manager()
         session = AsyncMock()
-        session.post.return_value = self.FakeResp(ct="image/jpeg", url=IMX_FULL)
+        resp = self.FakeResp(ct="image/jpeg", url=IMX_FULL)
+        session.post.return_value = resp
 
         async def run():
             return await pm._discover_linked_fullsize(
@@ -165,6 +169,9 @@ class TestDiscoveryIntegration(unittest.TestCase):
         self.assertEqual(discovered[0][1], IMX_FULL)
         self.assertEqual(discovered[0][0], "image")
         self.assertEqual(resolved, {IMX_THUMB})
+        # CORE-2: even the early return (binary content, no body read) must
+        # release the pooled connection via async-CM __aexit__.
+        self.assertTrue(resp.closed)
 
     def test_unmatched_link_not_consumed(self):
         pm = self._make_manager()
@@ -187,6 +194,8 @@ class TestProcessResultsDiscoveryWiring(unittest.TestCase):
     and consumed links are not queued for crawling."""
 
     class FakeResp:
+        """async-CM response fake (CORE-2: _discover_linked_fullsize wraps the
+        response in `async with`, so fakes must implement __aenter__/__aexit__)."""
         def __init__(self, html=None, ct="text/html"):
             self._html = html
             self._ct = ct
@@ -197,6 +206,12 @@ class TestProcessResultsDiscoveryWiring(unittest.TestCase):
 
         async def text(self):
             return self._html
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
 
     def test_thumbnail_drop_and_consumed_skip(self):
         settings = {

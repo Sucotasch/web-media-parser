@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QTableView,
     QHeaderView,
 )
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor
 import asyncio
 from src.gui.settings_dialog import SettingsDialog
@@ -37,7 +37,7 @@ from src.gui.log_handler import GUILogHandler
 from src.core.task_queue_manager import TaskQueueManager
 from src.core.task_item import TaskStatus, TaskItem
 from src.server.http_server import ExtensionServer
-from src.parser.utils import normalize_url, is_media_url
+from src.parser.utils import normalize_url
 from src.app_paths import queue_path
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,12 @@ class MainWindow(QMainWindow):
     """
     Main window class for the application
     """
+
+    # GUI-1: emitted from the extension HTTP server thread to run UI work on
+    # the GUI thread — that thread has no Qt event loop, so QTimer.singleShot
+    # created there never fired reliably. Payload: id of the one-shot task to
+    # auto-start, or "" when the task table should just refresh.
+    extension_tasks_added = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -90,6 +96,9 @@ class MainWindow(QMainWindow):
         self.task_queue.task_status_changed.connect(
             lambda tid, _: self._update_task_row(tid)
         )
+
+        # GUI-1: marshals UI updates from the extension HTTP server thread.
+        self.extension_tasks_added.connect(self._updateUiFromExtension)
 
         # Load queue state from previous session
         self._load_queue_state()
@@ -816,6 +825,14 @@ class MainWindow(QMainWindow):
             except (RuntimeError, TypeError):
                 pass  # signal not connected
 
+        # GUI-2: make sure the previous parser thread is truly dead before we
+        # start a new one (rapid pause → start would otherwise leak the QThread
+        # and risk "QThread destroyed while running").
+        if self.parser_thread and self.parser_thread.isRunning():
+            self.parser_thread.quit()
+            if not self.parser_thread.wait(5000):
+                self.log_handler.warning("Old parser thread did not stop in 5s")
+
         self.parser_manager = ParserManager(
             url=task.url,
             download_path=task.download_path,
@@ -864,29 +881,13 @@ class MainWindow(QMainWindow):
         settings = self.settings_dialog.get_settings()
         one_shot = self.one_shot_check.isChecked()
 
-        # Add to queue manager for tracking (but as a direct-run task)
+        # Add to queue manager for tracking, then launch through the SHARED
+        # path (GUI-2 п.3): the URL-input flow must build ParserManager/QThread
+        # exactly like queue-started tasks — the old hand-rolled construction
+        # duplicated the lifecycle and skipped the old-thread teardown.
         task = self.task_queue.add_task(url, settings, download_path, one_shot=one_shot)
-        self.task_queue.start_task(task.id)
+        self._launch_task_from_queue(task.id)
 
-        self.parser_manager = ParserManager(
-            url=url,
-            download_path=download_path,
-            settings=settings,
-            log_handler=self.log_handler,
-            task_id=task.id,
-            one_shot=one_shot,
-        )
-
-        # Connect signals
-        self._connect_parser_signals()
-
-        # Start parsing thread
-        self.parser_thread = QThread()
-        self.parser_manager.moveToThread(self.parser_thread)
-        self.parser_thread.started.connect(self.parser_manager.start_parsing)
-        self.parser_thread.start()
-
-        self.update_ui_state(True)
         self.status_bar.showMessage("Parsing started")
         self.one_shot_check.setChecked(False)
 
@@ -956,6 +957,14 @@ class MainWindow(QMainWindow):
             self.parser_manager.stop_parsing()
             self.status_bar.showMessage("Stopping task...")
             self.log_handler.info("Stopping task...")
+
+            # GUI-3: wait for the parser thread to actually stop before cleaning
+            # up — on Windows, deleting files still being written fails, and new
+            # .part files appear after the sweep otherwise.
+            if self.parser_thread and self.parser_thread.isRunning():
+                self.parser_thread.quit()
+                if not self.parser_thread.wait(10000):
+                    self.log_handler.warning("Parser thread did not stop within 10s")
 
             # Clean up: delete partial files and state for the stopped task
             active = self.task_queue.active_task
@@ -1045,10 +1054,17 @@ class MainWindow(QMainWindow):
                 active.stats = dict(stats)
                 self._update_task_row(active.id)
 
-    def on_task_ended(self, reason: str):
-        """Handle task_ended signal — called for completed, stopped, or failed."""
-        self.log_handler.info(f"Task ended: {reason}")
+    def on_task_ended(self, task_id: str, reason: str):
+        """Handle task_ended signal — called for completed, stopped, or failed.
+
+        GUI-2: the signal now carries the task id; a late signal from a
+        PREVIOUS task (rapid pause→start) must not corrupt the new active task.
+        """
         active = self.task_queue.active_task
+        if active and task_id and active.id != task_id:
+            self.log_handler.info(f"Ignoring task_ended for stale task {task_id} (active: {active.id})")
+            return
+        self.log_handler.info(f"Task ended: {reason}")
         if active:
             # Don't overwrite if manually paused
             if active.status != TaskStatus.PAUSED:
@@ -1069,10 +1085,12 @@ class MainWindow(QMainWindow):
         self.update_ui_state(False)
         self._update_start_button_state()
 
-        # Auto-start next queued task if this one completed naturally
+        # Auto-start next queued task if this one completed naturally.
+        # GUI-9: pass the finished task's id so the queue advances DOWNWARD
+        # from it — tasks placed above keep their state.
         if reason == "completed":
             self.log_handler.info("Task completed, checking queue for next task...")
-            if self.task_queue.start_next():
+            if self.task_queue.start_next(active.id if active else None):
                 next_task = self.task_queue.active_task
                 if next_task:
                     self.log_handler.info(f"Auto-starting next task: {next_task.url}")
@@ -1084,6 +1102,7 @@ class MainWindow(QMainWindow):
         def add_tasks_from_extension(urls, one_shot=False, user_agent="", cookies=""):
             """Callback: add tasks from extension to queue. Runs in HTTP thread."""
             added = 0
+            auto_start_id = ""  # one-shot task to auto-start on the GUI thread (GUI-1)
             settings = self.settings_dialog.get_settings()
 
             # Override settings with browser context from extension
@@ -1093,7 +1112,10 @@ class MainWindow(QMainWindow):
                 settings["extension_cookies"] = cookies
 
             if one_shot and urls:
-                source_page = urls[0].get("source", "") if urls else ""
+                # EXT-4: the popup now sends the page as `referer` (the scan
+                # results use `source` for ORIGIN — two meanings on one key).
+                # Keep `source` as a fallback for older extension builds.
+                source_page = (urls[0].get("referer") or urls[0].get("source") or "") if urls else ""
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 try:
                     domain = source_page.split("/")[2].replace(".", "_") if source_page else "extension"
@@ -1113,7 +1135,8 @@ class MainWindow(QMainWindow):
                     if url.startswith("//"):
                         url = "https:" + url
                     url = normalize_url(url)
-                    media_type = item.get("type", "image" if is_media_url(url) else "image")
+                    # GUI-9: the old ternary had "image" on both branches — dead conditional
+                    media_type = item.get("type", "image")
                     basename = os.path.basename(url.split("?")[0])
                     if not basename or "." not in basename:
                         basename = f"media_{len(items)}.jpg"
@@ -1131,13 +1154,10 @@ class MainWindow(QMainWindow):
                 added = len(items)
                 self.log_handler.info(f"One-shot: {added} items -> {task_folder}")
 
-                # Auto-start one_shot task if no active task
+                # Auto-start one_shot task if no active task — executed on the
+                # GUI thread via extension_tasks_added (GUI-1).
                 if self.task_queue.active_task is None:
-                    def _auto_start():
-                        self.task_queue.start_task(task.id)
-                        self._launch_parser_for_task(task)
-                        self.update_ui_state(True)
-                    QTimer.singleShot(0, _auto_start)
+                    auto_start_id = task.id
             else:
                 for item in urls:
                     url = item.get("url", "").strip()
@@ -1154,13 +1174,11 @@ class MainWindow(QMainWindow):
                     self.task_queue.add_task(url, settings, download_path)
                     added += 1
 
-            # Update UI on GUI thread
-            def _do_update():
-                self._refresh_task_table()
-                if self.task_queue.queue:
-                    self.task_table.selectRow(0)
-                    self._update_start_button_state()
-            QTimer.singleShot(100, _do_update)
+            # GUI-1: run the UI work on the GUI thread via a signal. The aiohttp
+            # worker thread has no Qt event loop, so QTimer.singleShot created
+            # there never fired reliably (stale table, one-shot tasks never
+            # auto-started).
+            self.extension_tasks_added.emit(auto_start_id)
             return {"added": added}
 
         def get_status():
@@ -1178,6 +1196,7 @@ class MainWindow(QMainWindow):
             import asyncio as aio
             loop = aio.new_event_loop()
             aio.set_event_loop(loop)
+            self._server_loop = loop  # GUI-5: so closeEvent can stop it gracefully
             try:
                 loop.run_until_complete(self.extension_server.start())
                 loop.run_forever()
@@ -1220,9 +1239,25 @@ class MainWindow(QMainWindow):
             pm.stop_parsing()
             if self.parser_thread and self.parser_thread.isRunning():
                 self.parser_thread.quit()
-                self.parser_thread.wait()
+                # GUI-9: bounded wait — a stuck worker must not freeze window close
+                if not self.parser_thread.wait(10000):
+                    self.log_handler.warning("Parser thread did not stop within 10s")
             self.task_queue.clear_active()
             self.update_ui_state(False)
+
+        # GUI-5: stop the extension server gracefully instead of hard-killing the
+        # daemon thread (the graceful stop() code was otherwise dead).
+        if self._server_thread and self._server_thread.isRunning():
+            try:
+                loop = getattr(self, "_server_loop", None)
+                if loop is not None and not loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(
+                        self.extension_server.stop(), loop
+                    ).result(timeout=3)
+                    loop.call_soon_threadsafe(loop.stop)
+                self._server_thread.join(timeout=3)
+            except Exception as e:
+                self.log_handler.error(f"Error stopping extension server: {e}")
 
         event.accept()
 
@@ -1241,8 +1276,16 @@ class MainWindow(QMainWindow):
                 level, state == Qt.CheckState.Checked.value
             )
 
-    def _updateUiFromExtension(self):
-        """Slot: update task table after extension adds tasks (called via QMetaObject)."""
+    def _updateUiFromExtension(self, task_id=""):
+        """Slot (GUI thread): auto-start an extension one-shot task if the queue
+        is idle, then refresh the task table (GUI-1 — connected to
+        extension_tasks_added, emitted from the HTTP server thread)."""
+        if task_id and self.task_queue.active_task is None:
+            task = self.task_queue.find_task(task_id)
+            if task is not None:
+                self.task_queue.start_task(task.id)
+                self._launch_parser_for_task(task)
+                self.update_ui_state(True)
         self._refresh_task_table()
         if self.task_queue.queue:
             self.task_table.selectRow(0)

@@ -16,8 +16,6 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src import constants as K
-
 
 # --- §3.2: video significance ---------------------------------------------
 
@@ -62,31 +60,40 @@ class TestVideoSignificance:
 # --- §3.4: likely_thumbnail hint -------------------------------------------
 
 class TestLikelyThumbnail:
-    def _parser(self):
+    """TST-1: exercise the REAL _extract_images path (attrs it produces), not
+    an inline copy of its logic — the old tests passed even if the feature
+    were deleted."""
+
+    @staticmethod
+    def _extract(html):
+        import asyncio
+        from bs4 import BeautifulSoup
         from src.parser.webpage_parser import WebpageParser
-        return WebpageParser(
+        parser = WebpageParser(
             url="https://example.com/",
             settings={},
             process_js=False,
             external_session=MagicMock(),
         )
+        soup = BeautifulSoup(html, "lxml")
+        asyncio.run(parser._extract_images(soup))
+        return parser.media_files
 
     def test_thumbnail_hint_marks_attrs(self):
-        attrs = {"dimensions": {"width": 800, "height": 600}, "source": "src"}
-        # _extract_images marks variant_attrs; simulate what it does:
-        url = "https://example.com/thumbs/photo.jpg"
-        variant_attrs = attrs.copy()
-        if any(h in url.lower() for h in K.THUMBNAIL_URL_HINTS):
-            variant_attrs["likely_thumbnail"] = True
-        assert variant_attrs.get("likely_thumbnail") is True
+        html = ('<html><body><img src="https://example.com/thumbs/photo.jpg"'
+                ' width="800" height="600"></body></html>')
+        media = self._extract(html)
+        assert len(media) >= 1
+        _url, _mtype, attrs = media[0]
+        assert attrs.get("likely_thumbnail") is True
 
     def test_non_thumbnail_not_marked(self):
-        attrs = {"dimensions": {"width": 800, "height": 600}, "source": "src"}
-        url = "https://example.com/gallery/photo.jpg"
-        variant_attrs = attrs.copy()
-        if any(h in url.lower() for h in K.THUMBNAIL_URL_HINTS):
-            variant_attrs["likely_thumbnail"] = True
-        assert variant_attrs.get("likely_thumbnail") is None
+        html = ('<html><body><img src="https://example.com/gallery/photo.jpg"'
+                ' width="800" height="600"></body></html>')
+        media = self._extract(html)
+        assert len(media) >= 1
+        _url, _mtype, attrs = media[0]
+        assert attrs.get("likely_thumbnail") is None
 
 
 # --- §3.5: json_parser media type ------------------------------------------
@@ -238,12 +245,14 @@ class TestPatternBothSections:
 
 class TestBackupExcludes:
     def test_settings_and_queue_excluded_from_zip(self):
+        """TST-1: run the REAL backup.create_backup with the project root
+        redirected into a temp dir (the old test verified a re-implementation)."""
         import tempfile
         import zipfile
         import backup
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Create a fake project root with sensitive files + a code file
+            # Fake project root with sensitive files + a code file
             for name in ("settings.json", "task_queue.json", "main.py"):
                 with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
                     f.write("x")
@@ -251,31 +260,12 @@ class TestBackupExcludes:
             with open(os.path.join(tmp, "sessions", "last.pkl"), "w") as f:
                 f.write("y")
 
-            # Replicate the walk logic (backup.create_backup writes next to root;
-            # call it with a monkeypatched create_backup instead).
-            from unittest.mock import patch
-
-            def fake_create_backup():
-                timestamp = "20260101_000000"
-                backup_filename = f"web_media_parser_backup_{timestamp}.zip"
-                backup_path = os.path.join(tmp, backup_filename)
-                exclude = [
-                    "__pycache__", ".git", ".pytest_cache", "backups",
-                    "build", "dist", ".idea", ".vscode", "venv", "env", ".env",
-                    "settings.json", "task_queue.json", "sessions",
-                ]
-                with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, dirs, files in os.walk(tmp):
-                        dirs[:] = [d for d in dirs if d not in exclude]
-                        for file in files:
-                            if (file.endswith(".zip") and "backup" in file) or file in exclude:
-                                continue
-                            file_path = os.path.join(root, file)
-                            zipf.write(file_path, os.path.relpath(file_path, tmp))
-                return backup_path
-
-            with patch.object(backup, "create_backup", fake_create_backup):
+            real_file = backup.__file__
+            try:
+                backup.__file__ = os.path.join(tmp, "backup.py")
                 result = backup.create_backup()
+            finally:
+                backup.__file__ = real_file
 
             names = set()
             with zipfile.ZipFile(result) as zf:

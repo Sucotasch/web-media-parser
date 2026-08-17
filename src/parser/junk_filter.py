@@ -57,9 +57,13 @@ AD_HOST_SUFFIXES = (
 
 # Path tokens (token-based, same semantics as _matches_ad_keyword). These are
 # ad/creative markers that a real gallery almost never uses in media URLs.
+# CORE-4: "pixel" and "creative" are deliberately NOT here — "pixel-art"
+# galleries and "creative-portfolio" hosts are legitimate content that was
+# silently dropped. Real tracker creatives (pixel_300x250.gif) are still
+# caught by the weak NNNxNNN + third-party rule below.
 AD_PATH_TOKENS = (
     "advert", "adserver", "adservice", "adsense", "adroll", "affiliate",
-    "banner", "creative", "impression", "beacon", "pixel", "tracking",
+    "banner", "impression", "beacon", "tracking",
     "tracker", "analytics", "sponsor", "promo", "popup", "popunder",
     "doubleclick", "googlesyndication", "taboola", "outbrain", "criteo",
     "mgid", "revcontent", "juicyads", "exoclick", "propellerads", "popads",
@@ -75,16 +79,25 @@ _allowlist_cache = None
 _allowlist_mtime = None
 
 
-def load_allowlist() -> set:
-    """Domains that must never be classified as junk. Cached by mtime."""
-    global _allowlist_cache, _allowlist_mtime
+def _allowlist_candidates() -> list:
+    """Candidate locations for the allowlist file, in priority order."""
     candidates = []
     if getattr(sys, "frozen", False):
         candidates.append(os.path.join(os.path.dirname(sys.executable), ALLOWLIST_FILENAME))
         candidates.append(os.path.join(os.path.dirname(sys.executable), "resources", ALLOWLIST_FILENAME))
     candidates.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ALLOWLIST_FILENAME))
+    # PAT-8: dev runs keep the allowlist in resources/ — the src/ candidate
+    # above points one level too high and never exists on a fresh clone.
+    candidates.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                   "resources", ALLOWLIST_FILENAME))
     candidates.append(ALLOWLIST_FILENAME)
-    path = next((p for p in candidates if os.path.exists(p)), None)
+    return candidates
+
+
+def load_allowlist() -> set:
+    """Domains that must never be classified as junk. Cached by mtime."""
+    global _allowlist_cache, _allowlist_mtime
+    path = next((p for p in _allowlist_candidates() if os.path.exists(p)), None)
     if path is None:
         return set()
     try:
@@ -181,11 +194,15 @@ def is_ad_url(url, page_url=None):
 
 
 def _third_party(page_host: str, url_host: str) -> bool:
-    """Approximate third-party check (different registrable domains)."""
-    def base(host):
-        parts = host.split(".")
-        return ".".join(parts[-2:]) if len(parts) > 1 else host
-    return base(page_host) != base(url_host)
+    """Approximate third-party check (different registrable domains).
+
+    CORE-6: uses the registrable-domain helper from utils (two-level ccTLD
+    aware) so "bbc.co.uk" vs "evil.co.uk" are correctly different sites.
+    Lazy import: utils imports this module at the top, so a module-level
+    import here would be circular.
+    """
+    from src.parser.utils import registrable_domain
+    return registrable_domain(page_host) != registrable_domain(url_host)
 
 
 # --- Junk transitions (forum chrome etc.) -----------------------------------

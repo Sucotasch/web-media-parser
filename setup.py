@@ -12,9 +12,11 @@ aiohttp/PySide6/filetype).
 
 from setuptools import setup, find_packages
 
+from src import constants as K  # single source of truth for the version (GUI-8)
+
 setup(
     name="web_media_parser",
-    version="1.1.0",
+    version=K.APP_VERSION,
     description="Web Media Parser - A tool for parsing and downloading media files from websites",
     author="WebMediaParser",
     packages=find_packages(),
@@ -23,11 +25,13 @@ setup(
         "requests>=2.31.0",
         "aiohttp>=3.9.0",
         "aiofiles>=23.2.0",
+        # P3: browser TLS impersonation (http_engine=curl_cffi + auto-escalation)
+        "curl_cffi>=0.14.0",
         "beautifulsoup4>=4.12.0",
         "lxml>=5.0.0",
         "filetype>=1.2.0",
-        "chardet>=5.0.0; sys_platform == 'win32'",
-        "cchardet>=2.1.7; sys_platform != 'win32'",
+        # PKG-3: cchardet never provided the `chardet` module — single source
+        "chardet>=5.0.0",
         "brotli>=1.1.0",
         "brotlicffi>=1.1.0",
         "certifi>=2024.0.0",

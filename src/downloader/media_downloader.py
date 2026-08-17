@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # simultaneously check and reserve unique filenames.
 _filename_lock = threading.Lock()
 
+# Paths already claimed by an in-flight download (DL-2). The unique final name is
+# reserved under _filename_lock so a concurrent download to the same sanitized
+# target gets a distinct name instead of both writing the same temp file.
+_reserved_paths: set = set()
+
 
 def create_shared_downloader_session(settings: dict) -> requests.Session:
     """Create a single shared download session for all MediaDownloader instances.
@@ -219,10 +224,11 @@ class MediaDownloader:
             # per-request media headers (Accept, Referer) are merged on top.
             resp = session.get(
                 self.url, headers=headers, timeout=timeout,
-                verify=False, stream=True, allow_redirects=True,
+                stream=True, allow_redirects=True,
             )
             if resp.status_code >= 400:
                 resp.close()
+                session.close()
                 logger.debug(f"Escalation GET returned HTTP {resp.status_code} for {self.url}")
                 return False
             self._escalated_response = resp
@@ -246,6 +252,20 @@ class MediaDownloader:
             except Exception:
                 pass
             self._escalation_session = None
+
+    def _cleanup_partial(self):
+        """Remove the current download's half-written .partial file (DL-5).
+
+        Mid-stream network/disk errors must not leave permanent junk behind once
+        retries are exhausted; only the Stop path and the explicit disk-error
+        returns remove the file themselves.
+        """
+        temp_path = getattr(self, "_temp_path", None)
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     def _get_per_request_headers(self) -> dict:
         """Build headers that vary per file and must be sent per-request.
@@ -293,37 +313,52 @@ class MediaDownloader:
         current_timeout = timeout if timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
         retries_left = retries if retries is not None else self.settings.get(K.SETTING_RETRY_COUNT, K.DEFAULT_RETRY_COUNT)
         attempt = 0
-        while True:
-            if self.stop_event and self.stop_event.is_set():
-                return {"success": False, "error": "Download manually aborted"}
-            try:
-                result = self._do_download(custom_timeout=current_timeout)
-            except Exception as e:
-                logger.error(f"Download failed for {self.filepath}: {str(e)}", exc_info=True)
-                result = {"success": False, "error": str(e)}
-            if result["success"] or retries_left <= 0:
-                return result
-            err_lower = (result.get("error") or "").lower()
-            if not any(hint in err_lower for hint in self._RETRYABLE_ERROR_HINTS):
-                return result  # content filter / size / abort — final
-            retries_left -= 1
-            attempt += 1
-            logger.info(f"Retrying download ({attempt}/{retries_left + attempt}) for {self.url}: {result.get('error')}")
-            time.sleep(0.5 * attempt)
+        try:
+            while True:
+                if self.stop_event and self.stop_event.is_set():
+                    return {"success": False, "error": "Download manually aborted"}
+                try:
+                    result = self._do_download(custom_timeout=current_timeout)
+                except Exception as e:
+                    logger.error(f"Download failed for {self.filepath}: {str(e)}", exc_info=True)
+                    result = {"success": False, "error": str(e)}
+                if result["success"] or retries_left <= 0:
+                    return result
+                err_lower = (result.get("error") or "").lower()
+                if not any(hint in err_lower for hint in self._RETRYABLE_ERROR_HINTS):
+                    return result  # content filter / size / abort — final
+                retries_left -= 1
+                attempt += 1
+                logger.info(f"Retrying download ({attempt}/{retries_left + attempt}) for {self.url}: {result.get('error')}")
+                time.sleep(0.5 * attempt)
+        finally:
+            # DL-2: release the reserved final name once the file exists on disk
+            # (success) or the download is abandoned (failure). os.path.exists then
+            # guards the name for any later downloader.
+            reserved = getattr(self, "_reserved_path", None)
+            if reserved:
+                _reserved_paths.discard(reserved)
 
     def _ensure_unique_filepath_at_destination(self, current_filepath: str) -> str:
         with _filename_lock:
-            if not os.path.exists(current_filepath):
-                return current_filepath
-            dir_path, original_basename = os.path.split(current_filepath)
-            base_name, ext = os.path.splitext(original_basename)
-            counter = 1
-            unique_filepath = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
-            while os.path.exists(unique_filepath):
-                counter += 1
-                unique_filepath = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
-            logger.debug(f"Adjusted filepath from {current_filepath} to {unique_filepath} due to existing file.")
-            return unique_filepath
+            # Release the previous reservation (if any) so a retry of the same
+            # downloader re-reserves cleanly instead of leaking stale entries.
+            prev_reserved = getattr(self, "_reserved_path", None)
+            if prev_reserved:
+                _reserved_paths.discard(prev_reserved)
+            candidate = current_filepath
+            if os.path.exists(candidate) or os.path.normcase(candidate) in _reserved_paths:
+                dir_path, original_basename = os.path.split(candidate)
+                base_name, ext = os.path.splitext(original_basename)
+                counter = 1
+                candidate = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
+                while os.path.exists(candidate) or os.path.normcase(candidate) in _reserved_paths:
+                    counter += 1
+                    candidate = os.path.join(dir_path, f"{base_name}_{counter}{ext}")
+                logger.debug(f"Adjusted filepath from {current_filepath} to {candidate} due to existing/reserved file.")
+            _reserved_paths.add(os.path.normcase(candidate))
+            self._reserved_path = os.path.normcase(candidate)
+            return candidate
 
     def _do_download(self, custom_timeout=None):
         try:
@@ -345,6 +380,7 @@ class MediaDownloader:
             timeout_to_use = custom_timeout if custom_timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
             content_length = 0
             response_head = None  # Define response_head before try block
+            head_encoding = ""  # DL-3: set when the HEAD response carries Content-Encoding
             # Per-request headers built once and reused for HEAD, GET, and chunks
             per_req_hdrs = self._get_per_request_headers()
 
@@ -355,7 +391,11 @@ class MediaDownloader:
                 # ("Webpage/script content") and the item was failed + re-parsed.
                 response_head = self.session.head(self.url, headers=per_req_hdrs, timeout=timeout_to_use, allow_redirects=True)
                 response_head.raise_for_status()
-                content_length = int(response_head.headers.get("Content-Length", 0))
+                try:
+                    content_length = int(response_head.headers.get("Content-Length", 0))
+                except (TypeError, ValueError):
+                    content_length = 0
+                head_encoding = (response_head.headers.get("Content-Encoding") or "").strip().lower()
                 content_type = response_head.headers.get("Content-Type", "").lower()
                 if any(t in content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
                     return {"success": False, "error": f"Webpage/script content (Content-Type: {content_type})"}
@@ -372,10 +412,14 @@ class MediaDownloader:
                 logger.warning(f"HEAD request failed for {self.url}: {str(e)}. Will attempt GET.")
 
             mode = "wb"
+            # DL-3 edge: never range-download an encoded body — byte ranges are
+            # served for the compressed representation, requests decompresses each
+            # part, and the per-chunk size check fails (or worse, corrupts).
             can_multi_thread = (self.threads_per_file > 1 and 
                                 content_length > 0 and 
                                 content_length > K.WRITE_BUFFER_SIZE * self.threads_per_file and 
-                                response_head and response_head.headers.get("Accept-Ranges") == "bytes")
+                                response_head and response_head.headers.get("Accept-Ranges") == "bytes" and
+                                not head_encoding)
 
             if can_multi_thread:
                 try:
@@ -425,7 +469,10 @@ class MediaDownloader:
                     return {"success": False, "error": f"Webpage/script content (Content-Type: {get_content_type})"}
 
             if content_length == 0:
-                content_length = int(response_get.headers.get("Content-Length", 0))
+                try:
+                    content_length = int(response_get.headers.get("Content-Length", 0))
+                except (TypeError, ValueError):
+                    content_length = 0
 
             # Ensure the target directory exists only when we're about to download
             target_dir = os.path.dirname(self.filepath)
@@ -438,7 +485,8 @@ class MediaDownloader:
                     return {"success": False, "error": f"Could not create directory: {e}"}
 
             write_buffer = bytearray()
-            temp_path = self.filepath + ".partial"
+            temp_path = f"{self.filepath}.{threading.get_ident():x}.partial"
+            self._temp_path = temp_path  # DL-5: for cleanup on mid-stream failures
             try:
                 with open(temp_path, mode) as f:
                     start_time = time.time()
@@ -458,7 +506,10 @@ class MediaDownloader:
                                 self.progress_callback(prog)
                             if len(write_buffer) >= K.WRITE_BUFFER_SIZE:
                                 try: f.write(write_buffer); write_buffer.clear()
-                                except Exception as e: return {"success": False, "error": f"Disk write error: {e}"}
+                                except Exception as e:
+                                    try: os.remove(temp_path)
+                                    except OSError: pass
+                                    return {"success": False, "error": f"Disk write error: {e}"}
                             if self.rate_limit > 0:
                                 elapsed = time.time() - start_time
                                 expected_time = downloaded_bytes / (self.rate_limit * 1024)
@@ -467,9 +518,17 @@ class MediaDownloader:
                         try:
                             f.write(write_buffer)
                         except Exception as e:
+                            try: os.remove(temp_path)
+                            except OSError: pass
                             return {"success": False, "error": f"Disk write error: {e}"}
 
-                if content_length > 0:
+                # DL-3: Content-Length is the COMPRESSED size when the server
+                # answers with Content-Encoding (gzip/br/deflate); iter_content
+                # yields decompressed bytes, so a byte-exact comparison would
+                # delete valid files. Skip the check for encoded responses.
+                # Runs AFTER the with-block closes so getsize sees flushed data.
+                encoding = (response_get.headers.get("Content-Encoding") or "").strip().lower()
+                if content_length > 0 and not encoding:
                     actual_size = os.path.getsize(temp_path)
                     if actual_size != content_length:
                         try:
@@ -491,13 +550,11 @@ class MediaDownloader:
         except http_engine.HTTP_ERROR_EXCEPTIONS as e:
             status = getattr(e, "response", None)
             return {"success": False, "error": f"HTTP error: {getattr(status, 'status_code', 'Unknown')}"}
-
-        except http_engine.HTTP_ERROR_EXCEPTIONS as e:
-            status = getattr(e, "response", None)
-            return {"success": False, "error": f"HTTP error: {getattr(status, 'status_code', 'Unknown')}"}
         except http_engine.NETWORK_ERROR_EXCEPTIONS as e:
+            self._cleanup_partial()
             return {"success": False, "error": f"Network error: {e}"}
         except Exception as e:
+            self._cleanup_partial()
             logger.error(f"Generic download error for {self.url}: {str(e)}", exc_info=True)
             return {"success": False, "error": str(e)}
 
@@ -505,6 +562,12 @@ class MediaDownloader:
         temp_files, threads = [], []
         progress_lock = threading.Lock()
         progress_dict = {"total": 0, "success": True, "errors": []}
+        if self.rate_limit > 0:
+            # DL-12: shared rate limiter — all chunks of this download throttle
+            # against ONE byte counter (otherwise N threads would each run at
+            # the configured limit and the Max Download Speed setting would be
+            # silently multiplied by the thread count).
+            progress_dict["_rate"] = {"start": time.time(), "bytes": 0}
         timeout_to_use = custom_timeout if custom_timeout is not None else self.settings.get(K.SETTING_TIMEOUT, K.DEFAULT_TIMEOUT)
         
         num_threads = min(self.threads_per_file, max(1, total_size // K.MIN_CHUNK_SIZE_PER_THREAD_MT), K.MAX_THREADS_PER_FILE_CAP)
@@ -514,7 +577,7 @@ class MediaDownloader:
         for i in range(num_threads):
             start = i * chunk_size_for_threads
             end = (i + 1) * chunk_size_for_threads - 1 if i < num_threads - 1 else total_size - 1
-            temp_file = f"{self.filepath}.part{i}"
+            temp_file = f"{self.filepath}.{threading.get_ident():x}.part{i}"
             temp_files.append(temp_file)
             thread = threading.Thread(target=self._download_chunk, args=(start, end, temp_file, total_size, progress_dict, progress_lock, timeout_to_use))
             thread.daemon = True; thread.start(); threads.append(thread)
@@ -572,29 +635,45 @@ class MediaDownloader:
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             response = self.session.get(self.url, headers=headers, stream=True, timeout=timeout_val)
-            response.raise_for_status()
-            write_buffer_chunk = bytearray()
-            downloaded_this_chunk = 0 # For this specific chunk part
-            with open(filename, "wb") as f:
-                for chunk_data in response.iter_content(chunk_size=network_chunk_size_thread):
-                    if not progress_dict["success"]: return # Check if another thread failed
-                    if self.stop_event and self.stop_event.is_set():
-                        with progress_lock:
-                            progress_dict["success"] = False
-                            progress_dict["errors"].append("Download manually aborted")
-                        return
-                    if chunk_data:
-                        write_buffer_chunk.extend(chunk_data)
-                        downloaded_this_chunk += len(chunk_data)
-                        with progress_lock:
-                            progress_dict["total"] += len(chunk_data) # Update overall progress
-                            if self.progress_callback:
-                                prog = min(99, int((progress_dict["total"] / total_size) * 100))
-                                self.progress_callback(prog)
-                        if len(write_buffer_chunk) >= K.WRITE_BUFFER_SIZE:
-                            f.write(write_buffer_chunk); write_buffer_chunk.clear()
-                        # Simplified rate limiting for threaded chunks - focus on buffer primarily
+            try:
+                response.raise_for_status()
+                write_buffer_chunk = bytearray()
+                downloaded_this_chunk = 0 # For this specific chunk part
+                with open(filename, "wb") as f:
+                    for chunk_data in response.iter_content(chunk_size=network_chunk_size_thread):
+                        if not progress_dict["success"]: return # Check if another thread failed
+                        if self.stop_event and self.stop_event.is_set():
+                            with progress_lock:
+                                progress_dict["success"] = False
+                                progress_dict["errors"].append("Download manually aborted")
+                            return
+                        if chunk_data:
+                            write_buffer_chunk.extend(chunk_data)
+                            downloaded_this_chunk += len(chunk_data)
+                            with progress_lock:
+                                progress_dict["total"] += len(chunk_data) # Update overall progress
+                                if self.progress_callback:
+                                    prog = min(99, int((progress_dict["total"] / total_size) * 100))
+                                    self.progress_callback(prog)
+                            # DL-12: shared rate limiter — compute needed sleep under
+                            # the lock, then sleep outside it so one slow chunk never
+                            # blocks the others' progress updates.
+                            if self.rate_limit > 0 and "_rate" in progress_dict:
+                                with progress_lock:
+                                    rate = progress_dict["_rate"]
+                                    rate["bytes"] += len(chunk_data)
+                                    elapsed = time.time() - rate["start"]
+                                    expected_time = rate["bytes"] / (self.rate_limit * 1024)
+                                    sleep_needed = max(0.0, expected_time - elapsed)
+                                if sleep_needed > 0:
+                                    time.sleep(sleep_needed)
+                            if len(write_buffer_chunk) >= K.WRITE_BUFFER_SIZE:
+                                f.write(write_buffer_chunk); write_buffer_chunk.clear()
                 if write_buffer_chunk: f.write(write_buffer_chunk) 
+            finally:
+                # DL-12: always release the connection, including on errors —
+                # otherwise it hangs in the pool until GC.
+                response.close()
             
             if os.path.getsize(filename) != (end - start + 1): # Verify this chunk's size
                 raise IOError(f"Chunk size mismatch: expected {end - start + 1}, got {os.path.getsize(filename)}")

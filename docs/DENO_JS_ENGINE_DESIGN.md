@@ -1,10 +1,18 @@
 # Deno как лёгкий JS-движок — анализ и дизайн интеграции
 
-> **Дата:** 2026-08-07 (обновлено 2026-08-10)
+> **As-built поправки (2026-08-16, сверка с кодом):**
+> 1. Модуль реализован как пакет `src/parser/js_engine/` (`engine.py` + воркеры), а не одиночный `js_engine.py`, как в эскизе §3.1.
+> 2. Публичный API: `run_js` (P0), `run_dom` (P1), `run_gateway_click` (P4), `available()`, `shutdown()`; `render_html()` из эскиза не реализан — вместо него DOM-eval url/res-правил (см. §4, P1-DOM).
+> 3. Таймаут вызова: `DEFAULT_CALL_TIMEOUT = 2.0 c` (engine.py:51), а не 5.0 из эскиза; таймаут включает холодный старт Deno — известная проблема (Audit DL-8). Настройки `js_engine_timeout` / `js_render_wait_ms` из §3.3 НЕ реализаны.
+> 4. Протокол gateway (§7.3): фактически `{"id":0,"html":...,"pageUrl":...,"textPatterns":[...],"overlaySelectors":[...]}` — поле `op`/`timeout` не используется, таймаут на Python-стороне; воркер отвечает `{id, ok|error, ...}` (gateway_worker.js).
+> 5. Права воркеров: без ЕДИНОГО `--allow-*` (дизайн §3.1 допускал `--allow-net=<цель>`); внешние `<script src>` не загружаются — inline-only.
+> 6. Бинарник Deno ищется и из venv-пакета `deno`, и рядом с exe (`bin/deno.exe`) — см. `_find_deno` в engine.py.
+>
+> **Дата:** 2026-08-07 (обновлено 2026-08-10; as-built сверка 2026-08-16)
 > **Статус:** P0 РЕАЛИЗОВАН (2026-08-08): src/parser/js_engine/ (engine.py + worker.js), интеграция в SitePatternManager (to_js), настройка js_engine: static|deno (дефолт static), сборка бандлит bin/deno.exe + bin/worker.js. P1 РЕАЛИЗОВАН (2026-08-08): DOM-режим — dom_worker.js (happy-dom 15.11.7, enableJavaScriptEvaluation=false, без прав), DOM-eval JS url/res правил sieve (apply_link_url_transform + extract_res_urls), офлайн-кэш happy-dom бандлится в bin/deno_cache/npm. P2-lite РЕАЛИЗОВАН (2026-08-08): src/parser/junk_filter.py — точный классификатор ad/трекер/форумный хром (suffix-матч хостов, path-токены, слабый сигнал размера только в паре с кросс-доменом), allowlist junk_allowlist.txt, финальный гейт в _process_media_batch, отсечка apple-touch-icon на парсинге; настройка filter_junk (дефолт on). P1.5 РЕАЛИЗОВАН (2026-08-08): this.node/TRG в dom_worker.js — живой DOM-элемент для res-правил (a-якорь по href, img по группам), this.find({href|src}), guards на querySelector/closest/src, фолбэк на document (не на первый элемент) со стубами () => null — чистый fail-open без мусорных URL. P3 РЕАЛИЗОВАН (2026-08-10) + P3-esc (авто-эскалация на 403/5xx). P4 РЕАЛИЗОВАН (2026-08-10, см. §7): JS-гейты consent/age — статическое извлечение consent-кук из onclick/функций (всегда) + точечный DOM-клик через gateway_worker.js (при js_engine=deno; JS-эвалуация включается только в этой операции) + consent-кэш по доменам. Заодно исправлен латентный баг: sync-куки теперь уходят в aiohttp re-fetch явно (cookie_jar.update_cookies ненадёжен для IP/бес-доменных кук). 191 passed, 1 skipped. P2-full — отложен; P5 (CF-PoW) — отклонён (тупик).
 >
 > **Боевая проверка (2026-08-08, deno включён):** запуск без видимых ошибок; fullsize-дискавери дал 1940 media (было 0); DOM rule errors 0 (было 21 — фикс `$._`); окна deno.exe больше не появляются (CREATE_NO_WINDOW). Поздние фиксы: `$._` (сырой текст страницы, Imagus-конвенция) + рекурсивное расплющивание вложенных массивов в dom_worker.js; CREATE_NO_WINDOW/start_new_session в engine.py.
-> **Контекст:** `Audit.md` (полный ревью), `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` (рабочий план улучшений).
+> **Контекст:** `Audit.md` в корне репо (полный аудит 2026-08-16; старые аудиты из `Audit/` удалены), `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` (рабочий план улучшений).
 > **Жёсткие ограничения:** никаких headless-браузеров, Playwright/Puppeteer запрещены; лёгкий путь — статический HTML + эвристики + правила + HTTP-байпас.
 
 ---

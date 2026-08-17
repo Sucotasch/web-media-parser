@@ -8,7 +8,7 @@ let activeDomainFilter = "";
 let activeSourceFilter = "";
 let concurrentLimit = 2;
 
-const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct"]);
+// FULLSIZE_SOURCES / LINKS_CAP come from shared.js (EXT-9).
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
@@ -120,7 +120,7 @@ scanBtn.addEventListener("click", async () => {
       if (response.links && response.links.length > 0) {
         const linked = await chrome.runtime.sendMessage({
           action: "discoverFullsize",
-          links: response.links.slice(0, 50),
+          links: response.links.slice(0, LINKS_CAP),
           pageUrl: response.url,
         });
         if (linked && linked.media) {
@@ -400,9 +400,13 @@ downloadBtn.addEventListener("click", async () => {
     const item = mediaItems[parseInt(cb.dataset.index)];
     if (item) selected.push({
       url: item.url,
-      source: item.pageUrl || "",
+      // EXT-4: `source` in the scan results means ORIGIN (img/srcset/sieve-res);
+      // the POST payload needs the page as REFERER — rename to avoid the clash.
+      referer: item.pageUrl || "",
       type: item.type,
-      original_url: item.original || null,
+      // EXT-2: the sieve-transform path stores the pre-transform URL in
+      // item.original_url — `item.original` never existed (always null).
+      original_url: item.original_url || null,
       transformed: !!item.transformed,
     });
   });
@@ -466,7 +470,12 @@ async function updateSieveInfo() {
     if (stored.sieveRules) {
       const data = JSON.parse(stored.sieveRules);
       const count = Object.keys(data).length;
-      infoEl.textContent = `Sieve: ${count} rules loaded`;
+      // EXT-7: MV3 CSP blocks JS sieve rules in the popup — surface that
+      // honestly instead of claiming all N rules are active.
+      const jsCount = typeof countJsRules === "function" ? countJsRules(data) : 0;
+      infoEl.textContent = jsCount > 0
+        ? `Sieve: ${count} rules (${jsCount} JS — skipped in popup)`
+        : `Sieve: ${count} rules loaded`;
     } else {
       infoEl.textContent = "Sieve: no rules loaded";
     }
@@ -488,7 +497,10 @@ document.getElementById("sieve-file").addEventListener("change", async (e) => {
       return;
     }
     await chrome.storage.local.set({ sieveRules: text });
-    document.getElementById("sieve-info").textContent = `Sieve: ${count} rules loaded`;
+    const jsCount = typeof countJsRules === "function" ? countJsRules(data) : 0;
+    document.getElementById("sieve-info").textContent = jsCount > 0
+      ? `Sieve: ${count} rules (${jsCount} JS — skipped in popup)`
+      : `Sieve: ${count} rules loaded`;
     showError(`Loaded ${count} sieve rules from ${file.name}`);
     setTimeout(() => document.getElementById("error").classList.add("hidden"), 3000);
   } catch (e) {

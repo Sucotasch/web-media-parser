@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.parser.js_engine import DenoJsEngine, find_deno_bin
 from src.parser.js_engine.engine import _popen_kwargs
 
+from helpers import SIEVE_PATH
+
 
 def test_popen_kwargs_suppresses_console_window():
     # Regression: without CREATE_NO_WINDOW every deno.exe child pops a visible
@@ -36,6 +38,27 @@ def test_find_deno_bin_returns_path_or_none():
     # Should not raise, and either find a binary or return None.
     result = find_deno_bin()
     assert result is None or os.path.exists(result)
+
+
+def test_default_call_timeout_matches_design_doc():
+    """DL-8: the JS call timeout must cover Deno's cold start (design doc: 5s)."""
+    from src.parser.js_engine.engine import DEFAULT_CALL_TIMEOUT
+    assert DEFAULT_CALL_TIMEOUT == 5.0
+
+
+def test_run_js_caches_none_results():
+    """DL-10: a failing rule (None) must be cached, not re-run per thumbnail."""
+    from unittest.mock import MagicMock
+    from src.parser.js_engine.engine import DenoJsEngine
+    engine = DenoJsEngine()
+    engine._bin = "deno"
+    engine._worker = "worker.js"
+    engine._call = MagicMock(return_value=None)
+    assert engine.run_js(":code", []) is None
+    # An identical second call must hit the cache, not re-invoke the worker.
+    engine._call = MagicMock(return_value="http://example.com/full.jpg")
+    assert engine.run_js(":code", []) is None
+    engine._call.assert_not_called()
 
 
 def test_run_js_simple():
@@ -185,8 +208,7 @@ def _make_manager(enable_deno):
         engine = DenoJsEngine()
         if not engine.available():
             pytest.skip("Deno binary/worker not available on this machine")
-    sieve = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "Imagus_sieve_2026.07.15_823.json")
+    sieve = SIEVE_PATH  # TST-5: single canonical sieve snapshot
     if not os.path.exists(sieve):
         pytest.skip("sieve file not present")
     return SitePatternManager(enable_built_in=False, imagus_sieve_path=sieve, js_engine=engine), engine

@@ -30,6 +30,9 @@ class SitePatternManager:
         self.imagus_global_rules = [] # Rules without specific domain
         self.global_settings = {}
         self.loaded_files = []
+        # PAT-2: rule names already seen in an earlier-loaded sieve file — the
+        # newest file wins on duplicates.
+        self._loaded_sieve_rule_names = set()
         self.enable_built_in = enable_built_in
         self.custom_pattern_path = custom_pattern_path
         self.imagus_sieve_path = imagus_sieve_path
@@ -51,6 +54,7 @@ class SitePatternManager:
         self.imagus_global_rules = []
         self.global_settings = {}
         self.loaded_files = []
+        self._loaded_sieve_rule_names = set()
         
         # Try loading custom patterns if specified
         if self.custom_pattern_path and os.path.exists(self.custom_pattern_path):
@@ -68,7 +72,10 @@ class SitePatternManager:
         search_dirs = []
         if not self.patterns and self.enable_built_in:
             # Check for patterns file in various locations
-            
+
+            built_in_path = None
+            exe_built_in = False
+
             # First try the actual executable directory (for standalone exe)
             if getattr(sys, 'frozen', False):
                 exe_dir = os.path.dirname(sys.executable)
@@ -81,11 +88,12 @@ class SitePatternManager:
                         if 'version' in data:
                             logger.info(f"Loaded patterns version: {data['version']}")
                     self._load_pattern_file(built_in_path)
-                    return
+                    exe_built_in = True  # PAT-10: continue to the sieve scan below
             
             # If not found, use the patterns file from the application directory
             exec_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            built_in_path = os.path.join(exec_dir, "site_patterns.json")
+            if built_in_path is None:  # keep the exe-adjacent path from above
+                built_in_path = os.path.join(exec_dir, "site_patterns.json")
             
             # If not found in application directory, try resources directory
             if not os.path.exists(built_in_path):
@@ -97,14 +105,22 @@ class SitePatternManager:
                 base_dir = getattr(sys, '_MEIPASS', exec_dir)
                 built_in_path = os.path.join(base_dir, "resources", "patterns", "site_patterns.json")
                 
-            if os.path.exists(built_in_path):
+            if built_in_path and os.path.exists(built_in_path) and not exe_built_in:
                 self._load_pattern_file(built_in_path)
                 logger.info(f"Using built-in patterns from {built_in_path}")
 
             # Also scan for Imagus sieves in the same directories
-            search_dirs = [os.path.dirname(built_in_path)]
+            search_dirs = []
+            if built_in_path:
+                search_dirs.append(os.path.dirname(built_in_path))
+            # PAT-1: the project root holds the Imagus_sieve*.json files —
+            # scan it too so a fresh clone / dev run loads the flagship rules.
+            if exec_dir not in search_dirs:
+                search_dirs.append(exec_dir)
             if getattr(sys, 'frozen', False):
-                search_dirs.append(os.path.dirname(sys.executable))
+                exe_dir = os.path.dirname(sys.executable)
+                if exe_dir not in search_dirs:
+                    search_dirs.append(exe_dir)
             
             # Add current user provided path if it exists
             if self.custom_pattern_path:
@@ -114,12 +130,21 @@ class SitePatternManager:
 
         for s_dir in search_dirs:
             if not s_dir or not os.path.exists(s_dir): continue
-            for filename in os.listdir(s_dir):
+            # PAT-2: deterministic order, newest sieve file first, so that on
+            # duplicate rule names the newest file wins (see _load_imagus_file).
+            try:
+                entries = sorted(os.listdir(s_dir), reverse=True)
+            except OSError:
+                continue
+            for filename in entries:
                 if filename.startswith("Imagus_sieve") and filename.endswith(".json"):
                     imagus_path = os.path.join(s_dir, filename)
                     self._load_imagus_file(imagus_path)
                 elif filename == "site_patterns.json":
                     native_path = os.path.join(s_dir, filename)
+                    # PAT-9: the built-in file was already loaded above — skip.
+                    if built_in_path and os.path.abspath(native_path) == os.path.abspath(built_in_path):
+                        continue
                     self._load_pattern_file(native_path)
     
     def _load_pattern_file(self, file_path):
@@ -137,6 +162,16 @@ class SitePatternManager:
                     if 'site' in pattern and pattern.get('enabled', True):
                         site_name = pattern['site']
                         self.patterns[site_name] = pattern
+                # PAT-6: root-level pattern entries (google_images, yandex_images)
+                # carry the same structure as 'patterns' entries but live at the
+                # document root — they were silently ignored before.
+                for key, value in data.items():
+                    if key in ('patterns', 'global_settings', 'version') or key.startswith('['):
+                        continue
+                    if isinstance(value, dict) and ('site' in value or 'domains' in value or 'url_patterns' in value):
+                        if value.get('enabled', True):
+                            site_name = value.get('site', key)
+                            self.patterns[site_name] = value
             else:
                 # Process old format or individual entries
                 for key, value in data.items():
@@ -173,6 +208,10 @@ class SitePatternManager:
             js_deno = 0
             for rule_name, rule_data in data.items():
                 if not isinstance(rule_data, dict): continue
+                # PAT-2: a newer sieve file already provided this rule — skip.
+                if rule_name in self._loaded_sieve_rule_names:
+                    continue
+                self._loaded_sieve_rule_names.add(rule_name)
                 
                 # Rules must have a 'to' rule to be useful
                 to_rule = rule_data.get('to', '')
@@ -195,8 +234,12 @@ class SitePatternManager:
                         continue  # Can't convert — skip entirely
                 
                 elif isinstance(to_rule, str) and to_rule:
-                    # Simple regex rule — existing logic
-                    rule_data['to_python'] = self._sanitize_imagus_target(to_rule)
+                    # Simple regex rule — existing logic. PAT-5: pass the img
+                    # regex's group count so $nn references are clamped to the
+                    # groups that actually exist (JS String.replace semantics).
+                    rule_data['to_python'] = self._sanitize_imagus_target(
+                        to_rule, self._regex_group_count(rule_data.get('img', ''))
+                    )
                 
                 # Indexing by domain from 'link' property
                 link_regex = rule_data.get('link', '')
@@ -229,12 +272,38 @@ class SitePatternManager:
             logger.error(f"Error loading Imagus sieve {file_path}: {str(e)}")
             return False
 
-    def _sanitize_imagus_target(self, target: Any) -> Any:
-        r"""Convert Imagus $1, $2 to Python \g<1>, \g<2> to avoid ambiguity with numbers"""
+    @staticmethod
+    def _regex_group_count(pattern) -> int:
+        """Number of capture groups in a regex, 0 when it cannot compile."""
+        try:
+            return re.compile(pattern).groups
+        except re.error:
+            return 0
+
+    def _sanitize_imagus_target(self, target: Any, group_count: int = 0) -> Any:
+        r"""Convert Imagus $1, $2, $& to Python \g<1>, \g<2>, \g<0> syntax.
+
+        Follows JS String.replace semantics: $& is the whole match, and a $nn
+        reference whose number exceeds the regex's group count is split into
+        $n + the remaining digits as literal text (e.g. '$11200x1200' with 2
+        groups becomes group(1) + '1200x1200' — the Deezer rule).
+        """
         if not isinstance(target, str): return target
-        # Use a lambda for replacement to safely construct the \g<n> syntax
-        # Limit to 1 digit ($1-$9) to avoid greedy matching with literal digits
-        return re.sub(r'(?<!\\)\$(\d+)', lambda m: f'\\g<{m.group(1)}>', target)
+        target = re.sub(r'(?<!\\)\$&', r'\\g<0>', target)
+
+        def _repl(m):
+            digits = m.group(1)
+            n = int(digits)
+            if group_count and n > group_count:
+                # Clamp to the highest valid group, keep extra digits literal.
+                for cut in range(len(digits) - 1, 0, -1):
+                    head = int(digits[:cut])
+                    if head <= group_count:
+                        return f'\\g<{head}>' + digits[cut:]
+                return m.group(0)
+            return f'\\g<{n}>'
+
+        return re.sub(r'(?<!\\)\$(\d+)', _repl, target)
 
     # --- JS rule conversion ---
 
@@ -570,6 +639,24 @@ def _transform(m):
         
         return applicable_patterns
     
+    def _apply_replace_pattern(self, source, target, url):
+        r"""Apply a single {source, target} replace transform.
+
+        PAT-4: native patterns use JS `$n` / `$&` target syntax — sanitize to
+        Python `\g<n>` / `\g<0>` before re.sub (a no-op for targets without
+        `$`). Clamping by the source regex's group count follows JS semantics
+        (PAT-5). Returns (new_url, changed).
+        """
+        if not source or target is None:
+            return url, False
+        target = self._sanitize_imagus_target(target, self._regex_group_count(source))
+        try:
+            new_url = re.sub(source, target, url, flags=re.IGNORECASE)
+        except (re.error, IndexError):
+            logger.debug(f"Bad replace pattern source: {source}")
+            return url, False
+        return (new_url, True) if new_url != url else (url, False)
+    
     def transform_image_url(self, url: str, source_url: str) -> List[str]:
         """
         Apply patterns to transform thumbnail URLs to fullsize image URLs
@@ -587,29 +674,53 @@ def _transform(m):
                     if 'image_transformations' in pattern_data:
                         transform_data = pattern_data['image_transformations']
                         if 'replace_patterns' in transform_data:
-                            for replace_pattern in transform_data['replace_patterns']:
-                                source, target = replace_pattern.get('source'), replace_pattern.get('target')
-                                # Empty target is legal (a strip/delete rule, e.g.
-                                # "thumbs/th_" -> ""); only the source must be set.
-                                if source and target is not None:
-                                    new_url = re.sub(source, target, results[0], flags=re.IGNORECASE)
-                                    if new_url != results[0]:
-                                        results[0] = new_url
-                                        transformed = True
+                            replace_list = transform_data['replace_patterns']
+                        else:
+                            # PAT-6: dict keyed by thumbnail host (nsfwalbum) —
+                            # each value is a {source, target} or a list of them.
+                            replace_list = []
+                            for _host, rp in transform_data.items():
+                                if isinstance(rp, dict):
+                                    replace_list.append(rp)
+                                elif isinstance(rp, list):
+                                    replace_list.extend(rp)
+                        for replace_pattern in replace_list:
+                            if not isinstance(replace_pattern, dict):
+                                continue
+                            source, target = replace_pattern.get('source'), replace_pattern.get('target')
+                            # Empty target is legal (a strip/delete rule, e.g.
+                            # "thumbs/th_" -> ""); only the source must be set.
+                            if source and target is not None:
+                                new_url, changed = self._apply_replace_pattern(source, target, results[0])
+                                if changed:
+                                    results[0] = new_url
+                                    transformed = True
 
                     # Native imagus_patterns section — separate `if`, not `elif`,
                     # so a pattern carrying BOTH sections applies both (Q13).
                     if 'imagus_patterns' in pattern_data:
                         imagus_data = pattern_data['imagus_patterns']
-                        for transform_type in ['photo_transform', 'media', 'image']:
-                            if transform_type in imagus_data:
-                                for transform in imagus_data[transform_type]:
-                                    source, target = transform.get('source'), transform.get('target')
-                                    if source and target is not None:
-                                        new_url = re.sub(source, target, results[0], flags=re.IGNORECASE)
-                                        if new_url != results[0]:
-                                            results[0] = new_url
-                                            transformed = True
+                        for transform_type in ['photo_transform', 'media', 'image',
+                                               'video_transform', 'imagus_pattern']:
+                            if transform_type not in imagus_data:
+                                continue
+                            transforms = imagus_data[transform_type]
+                            # PAT-6: dict sections (twitter pic, reddit media...)
+                            # may carry `transform_patterns`; the list forms are
+                            # plain {source, target} lists.
+                            if isinstance(transforms, dict):
+                                transforms = transforms.get('transform_patterns') or []
+                            if not isinstance(transforms, list):
+                                continue
+                            for transform in transforms:
+                                if not isinstance(transform, dict):
+                                    continue
+                                source, target = transform.get('source'), transform.get('target')
+                                if source and target is not None:
+                                    new_url, changed = self._apply_replace_pattern(source, target, results[0])
+                                    if changed:
+                                        results[0] = new_url
+                                        transformed = True
                 except Exception as e: logger.debug(f"Error applying pattern {pattern_name}: {e}")
 
         # 2. Imagus Sieves (Domain-indexed & Global)
@@ -923,13 +1034,10 @@ def _transform(m):
                 # Empty target is legal (strip/delete rule) — same semantics as
                 # the native pattern sections (see transform_image_url).
                 if source and target is not None:
-                    try:
-                        new_url = re.sub(source, target, url, flags=re.IGNORECASE)
-                        if new_url != url:
-                            url = new_url
-                            logger.debug(f"Transformed image URL using global pattern: {original_url} -> {url}")
-                    except Exception as e:
-                        logger.debug(f"Error applying global pattern {source}: {str(e)}")
+                    new_url, changed = self._apply_replace_pattern(source, target, url)
+                    if changed:
+                        url = new_url
+                        logger.debug(f"Transformed image URL using global pattern: {original_url} -> {url}")
                         
         return url
     

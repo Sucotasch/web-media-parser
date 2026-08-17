@@ -23,7 +23,9 @@
       /\/button[s]?\//i, /\/badge/i, /\/arrow/i,
       /\/(nav|menu|search|cart|share|social|widget|advert|tracker)\b/i,
       /\/(prev|next|close|expand|collapse|play|pause|mute|volume)\b/i,
-      /\.(gif|png|ico)$/i,
+      // EXT-8: no hard format drop here — GIF/PNG/ICO filtering belongs to the
+      // desktop app's format allowlist (which keeps .png ON by default). A
+      // gallery with PNG art was invisible to "Save (Chrome)" otherwise.
     ];
 
     function isJunkUrl(url) {
@@ -130,16 +132,19 @@
   }
 
   function parseSrcset(srcset) {
-    let bestUrl = null, bestScore = -1;
+    // EXT-12: w- and x-descriptors are different scales (a 600w candidate is
+    // NOT smaller than a 1.5x one) — compare only candidates of the same type.
+    let bestUrl = null, bestScore = -1, bestType = null;
     srcset.split(",").forEach((item) => {
       const parts = item.trim().split(/\s+/);
       if (!parts[0]) return;
-      let score = 1;
+      let score = 1, type = "bare";
       if (parts[1]) {
-        if (parts[1].endsWith("w")) score = parseInt(parts[1], 10) || 1;
-        else if (parts[1].endsWith("x")) score = (parseFloat(parts[1]) || 1) * 10000;
+        if (parts[1].endsWith("w")) { score = parseInt(parts[1], 10) || 1; type = "w"; }
+        else if (parts[1].endsWith("x")) { score = parseFloat(parts[1]) || 1; type = "x"; }
       }
-      if (score > bestScore) { bestScore = score; bestUrl = parts[0]; }
+      if (bestType !== null && type !== bestType) return; // not comparable
+      if (score > bestScore) { bestScore = score; bestUrl = parts[0]; bestType = type; }
     });
     return bestUrl;
   }

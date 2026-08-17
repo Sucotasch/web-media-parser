@@ -6,6 +6,7 @@ Task queue manager for managing multiple parsing tasks sequentially.
 """
 
 import os
+import re
 import json
 import glob
 import copy
@@ -150,9 +151,24 @@ class TaskQueueManager(QObject):
         logger.info(f"Starting task: {task_id}  url={task.url}")
         return True
 
-    def start_next(self) -> bool:
-        """Start the first queued (non-completed/stopped/failed) task."""
-        for t in self._queue:
+    def start_next(self, completed_task_id: str = None) -> bool:
+        """Start the next queued (non-completed/stopped/failed) task.
+
+        GUI-9 (owner decision): auto-start advances DOWNWARD from the task
+        that just finished — tasks the user placed above it keep their state
+        (paused/queued) and are never picked up. Without an anchor (or when
+        the anchor is gone after a state restore) it falls back to scanning
+        from the top of the list, preserving the historical behavior.
+        """
+        start_idx = 0
+        if completed_task_id:
+            anchor = next(
+                (i for i, t in enumerate(self._queue) if t.id == completed_task_id),
+                None,
+            )
+            if anchor is not None:
+                start_idx = anchor + 1
+        for t in self._queue[start_idx:]:
             if t.status in (TaskStatus.QUEUED, TaskStatus.PAUSED):
                 return self.start_task(t.id)
         # Nothing to start
@@ -207,15 +223,20 @@ class TaskQueueManager(QObject):
         dp = task.download_path
         if not dp or not os.path.isdir(dp):
             return
-        # Remove .part* files
-        for p in glob.glob(os.path.join(dp, "**", "*.part*"), recursive=True):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        # Remove files with size 0 (stuck single-thread downloads)
+        # Remove only the downloader's own temp files (GUI-9): single-thread
+        # downloads write '{file}.{tid:x}.partial', MT chunks '{file}.{tid:x}.partN'.
+        # A broad '*.part*' glob also matched user files like 'foo.partial.png'.
+        for pat in ("*.partial", "*.part[0-9]*"):
+            for p in glob.glob(os.path.join(dp, "**", pat), recursive=True):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # Remove stuck empty temp downloads (0 bytes); user files are untouched.
         for root, _, files in os.walk(dp):
             for fn in files:
+                if not (fn.endswith(".partial") or re.search(r"\.part\d+$", fn)):
+                    continue
                 fp = os.path.join(root, fn)
                 try:
                     if os.path.getsize(fp) == 0:
@@ -226,15 +247,19 @@ class TaskQueueManager(QObject):
     # --- Persistence ---
 
     def save(self, filepath: str) -> None:
-        """Save the entire queue state to a JSON file."""
+        """Save the entire queue state to a JSON file (atomic write, GUI-4)."""
         data = {
             "version": 1,
             "active_task_id": self._active_id,
             "tasks": [t.to_dict() for t in self._queue],
         }
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
+        # Write to a temp file and atomically replace — a crash mid-write can
+        # no longer leave a corrupt queue file that erases the whole queue.
+        tmp = filepath + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, filepath)
         logger.info(f"Queue saved to {filepath} ({len(self._queue)} tasks)")
 
     def load(self, filepath: str) -> int:
@@ -245,7 +270,14 @@ class TaskQueueManager(QObject):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self._queue = [TaskItem.from_dict(t) for t in data.get("tasks", [])]
+            tasks = []
+            for t in data.get("tasks", []):
+                try:
+                    tasks.append(TaskItem.from_dict(t))
+                except Exception as e:
+                    # GUI-4: one corrupt entry must not erase the whole queue
+                    logger.warning(f"Skipping corrupt task entry: {e}")
+            self._queue = tasks
             self._active_id = None  # Reset — no task is actually running after reload
             # Reset any tasks that were running (they are not actually running now)
             for t in self._queue:

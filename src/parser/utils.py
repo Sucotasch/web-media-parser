@@ -55,9 +55,10 @@ def is_image_url(url):
     parsed_url = urlparse(url_lower)
     path = parsed_url.path
     
-    # Basic extension check using centralized constants
-    if (any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS) or 
-        any(f"{ext}?" in path for ext in K.IMAGE_EXTENSIONS)):
+    # Basic extension check using centralized constants.
+    # CORE-16: path from urlparse never contains '?' (query is stripped), so
+    # the old f"{ext}?" in path check was dead.
+    if any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS):
         return True
         
     # Advanced pattern matching based on RipUtils.java
@@ -207,17 +208,12 @@ def is_media_url(url):
     # Direct extension check - most reliable method (handles query params via path)
     if any(path.endswith(ext) for ext in media_extensions):
         return True
-    
-    # Check for fullsize pattern combined with media extension - common across many sites
-    fullsize_indicators = ['full', 'large', 'original', 'highres', 'hires', 'hi-res', 'max', 'big']
-    
-    # If URL contains both a fullsize indicator and a media extension, it's very likely a media file
-    if any(indicator in url_lower for indicator in fullsize_indicators):
-        for ext in media_extensions:
-            if ext in url_lower:
-                return True
-    
-    # Quick check for common webpage file extensions that should NOT be treated as media
+
+    # Quick check for common webpage file extensions that should NOT be treated as media.
+    # CORE-5: this must run BEFORE the fullsize-indicator block below — otherwise a page
+    # URL that happens to contain both a fullsize word and a media-extension substring
+    # ("https://site.com/large/photo.mp4.html") was classified as media, sending the
+    # downloader after HTML ("Webpage/script content" loop + interstitial retry).
     non_media_extensions = [
         # Webpage extensions
         ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".jspx",
@@ -231,6 +227,15 @@ def is_media_url(url):
     
     if any(url_lower.endswith(ext) for ext in non_media_extensions):
         return False
+    
+    # Check for fullsize pattern combined with media extension - common across many sites
+    fullsize_indicators = ['full', 'large', 'original', 'highres', 'hires', 'hi-res', 'max', 'big']
+    
+    # If URL contains both a fullsize indicator and a media extension, it's very likely a media file
+    if any(indicator in url_lower for indicator in fullsize_indicators):
+        for ext in media_extensions:
+            if ext in url_lower:
+                return True
         
     # Check for media file extensions (use constants + streaming/document formats)
     media_extensions = K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS + [
@@ -295,8 +300,9 @@ def is_video_url(url):
     query = parsed_url.query
     
     # Basic extension check
-    if (any(path.endswith(ext) for ext in video_extensions) or 
-        any(f"{ext}?" in path for ext in video_extensions)):
+    # CORE-16: path from urlparse never contains '?' — the old f"{ext}?" in
+    # path check was dead.
+    if any(path.endswith(ext) for ext in video_extensions):
         return True
     
     # Check for video platforms and CDNs
@@ -345,6 +351,62 @@ def is_video_url(url):
     return bool(video_pattern.match(url_lower) or streaming_pattern.match(url_lower))
 
 
+# Two-level public suffixes (ccTLD + second level) that make the last two
+# labels a registrable-domain boundary (co.uk, com.au, ...). Without this,
+# "bbc.co.uk" and "evil.co.uk" would collapse to the same naive base "co.uk"
+# and be treated as one site (CORE-6) — weakening stay-in-domain and the
+# thumbnail parent-link decision.
+TWO_LEVEL_PUBLIC_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk", "net.uk", "ltd.uk", "plc.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "asn.au", "id.au",
+    "co.nz", "org.nz", "net.nz", "ac.nz", "govt.nz", "geek.nz",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "ad.jp", "ed.jp", "gr.jp", "lg.jp",
+    "com.br", "net.br", "org.br", "gov.br", "edu.br", "art.br", "blog.br",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "com.mx", "org.mx", "net.mx", "gob.mx", "edu.mx",
+    "com.tr", "org.tr", "net.tr", "gov.tr", "edu.tr",
+    "co.in", "org.in", "net.in", "gov.in", "ac.in",
+    "com.ar", "org.ar", "net.ar", "gob.ar", "edu.ar",
+    "co.za", "org.za", "net.za", "gov.za", "ac.za",
+    "com.eg", "org.eg", "net.eg", "gov.eg", "edu.eg",
+    "com.sg", "org.sg", "net.sg", "gov.sg", "edu.sg",
+    "com.hk", "org.hk", "net.hk", "gov.hk", "edu.hk",
+    "com.tw", "org.tw", "net.tw", "gov.tw", "edu.tw",
+    "co.kr", "or.kr", "ne.kr", "go.kr", "re.kr",
+    "com.ru", "org.ru", "net.ru", "msk.ru", "spb.ru",
+    "com.ua", "org.ua", "net.ua", "in.ua", "gov.ua",
+    "co.il", "org.il", "net.il", "gov.il", "ac.il",
+    "co.id", "or.id", "net.id", "go.id", "ac.id",
+    "com.my", "org.my", "net.my", "gov.my", "edu.my",
+    "co.th", "or.th", "net.th", "go.th", "ac.th", "in.th",
+    "com.vn", "org.vn", "net.vn", "gov.vn", "edu.vn",
+    "com.ph", "org.ph", "net.ph", "gov.ph", "edu.ph",
+    "com.pk", "org.pk", "net.pk", "gov.pk", "edu.pk",
+    "com.bd", "org.bd", "net.bd", "gov.bd", "edu.bd",
+    "com.ng", "org.ng", "net.ng", "gov.ng", "edu.ng",
+    "com.gh", "org.gh", "net.gh", "gov.gh", "edu.gh",
+    "com.ke", "org.ke", "net.ke", "go.ke", "ac.ke",
+    "com.sa", "org.sa", "net.sa", "gov.sa", "edu.sa",
+    "com.co", "org.co", "net.co", "gov.co", "edu.co",
+})
+
+
+def registrable_domain(host: str) -> str:
+    """Return the registrable (base) domain of a host, honoring two-level
+    public suffixes (co.uk, com.au, ...). ``www.example.com`` and
+    ``example.com`` -> ``example.com``; ``blog.bbc.co.uk`` -> ``bbc.co.uk``.
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    labels = host.split(".")
+    if len(labels) >= 3:
+        two = ".".join(labels[-2:])
+        if two in TWO_LEVEL_PUBLIC_SUFFIXES:
+            return ".".join(labels[-3:])
+    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
 def is_same_domain(url1, url2):
     """
     Check if two URLs belong to the same domain
@@ -355,15 +417,10 @@ def is_same_domain(url1, url2):
     if not domain1 or not domain2:
         return False
 
-    # Extract base domain (example.com from sub.example.com)
-    base_domain1 = (
-        ".".join(domain1.split(".")[-2:]) if len(domain1.split(".")) > 1 else domain1
-    )
-    base_domain2 = (
-        ".".join(domain2.split(".")[-2:]) if len(domain2.split(".")) > 1 else domain2
-    )
-
-    return base_domain1 == base_domain2
+    # CORE-6: compare registrable domains (two-level ccTLD aware) instead of
+    # the naive last-two-labels — "bbc.co.uk" vs "evil.co.uk" share the base
+    # "co.uk" and must NOT be treated as the same site.
+    return registrable_domain(domain1) == registrable_domain(domain2)
 
 
 # Tracking query params that never affect content identity — stripped during
@@ -450,7 +507,10 @@ _AD_KEYWORDS = (
     "ads", "advert", "advertisement", "advertising", "adserver", "adservice",
     "banner", "banners", "promo", "promotion", "promotions",
     "sponsor", "sponsors", "sponsored",
-    "tracking", "tracker", "trackers", "pixel", "pixels",
+    # CORE-4/CORE-15: "pixel" is deliberately NOT here — "pixel-art" galleries
+    # are legitimate content (junk_filter already excludes it from its tokens;
+    # this utils duplicate was silently re-dropping pixel-art via is_banner_or_ad).
+    "tracking", "tracker", "trackers",
     "analytics", "marketing", "campaign", "campaigns",
     "popup", "popups", "popover", "popovers",
     "cta", "ctas", "calltoaction", "call-to-action",
@@ -544,33 +604,6 @@ def is_banner_or_ad(url, attrs):
     return False
 
 
-def extract_largest_image_from_srcset(srcset):
-    """
-    Extract the largest image URL from a srcset attribute
-    """
-    if not srcset:
-        return None
-
-    best_url = None
-    max_width = 0
-
-    # Parse srcset format: "url1 123w, url2 456w, ..."
-    for src_item in srcset.split(","):
-        parts = src_item.strip().split(" ")
-        if len(parts) >= 2:
-            url = parts[0].strip()
-
-            # Parse width descriptor (e.g., 800w)
-            width_match = re.search(r"(\d+)w", parts[1])
-            if width_match:
-                width = int(width_match.group(1))
-                if width > max_width:
-                    max_width = width
-                    best_url = url
-
-    return best_url
-
-
 # --- Segment-aware URL classifier (WP-1) ---
 
 # Path segments that almost never hold scrapeable media content
@@ -589,13 +622,6 @@ DEFAULT_LINK_SKIP_SEGMENTS = frozenset({
     "go", "out", "external", "tracking", "pixel", "analytics",
     "search", "login.php", "wp-admin", "wp-login",
 })
-
-# Hosts that are ad networks
-_AD_HOSTS = (
-    "doubleclick.", "googlesyndication.", "googleadservices.",
-    "facebook.com/tr", "adservice.", "adnxs.", "taboola.", "outbrain.",
-)
-
 
 def _path_segments(url):
     """Extract lowercase path segments from a URL."""
@@ -643,9 +669,7 @@ def should_skip_crawl_url(url, extra_stop_words=None):
     if any(s in skip for s in segs):
         return True
 
-    # Host-level ad networks
-    full = url.lower()
-    if any(h in full for h in _AD_HOSTS):
-        return True
-
+    # NOTE (CORE-15): ad-network hosts are handled by junk_filter.should_skip_junk_url
+    # (called first, dot-boundary suffix match). The old substring _AD_HOSTS list
+    # was a buggy duplicate ("facebook.com/tr" matched "facebook.com/try-this").
     return False

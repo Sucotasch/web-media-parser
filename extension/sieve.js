@@ -49,6 +49,25 @@ function parseSieve(data) {
 }
 
 /**
+ * Count rules whose `to` is a JS expression (starts with ':').
+ *
+ * MV3 CSP forbids new Function() in the popup, so JS rules are silently
+ * skipped there (EXT-7) — this count lets the UI tell the user exactly how
+ * many of the loaded rules actually apply in the popup.
+ * @param {Object} data — raw JSON from sieve file
+ * @returns {number}
+ */
+function countJsRules(data) {
+  let n = 0;
+  for (const [name, rule] of Object.entries(data)) {
+    if (!rule || typeof rule !== "object") continue;
+    const to = rule.to || "";
+    if (typeof to === "string" && to.startsWith(":")) n++;
+  }
+  return n;
+}
+
+/**
  * Apply sieve rules to a media URL.
  * Returns the transformed URL or null if no rule matched.
  *

@@ -5,10 +5,17 @@
 | **Audience** | Agent / developer with **no prior project knowledge** |
 | **Goal** | Improve fullsize media discovery, crawl-link selection, junk filtering, gateway/anti-bot handling — **without** changing product concept |
 | **Rules** | No speculative architecture; verify against real code; max benefit / min complexity; no regressions |
-| **Related** | `AGENTS.md`, `CONTEXT.md`, `Audit/FULL_AUDIT_2026-07-16.md`, `Audit/CHROME_EXTENSION_AUDIT_2026-07-16.md` |
-| **Date** | 2026-07-16 |
+| **Related** | `AGENTS.md`, `CONTEXT.md` (as-built, 2026-08-16), `Audit.md` (полный аудит 2026-08-16; старые файлы из `Audit/` удалены) |
+| **Date** | 2026-07-16 (статус-обновление 2026-08-16) |
 
 This document is a **work plan + map of the real code**. Fix P0 bugs from audits first if they block testing (especially Pause/Resume `downloaded_files`, session paths, extension cookies). Then implement work packages below in order.
+
+> **Статус на 2026-08-16 (сверка с кодом).** Большинство гэпов из §2 закрыто волнами P2-lite…P4 (август 2026, см. `DENO_JS_ENGINE_DESIGN.md` §4):
+> - **§2.2:** `thumb`/`thumbnail` убраны из `SIGNIFICANT_MEDIA_IGNORE_PATTERNS` (комментарий в `constants.py`); sieve-JS с DOM — реализовано (`js_engine=deno`); fullsize-дискавери linked-страниц — реализовано (`_discover_linked_fullsize`).
+> - **§2.4:** stop-words — сегментно-осознанный матчинг (`utils.should_skip_crawl_url`), `DEFAULT_STOP_WORDS` расширен (`privacy`, `terms`, `careers`...).
+> - **§2.6:** GIF-политика — формат-allowlist'ы (`enabled_image_formats`, GIF off по умолчанию, включается пользователем); apple-touch-иконы — отсечка по размеру (`APPLE_TOUCH_ICON_MIN_DIM`); outbound /privacy //legal — stop-words + junk-классификатор ссылок. Осторожно: сильные токены `pixel`/`creative` в `junk_filter.AD_PATH_TOKENS` роняют легитимный контент (Audit CORE-4).
+> - **§2.8:** Referer-политика — настройка `referrer: auto|origin|none`; curl_cffi — реализован (P3 + авто-эскалация); consent-кэш по доменам — P4.
+> - Актуальные открытые дефекты — **`Audit.md`** (CORE/DL/GUI/PAT/PKG/TST), а не таблицы ниже.
 
 ---
 

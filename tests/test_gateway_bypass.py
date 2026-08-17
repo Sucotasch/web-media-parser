@@ -24,17 +24,7 @@ from bs4 import BeautifulSoup
 
 from src.parser.webpage_parser import WebpageParser
 
-
-class _DummySession:
-    """Minimal stand-in for aiohttp.ClientSession (gateway logic makes no I/O)."""
-
-    def __init__(self):
-        self.cookie_jar = _DummyCookieJar()
-
-
-class _DummyCookieJar:
-    def update_cookies(self, *a, **k):
-        pass
+from helpers import _DummySession
 
 
 def _make_parser(html, context=None, pattern_manager=None):

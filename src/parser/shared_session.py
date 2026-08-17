@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Try to import brotli for content-encoding support.
 # noqa below: side-effect import — aiohttp needs the module present to decode br.
+# DL-6: aiohttp announces Accept-Encoding itself based on what it can decode,
+# so HAS_BROTLI here is informational only — never force-announce "br".
 try:
     import brotli  # noqa: F401
     HAS_BROTLI = True
@@ -23,25 +25,13 @@ except ImportError:
     HAS_BROTLI = False
     logger.info("Brotli support not detected.")
 
-# Ensure consistent brotli support detection (fallback if primary import fails)
-if not HAS_BROTLI:
-    try:
-        # This import is for side-effects if aiohttp needs help finding brotli
-        from src.fix_brotli import BrotliSupportFix
-        HAS_BROTLI = BrotliSupportFix.patch()
-        if HAS_BROTLI:
-            logger.info("Brotli support enabled via fix_brotli.")
-    except ImportError:
-        logger.info("fix_brotli module not found, Brotli support may be limited.")
-        pass # HAS_BROTLI remains False
-
 
 class AsyncClientManager:
     """
     Manages a shared aiohttp.ClientSession for asynchronous HTTP requests.
     """
 
-    def __init__(self, settings: Dict[str, Any]):
+    def __init__(self, settings: Dict[str, Any], start_url: str = ""):
         """
         Initialize the session manager.
 
@@ -51,8 +41,12 @@ class AsyncClientManager:
                       - "page_timeout" (int): Total timeout for a request.
                       - "user_agent" (str): User-Agent string.
                       - "accept_language" (str): Accept-Language string.
+            start_url: The task's start URL. Browser-extension cookies are scoped
+                      to this domain only (DL-7) instead of being sent to every
+                      host the task crawls.
         """
         self.settings = settings
+        self.start_url = start_url or ""
         self._session: Optional[aiohttp.ClientSession] = None
         # Align defaults with src/constants.py (page_timeout, connect, sock_read)
         # instead of local hard-coded values that drifted from the settings keys.
@@ -87,10 +81,11 @@ class AsyncClientManager:
             "DNT": "1",
             "Connection": "keep-alive",
         }
-        # Add cookies from browser extension context
-        ext_cookies = self.settings.get("extension_cookies", "")
-        if ext_cookies:
-            headers["Cookie"] = ext_cookies
+        # NOTE (DL-7): browser-extension cookies are intentionally NOT added to
+        # the session headers — a session-level Cookie header would leak the
+        # tab's cookies to every crawled host. They are loaded into the session's
+        # cookie jar scoped to the task's start domain instead (see
+        # _apply_extension_cookies), so aiohttp only sends them to that domain.
         return headers
 
     async def get_session(self) -> aiohttp.ClientSession:
@@ -106,8 +101,39 @@ class AsyncClientManager:
                 timeout=self._timeout_config,
                 headers=self._get_default_headers(),
             )
+            self._apply_extension_cookies(self._session)
             logger.info(f"New aiohttp.ClientSession created. Brotli enabled in session: {HAS_BROTLI and self._session.headers.get('Accept-Encoding','').lower().startswith('gzip, deflate, br')}")
         return self._session
+
+    def _apply_extension_cookies(self, session: aiohttp.ClientSession) -> None:
+        """Load browser-extension cookies into the session's jar scoped to the
+        task's start domain (DL-7).
+
+        The tab's cookies are only meaningful for the start site; a session-level
+        Cookie header leaked them to every host the task crawls (CDNs, third
+        parties). aiohttp's CookieJar only sends a cookie to hosts matching its
+        domain, so loading the pairs anchored at the start URL both fixes the
+        leak and keeps authenticated access to the start site working.
+        """
+        ext_cookies = self.settings.get("extension_cookies", "")
+        if not ext_cookies or not self.start_url:
+            return
+        try:
+            from yarl import URL
+            pairs: Dict[str, str] = {}
+            for part in ext_cookies.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, _, value = part.partition("=")
+                if name.strip():
+                    pairs[name.strip()] = value.strip()
+            if not pairs:
+                return
+            session.cookie_jar.update_cookies(pairs, response_url=URL(self.start_url))
+            logger.info(f"Scoped {len(pairs)} extension cookie(s) to start domain {URL(self.start_url).host}")
+        except Exception as e:
+            logger.warning(f"Could not scope extension cookies to start domain: {e}")
 
     async def close(self):
         """

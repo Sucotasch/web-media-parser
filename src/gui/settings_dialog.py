@@ -747,11 +747,11 @@ class SettingsDialog(QDialog):
         ):
             spin.interpretText()
 
-        # Parser settings
-        settings["search_depth"] = self.search_depth_spin.value()
-        settings["page_limit"] = self.page_limit_spin.value()
-        settings["page_timeout"] = self.page_timeout_spin.value()
-        settings["stay_in_domain"] = self.stay_in_domain_check.isChecked()
+        # Parser settings (GUI-8: keys via K.* — single source of truth)
+        settings[K.SETTING_SEARCH_DEPTH] = self.search_depth_spin.value()
+        settings[K.SETTING_PAGE_LIMIT] = self.page_limit_spin.value()
+        settings[K.SETTING_PAGE_TIMEOUT] = self.page_timeout_spin.value()
+        settings[K.SETTING_STAY_IN_DOMAIN] = self.stay_in_domain_check.isChecked()
         settings[K.SETTING_PROCESS_JS] = self.process_js_check.isChecked()
         settings[K.SETTING_BYPASS_COOKIE_CONSENT] = self.bypass_cookie_consent_check.isChecked()
         settings[K.SETTING_BYPASS_JS_REDIRECTS] = self.bypass_js_redirects_check.isChecked()
@@ -763,43 +763,53 @@ class SettingsDialog(QDialog):
         settings[K.SETTING_IMAGUS_SIEVE_PATH] = self.imagus_sieve_edit.text() if self.imagus_sieve_edit.text() else ""
 
         # Filters
-        settings["min_image_width"] = self.min_image_width_spin.value()
-        settings["min_image_height"] = self.min_image_height_spin.value()
-        settings["min_image_size"] = self.min_image_size_spin.value()
-        settings["min_video_size"] = self.min_video_size_spin.value()
+        settings[K.SETTING_MIN_IMG_WIDTH] = self.min_image_width_spin.value()
+        settings[K.SETTING_MIN_IMG_HEIGHT] = self.min_image_height_spin.value()
+        settings[K.SETTING_MIN_IMG_SIZE] = self.min_image_size_spin.value()
+        settings[K.SETTING_MIN_VID_SIZE] = self.min_video_size_spin.value()
 
         # Stop words
         stop_words_text = self.stop_words_edit.toPlainText().strip()
         if stop_words_text:
-            settings["stop_words"] = [
+            settings[K.SETTING_STOP_WORDS] = [
                 word.strip() for word in stop_words_text.split("\n") if word.strip()
             ]
         else:
-            settings["stop_words"] = []
+            settings[K.SETTING_STOP_WORDS] = []
 
         # Performance
-        settings["parser_threads"] = self.parser_threads_spin.value()
-        settings["downloader_threads"] = self.downloader_threads_spin.value()
-        settings["threads_per_file"] = self.threads_per_file_spin.value()
-        settings["max_download_speed"] = self.speed_slider.value()
+        settings[K.SETTING_PARSER_THREADS] = self.parser_threads_spin.value()
+        settings[K.SETTING_DOWNLOADER_THREADS] = self.downloader_threads_spin.value()
+        settings[K.SETTING_THREADS_PER_FILE] = self.threads_per_file_spin.value()
+        settings[K.SETTING_MAX_DOWNLOAD_SPEED] = self.speed_slider.value()
         settings[K.SETTING_ENABLED_IMAGE_FORMATS] = [
             ext for ext, checkbox in self.image_format_checks.items() if checkbox.isChecked()
         ]
         settings[K.SETTING_ENABLED_VIDEO_FORMATS] = [
             ext for ext, checkbox in self.video_format_checks.items() if checkbox.isChecked()
         ]
+        # GUI-6: there is no audio-format UI — preserve whatever was loaded so a
+        # Save does not silently reset the allowlist to defaults.
+        settings[K.SETTING_ENABLED_AUDIO_FORMATS] = list(
+            self.settings.get(K.SETTING_ENABLED_AUDIO_FORMATS, K.DEFAULT_ENABLED_AUDIO_FORMATS)
+        )
 
         # HTTP
-        settings["user_agent"] = self.user_agent_edit.text()
-        settings["referrer"] = self.referer_combo.currentText()
-        settings["accept_language"] = self.accept_language_edit.text()
-        settings["timeout"] = self.timeout_spin.value()
-        settings["retry_count"] = self.retry_count_spin.value()
-        settings["proxy"] = self.proxy_edit.text().strip()
+        settings[K.SETTING_USER_AGENT] = self.user_agent_edit.text()
+        settings[K.SETTING_REFERRER_POLICY] = self.referer_combo.currentText()
+        settings[K.SETTING_ACCEPT_LANGUAGE] = self.accept_language_edit.text()
+        settings[K.SETTING_TIMEOUT] = self.timeout_spin.value()
+        settings[K.SETTING_RETRY_COUNT] = self.retry_count_spin.value()
+        settings[K.SETTING_PROXY] = self.proxy_edit.text().strip()
         settings[K.SETTING_HTTP_ENGINE] = self.http_engine_combo.currentData() or "aiohttp"
         settings[K.SETTING_HTTP_ESCALATE] = self.http_escalate_check.isChecked()
+        # GUI-6: no impersonation UI — preserve the loaded value (fail-open at
+        # session creation if the profile is unavailable).
+        settings[K.SETTING_HTTP_IMPERSONATE] = self.settings.get(
+            K.SETTING_HTTP_IMPERSONATE, K.DEFAULT_HTTP_IMPERSONATE
+        )
 
-        # Logging
+        # Logging (no K.* keys exist for these — kept as literals)
         settings["log_to_file"] = self.log_to_file_check.isChecked()
         settings["log_file_path"] = self.log_file_edit.text().strip() or "web_media_parser.log"
 
@@ -822,8 +832,11 @@ class SettingsDialog(QDialog):
         try:
             # Ensure directory exists (though for EXE dir it always should)
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-            with open(settings_path, "w", encoding="utf-8") as f:
+            # GUI-9: atomic write — a crash mid-dump can no longer corrupt settings.json
+            tmp = settings_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=4)
+            os.replace(tmp, settings_path)
             logger.info(f"Saved settings to {settings_path}")
         except Exception as e:
             logger.error(f"Error saving settings to {settings_path}: {e}")

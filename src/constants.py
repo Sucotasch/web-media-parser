@@ -5,6 +5,18 @@
 Global constants for the Web Media Parser application.
 """
 
+# Application version (single source of truth — used by main.py and setup.py)
+APP_VERSION = "1.3.0"
+
+# Localhost port for the browser-extension HTTP API (ExtensionServer).
+# Mirrored in extension/background.js API_BASE (JS cannot import Python).
+EXTENSION_API_PORT = 19876
+
+# Extension ID trusted by the HTTP API (EXT-11). Until the extension ships in
+# the Web Store its ID is unstable, so an empty value keeps the permissive
+# "any chrome-extension:// origin" behavior as a documented compromise.
+EXTENSION_ID = ""
+
 # Default Application Settings
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_TIMEOUT = 30  # General network timeout for requests
@@ -247,6 +259,7 @@ SETTING_STOP_WORDS = "stop_words"
 # Filter settings keys
 SETTING_MAX_DOWNLOAD_SPEED = "max_download_speed" # in KB/s, 0 for unlimited
 SETTING_PAGE_TIMEOUT = "page_timeout" # Timeout for page loading/parsing
+SETTING_PAGE_LIMIT = "page_limit" # Stop after N pages with downloads (0 = unlimited)
 SETTING_ENABLED_IMAGE_FORMATS = "enabled_image_formats"
 SETTING_ENABLED_VIDEO_FORMATS = "enabled_video_formats"
 SETTING_ENABLED_AUDIO_FORMATS = "enabled_audio_formats"
@@ -279,6 +292,8 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_BYPASS_COOKIE_CONSENT: DEFAULT_BYPASS_COOKIE_CONSENT,
     SETTING_BYPASS_JS_REDIRECTS: DEFAULT_BYPASS_JS_REDIRECTS,
     SETTING_FILTER_JUNK: True,  # P2-lite junk classifier (precision-first + allowlist)
+    SETTING_FILTER_HIDDEN_LINKS: DEFAULT_FILTER_HIDDEN_LINKS,
+    SETTING_PAGE_LIMIT: 1000,  # 0 = unlimited (matches the dialog tooltip)
     SETTING_STOP_WORDS: DEFAULT_STOP_WORDS,
     SETTING_MAX_DOWNLOAD_SPEED: 0, # KB/s
     SETTING_PAGE_TIMEOUT: DEFAULT_PAGE_TIMEOUT,

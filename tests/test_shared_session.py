@@ -119,5 +119,52 @@ class TestAsyncClientManager(unittest.TestCase):
 
         asyncio.run(_test())
 
+    # --- Phase 4 (DL) ---
+
+    def test_default_headers_never_include_cookie_header(self):
+        """DL-7: extension cookies must not become a session-level Cookie header
+        (that would leak the tab's cookies to every crawled host)."""
+        manager = AsyncClientManager(
+            settings={"extension_cookies": "session=abc"},
+            start_url="https://example.com/thread/1",
+        )
+        headers = manager._get_default_headers()
+        self.assertNotIn("Cookie", headers)
+
+    def test_extension_cookies_scoped_to_start_domain(self):
+        """DL-7: cookies load into the jar anchored at the start URL only."""
+        manager = AsyncClientManager(
+            settings={"extension_cookies": "session=abc; theme=dark"},
+            start_url="https://example.com/thread/1",
+        )
+        session = MagicMock()
+        session.cookie_jar = MagicMock()
+        manager._apply_extension_cookies(session)
+        session.cookie_jar.update_cookies.assert_called_once()
+        args, kwargs = session.cookie_jar.update_cookies.call_args
+        self.assertEqual(args[0], {"session": "abc", "theme": "dark"})
+        self.assertEqual(kwargs["response_url"].host, "example.com")
+
+    def test_extension_cookies_skipped_without_start_url(self):
+        """DL-7: without a start URL nothing is scoped (no crash, no cookies)."""
+        manager = AsyncClientManager(settings={"extension_cookies": "session=abc"})
+        session = MagicMock()
+        session.cookie_jar = MagicMock()
+        manager._apply_extension_cookies(session)
+        session.cookie_jar.update_cookies.assert_not_called()
+
+    def test_brotli_patch_does_not_mutate_aiohttp(self):
+        """DL-6: fix_brotli.patch() must never force-announce 'br' on aiohttp
+        (aiohttp announces exactly what it can decode itself)."""
+        from src.fix_brotli import BrotliSupportFix
+        from aiohttp.client_reqrep import ClientRequest
+        from aiohttp import hdrs
+        before = ClientRequest.DEFAULT_HEADERS.get(hdrs.ACCEPT_ENCODING)
+        result = BrotliSupportFix.patch()
+        after = ClientRequest.DEFAULT_HEADERS.get(hdrs.ACCEPT_ENCODING)
+        self.assertEqual(after, before)
+        self.assertIn(result, (True, False))
+
+
 if __name__ == '__main__':
     unittest.main()

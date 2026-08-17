@@ -44,11 +44,11 @@ DOM_WORKER_BASENAME = "dom_worker.js"
 GATEWAY_WORKER_BASENAME = "gateway_worker.js"
 
 # Timeout for a single JS rule call (seconds). Rules are tiny; this is a
-# safety net against pathological infinite loops inside a sieve rule. Kept
-# low because run_js blocks its caller synchronously (it is called from the
-# async parser path via transform_image_url) — a long stall would freeze the
-# whole event loop.
-DEFAULT_CALL_TIMEOUT = 2.0
+# safety net against pathological infinite loops inside a sieve rule. Must
+# also cover the cold start of the Deno worker (spawn + compile + happy-dom
+# import); 2.0s was too tight on slow disks/antivirus machines and silently
+# disabled DOM rules. 5.0s matches docs/DENO_JS_ENGINE_DESIGN.md (DL-8).
+DEFAULT_CALL_TIMEOUT = 5.0
 
 # Bounded result cache: same (code, groups, pageUrl) rarely repeats, but a
 # gallery page re-matches identical thumb URLs; cap to avoid unbounded growth.
@@ -257,8 +257,14 @@ class DenoJsEngine:
             raise
         return self._proc
 
-    def _kill_proc(self):
-        proc, self._proc = self._proc, None
+    @staticmethod
+    def _kill_worker(proc):
+        """Terminate a worker subprocess and fully reap it (DL-9).
+
+        A bare kill() leaves the child un-reaped (zombie on POSIX until GC,
+        leaked handles on Windows). Bounded: 2s grace for terminate(), then
+        kill() + a final wait() to reap.
+        """
         if proc is None:
             return
         try:
@@ -267,9 +273,20 @@ class DenoJsEngine:
                 try:
                     proc.wait(timeout=2)
                 except Exception:
-                    proc.kill()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    def _kill_proc(self):
+        proc, self._proc = self._proc, None
+        self._kill_worker(proc)
 
     def _ensure_dom_proc(self):
         if self._dom_proc is not None and self._dom_proc.poll() is None:
@@ -298,17 +315,7 @@ class DenoJsEngine:
 
     def _kill_dom_proc(self):
         proc, self._dom_proc = self._dom_proc, None
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except Exception:
-                    proc.kill()
-        except Exception:
-            pass
+        self._kill_worker(proc)
 
     def _ensure_gateway_proc(self):
         """Spawn the P4 gateway worker (happy-dom, JS evaluation ON).
@@ -343,17 +350,7 @@ class DenoJsEngine:
 
     def _kill_gateway_proc(self):
         proc, self._gateway_proc = self._gateway_proc, None
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except Exception:
-                    proc.kill()
-        except Exception:
-            pass
+        self._kill_worker(proc)
 
     def shutdown(self):
         """Terminate all workers. Safe to call multiple times."""
@@ -368,8 +365,12 @@ class DenoJsEngine:
 
     # --- cache ----------------------------------------------------------
 
+    # DL-10: cached None results (failed rules) must be distinguishable from a
+    # cache miss, otherwise every failing rule re-runs on each matching thumb.
+    _MISS = object()
+
     def _cache_get(self, key):
-        return self._cache.get(key)
+        return self._cache.get(key, self._MISS)
 
     def _cache_set(self, key, value):
         if len(self._cache) >= CACHE_MAX_ENTRIES:
@@ -398,7 +399,7 @@ class DenoJsEngine:
         key = (code, tuple(groups), page_url or "")
         with self._lock:
             cached = self._cache_get(key)
-            if cached is not None:
+            if cached is not self._MISS:
                 return cached
 
             result = None

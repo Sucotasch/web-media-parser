@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Web Media Parser",
-  "version": "1.0.4",
+  "version": "1.3.0",
   "description": "Extract and download media from web pages",
   "permissions": [
     "activeTab",
@@ -11,12 +11,6 @@
   ],
   "host_permissions": [
     "<all_urls>"
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["sieve.json"],
-      "matches": ["<all_urls>"]
-    }
   ],
   "action": {
     "default_popup": "popup/popup.html",

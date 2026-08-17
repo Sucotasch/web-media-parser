@@ -5,6 +5,7 @@
 Custom log handler for GUI with filtering support
 """
 
+import html
 import logging
 from PySide6.QtCore import Signal, Slot, QObject
 
@@ -145,7 +146,11 @@ class GUILogHandler(QObject, logging.Handler):
 
         # Format message with HTML color
         color = colors.get(level, "#FFFFFF")
-        formatted_message = f'<span style="color: {color}; font-family: monospace;">{message}</span>'
+        # GUI-7: log messages may contain '<', '&' etc. (URLs with query params,
+        # scraped HTML snippets) — escape so the log widget renders them as text
+        # instead of breaking the HTML span.
+        safe_message = html.escape(message)
+        formatted_message = f'<span style="color: {color}; font-family: monospace;">{safe_message}</span>'
 
         # Append message to text edit
         self.text_edit.append(formatted_message)

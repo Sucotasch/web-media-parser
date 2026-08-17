@@ -3,6 +3,9 @@
  * Loads sieve rules into storage and communicates with desktop app.
  */
 
+// EXT-9: shared constants (FULLSIZE_SOURCES, LINKS_CAP) — single source.
+importScripts("shared.js");
+
 const API_BASE = "http://127.0.0.1:19876";
 const SIEVE_VERSION = "2026.04.01"; // Bump when shipping new sieve.json
 
@@ -147,7 +150,6 @@ function applyUrlTransform(template, matchGroups) {
 async function discoverFullsize(links, pageUrl) {
   const discovered = [];
   const seen = new Set();
-  const lock = { acquire() {}, release() {} }; // no-op — JS is single-threaded in SW
 
   async function processLink(linkUrl) {
     try {
@@ -281,7 +283,9 @@ async function resolveUrl(url) {
           }
         }
       } catch (e) {}
-      // Only break if res found something; otherwise try next rule
+      // Note: we return on the FIRST rule whose res regex finds a match —
+      // there is no "try next rule" fallthrough here (rules are tried in order
+      // and the first hit wins).
     }
   } catch (e) {}
   return url;
@@ -326,6 +330,7 @@ async function chromeDownload(items, concurrentLimit = 2) {
             if (delta.id === downloadId && delta.state?.current) {
               const state = delta.state.current;
               if (state === 'complete' || state === 'interrupted') {
+                clearTimeout(watchdog);
                 chrome.downloads.onChanged.removeListener(listener);
                 activeCount--; // Release the slot
                 if (state === 'complete') saved++;
@@ -335,6 +340,15 @@ async function chromeDownload(items, concurrentLimit = 2) {
             }
           };
           chrome.downloads.onChanged.addListener(listener);
+          // EXT-5: safety net — if onChanged never fires (download cancelled
+          // from Chrome's shelf, extension reloaded), don't hang the promise
+          // (and the popup's "Saving…") forever.
+          const watchdog = setTimeout(() => {
+            chrome.downloads.onChanged.removeListener(listener);
+            activeCount--; // Release the slot
+            completed++;
+            startNext();
+          }, 10 * 60 * 1000);
           setTimeout(startNext, 0); // Try to start next (async to avoid stack overflow)
         });
       }).catch(e => {
@@ -376,10 +390,13 @@ async function sendToDesktop(urls, oneShot = false, context = {}) {
     const payload = { urls, one_shot: oneShot };
     if (context.user_agent) payload.user_agent = context.user_agent;
     if (context.cookies) payload.cookies = context.cookies;
+    // EXT-6: the desktop app may be half-alive (port open, no response) —
+    // a 5s timeout keeps the popup/command from hanging on "Sending...".
     const response = await fetch(`${API_BASE}/api/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
     });
     const data = await response.json();
     return data;
@@ -393,7 +410,10 @@ async function sendToDesktop(urls, oneShot = false, context = {}) {
  */
 async function getStatus() {
   try {
-    const response = await fetch(`${API_BASE}/api/status`);
+    // EXT-6: bounded wait — same half-alive-app protection as sendToDesktop.
+    const response = await fetch(`${API_BASE}/api/status`, {
+      signal: AbortSignal.timeout(5000),
+    });
     return await response.json();
   } catch (e) {
     return { error: `Desktop app not reachable: ${e.message}` };
@@ -418,6 +438,17 @@ async function commandScanAndProcess(action) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
 
+  if (action === "send-desktop") {
+    // EXT-3: the desktop app crawls the page itself — the old code ran the
+    // full scan pipeline (up to 50 linked pages) and then threw it all away,
+    // sending only the page URL. Send the URL and show the badge immediately.
+    const context = await getPageContext(tab.id);
+    await sendToDesktop([{ url: tab.url }], false, context);
+    await setBadge("✓", "#4CAF50");
+    setTimeout(() => setBadge(""), 3000);
+    return;
+  }
+
   await setBadge("...", "#FFA000");
 
   let response;
@@ -437,7 +468,7 @@ async function commandScanAndProcess(action) {
   let media = response.media;
   if (response.links && response.links.length > 0) {
     await setBadge("...", "#FFA000");
-    const linked = await discoverFullsize(response.links.slice(0, 50), response.url);
+    const linked = await discoverFullsize(response.links.slice(0, LINKS_CAP), response.url);
     if (linked && linked.media) {
       media = media.concat(linked.media);
     }
@@ -455,18 +486,13 @@ async function commandScanAndProcess(action) {
     }));
     await chromeDownload(toDownload);
     setTimeout(() => setBadge(""), 5000);
-  } else if (action === "send-desktop") {
-    await setBadge("✓", "#4CAF50");
-    const context = await getPageContext(tab.id);
-    await sendToDesktop([{ url: response.url }], false, context);
-    setTimeout(() => setBadge(""), 3000);
   }
   } finally {
     commandBusy = false;
   }
 }
 
-const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct"]);
+// FULLSIZE_SOURCES now comes from shared.js (EXT-9).
 
 chrome.commands?.onCommand?.addListener((command) => {
   if (command === "save-chrome" || command === "send-desktop") {

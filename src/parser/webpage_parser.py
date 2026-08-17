@@ -13,11 +13,9 @@ import yarl
 from typing import List, Tuple, Dict, Any, Optional
 from urllib.parse import urlparse, urljoin 
 
-try:
-    import brotli  # noqa: F401 — side-effect import; aiohttp needs it to decode br
-    HAS_BROTLI = True 
-except ImportError:
-    HAS_BROTLI = False
+# DL-6: aiohttp announces/decodes 'br' itself when the brotli module is
+# importable — no patching here (force-announcing 'br' without a decoder
+# breaks every such page fetch).
 
 from src.parser.utils import (
     is_image_url, is_media_url, get_domain,
@@ -30,13 +28,6 @@ from src import constants as K
 import aiohttp 
 import chardet
 from bs4 import BeautifulSoup
-
-if not HAS_BROTLI:
-    try:
-        from src.fix_brotli import BrotliSupportFix 
-        HAS_BROTLI = BrotliSupportFix.patch()
-    except ImportError:
-        pass 
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +62,11 @@ class WebpageParser:
     JS_PATTERNS = { 
         "image_sources": [r'["\'](https?://[^"\']+\.(?:jpg|jpeg|png|gif|webp))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+)["\']', r'loadImage\s*\(\s*["\'](https?://[^"\']+)["\']', r'background(?:-image)?\s*:\s*url\(["\']?(https?://[^"\']+)["\']?\)',],
         "video_sources": [r'["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'loadVideo\s*\(\s*["\'](https?://[^"\']+)["\']',],
-        "data_attributes": [r'data-(?:src|original|lazy|load|image|video|poster|bg|background|url)\s*=\s*["\'](https?://[^"\']+)["\']', r'data-srcset\s*=\s*["\'](https?://[^"\']+(?:\s+\d+[wx])?(?:,\s*https?://[^"\']+(?:\s+\d+[wx])?)*)["\']',],
+        # CORE-14: the data-srcset regex was removed — its group(1) captured the
+        # whole srcset string (multi-URL srcsets became one garbage URL that
+        # is_media_url rejects); single-URL data-srcset is already covered by the
+        # lazy-data-* scan below.
+        "data_attributes": [r'data-(?:src|original|lazy|load|image|video|poster|bg|background|url)\s*=\s*["\'](https?://[^"\']+)["\']',],
         "framework_patterns": {"react": r'className\s*=\s*["\'](lazy-load|image-loader)["\']', "vue": r'v-lazy\s*=\s*["\'](https?://[^"\']+)["\']', "angular": r'\[lazyLoad\]\s*=\s*["\'](https?://[^"\']+)["\']',}
     }
 
@@ -174,7 +169,9 @@ class WebpageParser:
                 request_timeout_config = aiohttp.ClientTimeout(
                     total=page_timeout_val, 
                     connect=min(5, page_timeout_val // 2),
-                    sock_read=page_timeout_val - 2
+                    # CORE-18: clamp so hand-edited settings with page_timeout<=2
+                    # cannot produce sock_read<=0 (instant timeout on everything).
+                    sock_read=max(1, page_timeout_val - 2)
                 )
 
                 if attempt > 0:
@@ -197,6 +194,11 @@ class WebpageParser:
                                 retry_after = max(0, int((parsedate_to_datetime(raw_retry_after) - datetime.now(timezone.utc)).total_seconds()))
                             except Exception:
                                 retry_after = 5
+                        # CORE-3: cap Retry-After to the page timeout — a
+                        # 'Retry-After: 86400' must not park the worker (and the
+                        # whole per-domain semaphore) for a day; the only way out
+                        # was a manual Stop.
+                        retry_after = min(retry_after, max(1, page_timeout_val))
                         logger.warning(f"HTTP 429 Rate limited for {self.url}, retry after {retry_after}s")
                         if attempt < max_retries:
                             await asyncio.sleep(retry_after)
@@ -666,10 +668,14 @@ class WebpageParser:
             logger.debug(f"P4: DOM gateway click failed: {e}")
             return None
 
+    # CORE-7: direct-video extension matched as a COMPLETE path extension (end
+    # of path or followed by / ? #), never as a substring — ".ts" must not
+    # classify "/user.tsuji/page" as a direct video.
+    _DIRECT_VIDEO_RE = re.compile(r"\.(?:mp4|webm|avi|mov|flv|mkv|wmv|ts)(?:$|[/?#])", re.I)
+
     def _get_video_platform(self, url: str) -> Optional[str]:
         parsed_url = urlparse(url.lower()); domain = parsed_url.netloc; path = parsed_url.path
-        video_extensions = [".mp4", ".webm", ".avi", ".mov", ".flv", ".mkv", ".wmv", ".ts"]
-        if any(ext in path for ext in video_extensions): return "direct-video"
+        if self._DIRECT_VIDEO_RE.search(path): return "direct-video"
         for platform, patterns in self.VIDEO_PLATFORMS.items(): 
             if any(re.search(pattern, domain) for pattern in patterns): return platform
         return None
@@ -688,15 +694,20 @@ class WebpageParser:
         }
         for attr_name, url_val in sources.items():
             if url_val:
-                priority = 100 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
-                candidates.append({"url": url_val, "width": priority, "source": attr_name})
+                # CORE-17: priority tier goes into `score`, real pixels into
+                # `width`. Mixing them (width=100 for named hi-res attrs) made
+                # those attrs drop out of substantial_candidates once the user
+                # set min_image_width > 100 — the explicit fullsize attribute
+                # silently lost to the plain thumbnail src.
+                score = 100 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
+                candidates.append({"url": url_val, "width": 0, "score": score, "source": attr_name})
         for srcset_attr_name in ["srcset", "data-srcset", "data-lazy-srcset"]:
             srcset_val = element.get(srcset_attr_name, "")
             if srcset_val: candidates.extend(self._parse_srcset(srcset_val))
         for attr_name, value in element.attrs.items():
             if isinstance(value, str) and re.search(r"\.(jpg|jpeg|png|webp|gif|avif|tiff|bmp)", value.lower()):
-                priority = 999999 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
-                candidates.append({"url": value, "width": priority, "source": attr_name})
+                score = 999999 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
+                candidates.append({"url": value, "width": 0, "score": score, "source": attr_name})
 
         width_str, height_str = element.get("width", ""), element.get("height", "")
         min_img_width = self.settings.get(K.SETTING_MIN_IMG_WIDTH, K.DEFAULT_MIN_IMAGE_WIDTH)
@@ -725,9 +736,13 @@ class WebpageParser:
             except (ValueError, TypeError): pass
         
         attributes["alt"] = element.get("alt", ""); attributes["title"] = element.get("title", "")
+        # CORE-17: with named attrs now width=0 (score carries the tier), the
+        # substantial gate keeps them via the width==0 fail-open — no more
+        # drop-out at min_image_width > 100. Sort prefers the explicit
+        # hi-res tier first, then real pixel width.
         substantial_candidates = [c for c in candidates if (c["width"] >= min_img_width and c["width"] > 0) or ("dimensions" in attributes and attributes["dimensions"].get("height", 0) >= min_img_height) or c["width"] == 0]
         filtered_candidates = substantial_candidates if substantial_candidates else candidates
-        filtered_candidates.sort(key=lambda x: x["width"], reverse=True)
+        filtered_candidates.sort(key=lambda x: (x["score"], x["width"]), reverse=True)
 
         if filtered_candidates:
             best_url, best_attrs = filtered_candidates[0]["url"], attributes
@@ -764,7 +779,9 @@ class WebpageParser:
                         width = int(density * 1000)
                     except ValueError:
                         pass 
-            candidates.append({"url": url, "width": width, "source": "srcset"})
+            # CORE-17: srcset entries carry their real pixel width; the
+            # priority tier (score) is 0 — real pixels are their signal.
+            candidates.append({"url": url, "width": width, "score": 0, "source": "srcset"})
         return candidates
 
     def _extract_inline_css_images(self, element: Any) -> List[str]:
@@ -884,15 +901,17 @@ class WebpageParser:
                                     link_attrs = attrs.copy(); link_attrs['source'] = 'parent-link'
                                     if self._is_significant_media("image", link_abs_url, link_attrs):
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
-                                else:
-                                    self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
+                                # CORE-19: disabled-format direct media is DROPPED,
+                                # not queued as a from_image crawl link — queueing
+                                # made the crawler fetch image bytes as a
+                                # "webpage" on every such URL (media-lookup
+                                # bypasses stay-in-domain/depth).
                             elif is_media_url(link_abs_url) or any(kw in link_abs_url for kw in ['full','large','original']): 
                                 if is_format_allowed(link_abs_url, "image", self.settings):
                                     link_attrs = attrs.copy(); link_attrs['source'] = 'fullsize-link'
                                     if self._is_significant_media("image", link_abs_url, link_attrs):
                                         self.media_files.append(("image", link_abs_url, link_attrs)); found += 1
-                                else:
-                                    self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 10.0}
+                                # CORE-19: same drop as above for disabled formats.
                             elif not has_parent_webpage_link: 
                                 self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'potential_media_container': True, 'priority': 15.0}
         
@@ -1033,30 +1052,53 @@ class WebpageParser:
                         if isinstance(u, str) and u.startswith("http"):
                             urls.append(("video", u))
                 if "ImageObject" in str(obj_type) or "image" in obj:
-                    img = obj.get("image") or obj.get("url")
-                    if isinstance(img, str) and img.startswith("http"):
-                        urls.append(("image", img))
-                    elif isinstance(img, dict):
-                        u = img.get("url") or img.get("contentUrl")
-                        if isinstance(u, str) and u.startswith("http"):
-                            urls.append(("image", u))
+                    # CORE-9: accept str/dict/list (incl. ImageObject.image as a
+                    # list, which was previously lost entirely).
+                    for u in self._jsonld_image_urls(obj.get("image") or obj.get("url")):
+                        urls.append(("image", u))
                 # Article / Gallery / Post with image
                 if "image" in obj and "ImageObject" not in str(obj_type):
-                    img = obj.get("image")
-                    if isinstance(img, str) and img.startswith("http"):
-                        urls.append(("image", img))
-                    elif isinstance(img, list):
-                        for item in img[:5]:  # cap at 5
-                            u = item if isinstance(item, str) else (item.get("url") if isinstance(item, dict) else None)
-                            if u and isinstance(u, str) and u.startswith("http"):
-                                urls.append(("image", u))
+                    for u in self._jsonld_image_urls(obj.get("image")):
+                        urls.append(("image", u))
+                seen = set()
                 for media_type, u in urls:
+                    if u in seen:
+                        continue
+                    seen.add(u)
                     if not is_media_url(u):
                         continue
-                    self.media_files.append((media_type, u, {"source": "json-ld"}))
-                    found += 1
+                    # CORE-9: JSON-LD media passes the same significance gate as
+                    # every other extraction path (format allowlist, ad/junk,
+                    # icon/logo URL noise) — before, VideoObject previews and
+                    # small Article thumbnails went straight to the queue.
+                    if self._is_significant_media(media_type, u, {"source": "json-ld"}):
+                        self.media_files.append((media_type, u, {"source": "json-ld"}))
+                        found += 1
         if found:
             logger.info(f"Found {found} media URLs from JSON-LD on {self.url}")
+
+    def _jsonld_image_urls(self, img: Any, limit: int = 5) -> List[str]:
+        """Recursively collect image URLs from a JSON-LD image field.
+
+        Accepts a plain URL string, a dict with url/contentUrl, or a list of
+        either (CORE-9: the ImageObject.image list form was previously lost).
+        """
+        out: List[str] = []
+        def walk(node: Any) -> None:
+            if len(out) >= limit:
+                return
+            if isinstance(node, str):
+                if node.startswith("http"):
+                    out.append(node)
+            elif isinstance(node, dict):
+                u = node.get("url") or node.get("contentUrl")
+                if isinstance(u, str) and u.startswith("http"):
+                    out.append(u)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+        walk(img)
+        return out
 
     def _select_one_safe(self, soup, selector: str):
         """soup.select_one() that never raises on malformed CSS selectors."""
@@ -1355,9 +1397,6 @@ class WebpageParser:
         Parse webpage and extract media files and links.
         Returns: (links, media_files, error_status, error_message, http_status_code, cookies)
         """
-        if not hasattr(self, '_bypass_attempts'):
-            self._bypass_attempts = 0 
-
         # P4: a previous DOM click may have produced a mutated document — parse
         # it directly instead of re-fetching the same gateway page.
         if self._js_gateway_html:
@@ -1534,8 +1573,12 @@ class WebpageParser:
                     # Skip data-* extraction on preview thumbnails — the URL is
                     # a transition thumbnail, not page content.
                     continue
-                for framework, pattern in self.JS_PATTERNS["framework_patterns"].items():
-                    if re.search(pattern, str(elem)): self._process_framework_element(elem, framework)
+                # CORE-8: check the framework's marker attributes directly
+                # instead of re-serializing the element for each regex
+                # (str(elem) is O(subtree) per pattern — quadratic on big pages).
+                for framework in self.JS_PATTERNS["framework_patterns"]:
+                    if self._framework_attr_present(elem, framework):
+                        self._process_framework_element(elem, framework)
                 for attr_name in elem.attrs:
                     if attr_name.startswith("data-"): self._process_data_attribute(elem, attr_name)
             for data_attr_pattern in self.LAZY_LOAD_PATTERNS["data-attributes"]:
@@ -1568,12 +1611,29 @@ class WebpageParser:
                             if self._is_significant_media(media_hint, abs_url, attrs):
                                 self.media_files.append((media_hint, abs_url, attrs))
 
+    def _framework_attr_present(self, elem: Any, framework: str) -> bool:
+        """True when the element carries the framework's lazy-image marker.
+
+        CORE-8: attribute-based equivalent of the old regex-on-str(elem) checks
+        (those re-serialized the whole subtree per framework — O(page x depth)).
+        Mirrors exactly what _process_framework_element reads per framework.
+        """
+        if framework == "react":
+            return bool(elem.get("data-src") or elem.get("data-lazy"))
+        if framework == "vue":
+            return bool(elem.get("v-lazy"))
+        if framework == "angular":
+            # lxml lowercases attribute names, so the source "lazyLoad" appears
+            # as "lazyload" in the parsed tree — accept both cases.
+            return bool(elem.get("lazyLoad") or elem.get("lazyload") or elem.get("ng-src"))
+        return False
+
     def _process_framework_element(self, elem: Any, framework: str) -> None:
         attrs = {"source": f"framework-{framework}"}
         src_val = None
         if framework == "react": src_val = elem.get("data-src") or elem.get("data-lazy")
         elif framework == "vue": src_val = elem.get("v-lazy")
-        elif framework == "angular": src_val = elem.get("lazyLoad") or elem.get("ng-src")
+        elif framework == "angular": src_val = elem.get("lazyLoad") or elem.get("lazyload") or elem.get("ng-src")
         if src_val and is_media_url(src_val):
             abs_url = urljoin(self.url, src_val)
             media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"

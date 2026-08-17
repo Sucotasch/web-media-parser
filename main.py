@@ -16,6 +16,7 @@ from src.fix_brotli import BrotliSupportFix
 
 from src.app_paths import get_resource_dir
 from src.gui.main_window import MainWindow
+from src import constants as K
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QCoreApplication, Qt
 
@@ -37,7 +38,7 @@ def main():
     # Set application information before creating QApplication
     QCoreApplication.setApplicationName("Web Media Parser")
     QCoreApplication.setOrganizationName("WebMediaParser")
-    QCoreApplication.setApplicationVersion("1.0.0")
+    QCoreApplication.setApplicationVersion(K.APP_VERSION)
 
     # Configure High DPI settings before creating QApplication
     QApplication.setHighDpiScaleFactorRoundingPolicy(

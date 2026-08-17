@@ -14,9 +14,11 @@ from typing import Optional, Callable
 
 from aiohttp import web
 
+from src import constants as K
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_PORT = 19876
+DEFAULT_PORT = K.EXTENSION_API_PORT  # single source: src/constants (GUI-8)
 
 
 class ExtensionServer:
@@ -69,7 +71,13 @@ class ExtensionServer:
         origin = request.headers.get("Origin", "")
         if not origin:
             return True
-        return origin.startswith("chrome-extension://")
+        if not origin.startswith("chrome-extension://"):
+            return False
+        # EXT-11: pin to a specific extension ID when configured (stable only
+        # after Web Store publication); empty default = permissive compromise.
+        if K.EXTENSION_ID:
+            return origin == f"chrome-extension://{K.EXTENSION_ID}"
+        return True
 
     def _cors_headers(self, request=None):
         origin = request.headers.get("Origin", "") if request is not None else ""
@@ -130,17 +138,25 @@ class ExtensionServer:
             return web.json_response({"error": "Invalid JSON"}, status=400, headers=self._cors_headers(request))
 
         urls = body.get("urls", [])
+        # EXT-4: validate items server-side — a corrupt payload (strings, nulls,
+        # missing url) must not 500 the callback, which calls .get on each item.
+        urls = [
+            u for u in urls
+            if isinstance(u, dict) and isinstance(u.get("url"), str) and u["url"].strip()
+        ]
         one_shot = body.get("one_shot", False)
         user_agent = body.get("user_agent", "")
         cookies = body.get("cookies", "")
 
         if not urls:
-            return web.json_response({"error": "No URLs provided"}, status=400, headers=self._cors_headers(request))
+            return web.json_response({"error": "No valid URLs provided"}, status=400, headers=self._cors_headers(request))
 
         if self.add_tasks_callback:
             try:
                 result = self.add_tasks_callback(urls, one_shot, user_agent=user_agent, cookies=cookies)
-                return web.json_response({"ok": True, "added": len(urls), **(result or {})}, headers=self._cors_headers(request))
+                # X-1.4: the callback's own "added" count wins — the server-side
+                # count was dead (and misleading after validation filtering).
+                return web.json_response({"ok": True, **(result or {})}, headers=self._cors_headers(request))
             except Exception as e:
                 logger.error(f"Error adding tasks from extension: {e}")
                 return web.json_response({"error": str(e)}, status=500, headers=self._cors_headers(request))

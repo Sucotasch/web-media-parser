@@ -16,9 +16,9 @@ lxml>=5.0.0
 # Media detection
 filetype>=1.2.0
 
-# Character encoding
-chardet>=5.0.0; sys_platform == 'win32'
-cchardet>=2.1.7; sys_platform != 'win32'
+# Character encoding (PKG-3: cchardet never provided the `chardet` module the
+# parser imports, so Linux installs were broken; single source below)
+chardet>=5.0.0
 
 # Compression support (for aiohttp brotli content-encoding)
 brotli>=1.1.0

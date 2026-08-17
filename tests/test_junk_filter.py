@@ -35,6 +35,10 @@ def test_is_ad_url_positives(url, page):
     ("https://i.imgur.com/abc123.jpg", "https://imgur.com/"),
     ("https://pixhost.to/gallery/x/y.jpg", "https://forum.example/"),
     ("https://postimg.cc/abc/xyz.jpg", "https://forum.example/"),
+    # CORE-4: "pixel-art" galleries and "creative-portfolio" hosts are
+    # legit content — the old path tokens silently dropped them
+    ("https://cdn.artstation.com/pixel-art/scene1.png", "https://artstation.com/"),
+    ("https://i.imgur.com/creative-portfolio/shot.jpg", "https://imgur.com/"),
     # host token NOT a real ad network (suffix match precision)
     ("https://myadserver.example-gallery.com/photo.jpg", "https://example-gallery.com/"),
     # compound token (banner123 != banner) — precision
@@ -53,6 +57,16 @@ def test_is_ad_url_weak_third_party_size():
     # same-domain size alone stays safe
     assert junk_filter.is_ad_url(
         "https://gallery.com/i/300x250/1.jpg", "https://gallery.com/") is False
+
+
+def test_is_ad_url_third_party_uses_registrable_domain():
+    # CORE-6: bbc.co.uk vs evil.co.uk are DIFFERENT sites — a cross-site
+    # banner pixel on a co.uk page is third-party and fires the weak rule.
+    assert junk_filter.is_ad_url(
+        "https://evil.co.uk/i/300x250/1.jpg", "https://bbc.co.uk/") is True
+    # same registrable domain (subdomain) stays same-party
+    assert junk_filter.is_ad_url(
+        "https://img.bbc.co.uk/i/300x250/1.jpg", "https://bbc.co.uk/") is False
 
 
 def test_is_ad_url_allowlist_override(monkeypatch):

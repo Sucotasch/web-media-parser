@@ -82,10 +82,12 @@ def test_json_parser_keeps_video_urls_as_media():
     assert len(parser.media_files) == 1
     assert parser.media_files[0][0] == "video"
 
-    # Disabled format (GIF by default) becomes a link, not media
+    # CORE-19: disabled format (GIF by default) is dropped entirely, not
+    # queued as a crawl link — queueing made the crawler fetch image bytes
+    # as a "webpage" (media-lookup bypasses stay-in-domain/depth).
     parser2 = JSONWebpageParser(
         url="https://example.com/api", settings={}, external_session=object()
     )
     parser2._process_potential_media("https://example.com/anim.gif", "data.img")
     assert len(parser2.media_files) == 0
-    assert parser2.links == {"https://example.com/anim.gif"}
+    assert parser2.links == set()

@@ -6,9 +6,9 @@ This file gives Freebuff context about your project: goals, commands, convention
 - **What:** Desktop app (PySide6) that crawls web pages, detects media (images/video/audio/HLS/DASH), upgrades thumbnails to full-size URLs (built-in patterns + Imagus Sieve), and downloads files. Chrome MV3 extension (`extension/`) talks to the app over localhost HTTP. Python 3.8+ (dev env 3.12), primary OS Windows. Docs in Russian; code/identifiers in English.
 - **Setup:** `pip install -r requirements.txt` (project venv at `venv/` on Windows). `pytest` is NOT in requirements.txt — install separately.
 - **Run:** `python main.py` (GUI). Entry point applies lxml/brotli patches then starts `MainWindow`.
-- **Test:** `python -m pytest tests -q` (10 modules under `tests/`, 141 passed incl. `test_js_engine.py`, `test_junk_filter.py`). Deno-dependent tests auto-skip when `bin/deno.exe` / happy-dom cache is absent.
-- **Lint:** None configured — no pyproject.toml/setup.cfg/.flake8/.editorconfig. Match surrounding style by hand.
-- **Build:** `python build_exe.py` → PyInstaller onedir → `dist/WebMediaParser/` with `.exe` and deps.
+- **Test:** `python -m pytest tests -q` (26 modules under `tests/`, 265 passed / 30 skipped incl. `test_js_engine.py`, `test_junk_filter.py`). Deno-dependent tests auto-skip when the Deno binary isn't on PATH; curl_cffi must be installed for the P3 escalation tests. Shared helpers live in `tests/helpers.py` + `tests/conftest.py`.
+- **Lint:** None configured — `python -m pyflakes src/ tests/` used ad-hoc; no pyproject.toml/setup.cfg/.flake8/.editorconfig. Match surrounding style by hand.
+- **Build:** `python build_exe.py` → PyInstaller onedir → `dist/WebMediaParser/` with `.exe` and deps. Release = two zips: app `WebMediaParser_v<ver>.zip` + extension `WebMediaParser_extension_v<ver>.zip`.
 - **Extension:** Load unpacked `extension/` via `chrome://extensions` (Developer mode). API: `http://127.0.0.1:19876` (`GET /api/status`, `GET /api/queue`, `POST /api/tasks`).
 
 ## Architecture
@@ -20,12 +20,12 @@ This file gives Freebuff context about your project: goals, commands, convention
   - `src/server/http_server.py` — extension bridge.
   - `src/app_paths.py` — portable path resolution (dev vs frozen PyInstaller). `src/constants.py` — all defaults/setting keys (`K.*`, single source of truth).
   - `resources/` — `dark_theme.qss`, `domain_blocklist.txt`, `patterns/site_patterns.json`. `extension/` — Chrome MV3 (content script, sieve rules, popup).
-- **Data flow:** User or extension adds task → `TaskQueueManager.add_task` **snapshots settings + download_path** → MainWindow creates a **new** `ParserManager` + **new** `QThread` per launch → ParserManager runs asyncio loop with parser/downloader workers + URL priority queue → completion emits `task_ended(reason)` (`"completed"|"stopped"|"failed"`) → queue auto-starts next task. Per-task resume state in `sessions/{task_id}/state.pkl` (pickle). Settings dialog has 5 tabs (Parsing, Filters, Performance, HTTP, Logging).
+- **Data flow:** User or extension adds task → `TaskQueueManager.add_task` **snapshots settings + download_path** → MainWindow creates a **new** `ParserManager` + **new** `QThread` per launch → ParserManager runs asyncio loop with parser/downloader workers + URL priority queue → completion emits `task_ended(task_id, reason)` (`"completed"|"stopped"|"failed"`) → queue auto-starts the next task **below** the finished one (tasks placed above keep their state). Per-task resume state in `sessions/{task_id}/state.pkl` (pickle). Settings dialog has 5 tabs (Parsing, Filters, Performance, HTTP, Logging).
 
 ## JS engine (P0+P1, Deno)
 - Setting `SETTING_JS_ENGINE` (`js_engine`): `static` (default, unchanged behavior) | `deno` (Settings → JS Engine → Deno). `js_engine=None` means rules keep old static path.
 - P0: `to`-rules that can't be JS→Python converted run in the dependency-free `worker.js` (location/URL shims, `$[n]` groups, `#ext#` variants). P1: `url`/`res` rules run in `dom_worker.js` (happy-dom, `enableJavaScriptEvaluation=false`, NO `--allow-*` flags); `$._` carries raw fetched page text (Imagus convention), nested arrays are flattened, `#` fullsize marker stripped. DOM mode needs the bundled `deno_cache/npm` (populated at build time; `deno vendor` was removed in Deno 2).
-- Sandbox: workers get no permissions; console.* routed to stderr (stdout is the JSON protocol). Fail-open: any engine error → `None` → static path. Timeout 2s/call, workers killed on `shutdown()`.
+- Sandbox: workers get no permissions; console.* routed to stderr (stdout is the JSON protocol). Fail-open: any engine error → `None` → static path. Timeout 5s/call (covers cold Deno start; was 2s), workers killed on `shutdown()` (kill + bounded wait).
 - Windows: both `Popen`s use `CREATE_NO_WINDOW` (`_popen_kwargs()` in `engine.py`) — otherwise deno.exe console windows pop up for the whole task.
 - Build: `build_exe.py` bundles `bin/deno.exe` (~121 MB), `bin/worker.js`, `bin/dom_worker.js`, `bin/deno_cache/npm` (~13 MB). `resources/junk_allowlist.txt` is copied next to the exe.
 - P2-lite (`filter_junk`, default on): drop `junk_allowlist.txt` next to the exe to whitelist domains (one per line, `#` comments). `SETTING_FILTER_JUNK=False` keeps behavior byte-identical.

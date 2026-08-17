@@ -31,22 +31,7 @@ from src.parser.priority_url_queue import PriorityURLQueue
 from src.parser.parser_manager import ParserManager
 from src import constants as K
 
-
-class MockGUILogHandler:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def info(self, msg):
-        pass
-
-    def warning(self, msg):
-        pass
-
-    def error(self, msg):
-        pass
-
-    def debug(self, msg):
-        pass
+from helpers import MockGUILogHandler
 
 
 def run(coro):
@@ -297,14 +282,24 @@ class TestSameGalleryPriority(unittest.TestCase):
         boost falls back to the effective source — same as before."""
         album = "https://www.pictoa.com/albums/alisa-in-angel-a-3522178.html"
         own = "https://www.pictoa.com/albums/alisa-in-angel-a-3522178.html/53000424.html"
-        p = self.q._calculate_url_priority(own, 1, album, {"from_image": True})
-        self.assertGreater(p, 0)
+        # TST-3: also assert the from_image boost actually raises the priority
+        # vs the same URL without it (was only "p > 0").
+        boosted = self.q._calculate_url_priority(own, 1, album, {"from_image": True})
+        plain = self.q._calculate_url_priority(own, 1, album, {})
+        self.assertGreater(boosted, 0)
+        self.assertGreater(boosted, plain)
 
 
 class TestPageLimitSemantics(unittest.TestCase):
-    """F4: page_limit counts source pages with downloads, not files."""
+    """F4/TST-1: page_limit counts source pages with downloads, not files.
+
+    Exercised through the REAL production workers (downloader worker records
+    a source page per successful download; parser worker's gate stops the
+    crawl), not by poking _pages_with_downloads directly.
+    """
 
     def _make_manager(self, page_limit=1000):
+        import threading
         settings = {
             K.SETTING_STAY_IN_DOMAIN: True,
             K.SETTING_USE_PATTERNS: False,
@@ -317,28 +312,90 @@ class TestPageLimitSemantics(unittest.TestCase):
                 url="https://site.com/album-a", download_path="x",
                 settings=settings, log_handler=MockGUILogHandler(),
             )
+        # Asyncio primitives that start_parsing() would create on the loop
+        pm.download_queue = asyncio.Queue()
+        pm.quarantine_queue = asyncio.Queue()
+        pm._stop_event = asyncio.Event()
+        pm._pause_event = asyncio.Event()
+        pm._pause_event.set()
+        pm._domain_semaphores = {}
+        pm._thread_stop_event = threading.Event()
+        pm.url_queue.reset_async_primitives()  # _lock/_not_empty are None until start_parsing
         return pm
+
+    @staticmethod
+    def _media_item(url, source):
+        return {"url": url, "source_url": source, "media_type": "image",
+                "attrs": {}, "filepath": os.path.join("x", "f.jpg")}
+
+    def _run_downloader(self, pm, items):
+        """Drive the real _downloader_worker with a stubbed MediaDownloader."""
+        async def run():
+            for it in items:
+                await pm.download_queue.put(it)
+
+            async def stopper():
+                while not pm.download_queue.empty():
+                    await asyncio.sleep(0.02)
+                pm._stop_event.set()
+                pm.is_running = False
+
+            pm.is_running = True
+            with patch("src.parser.parser_manager.MediaDownloader") as MD:
+                MD.return_value.download.return_value = {"success": True}
+                await asyncio.gather(pm._downloader_worker(), stopper())
+        asyncio.run(run())
 
     def test_many_files_from_one_page_is_one_source(self):
         pm = self._make_manager(page_limit=2)
-        # 50 downloads from the SAME source page — still only ONE source page,
-        # so a limit of 2 pages is NOT reached (50 files != 50 pages).
-        for _ in range(50):
-            pm._pages_with_downloads.add("https://site.com/album-a")
+        # 50 downloads from the SAME source page — the downloader worker records
+        # ONE source page (set semantics), so a 2-page limit is NOT reached.
+        items = [self._media_item(f"https://img.example/f{i}.jpg", "https://site.com/album-a")
+                 for i in range(50)]
+        self._run_downloader(pm, items)
         self.assertEqual(len(pm._pages_with_downloads), 1)
-        self.assertFalse(len(pm._pages_with_downloads) >= pm.page_limit)
+        self.assertIn("https://site.com/album-a", pm._pages_with_downloads)
 
     def test_distinct_sources_trigger_limit(self):
         pm = self._make_manager(page_limit=2)
-        pm._pages_with_downloads.update([
-            "https://site.com/album-a", "https://site.com/album-b",
-        ])
-        self.assertTrue(len(pm._pages_with_downloads) >= pm.page_limit)
+        items = [
+            self._media_item("https://img.example/a.jpg", "https://site.com/album-a"),
+            self._media_item("https://img.example/b.jpg", "https://site.com/album-b"),
+        ]
+        self._run_downloader(pm, items)
+        self.assertEqual(len(pm._pages_with_downloads), 2)
+        # Real parser worker: with 2 source pages recorded and limit 2, the
+        # gate fires and the worker stops itself.
+        pm.is_running = True
+        pm._stop_event = asyncio.Event()
+        asyncio.run(pm._parser_worker(None))
+        self.assertTrue(pm._completed_naturally)
+        self.assertTrue(pm._stop_event.is_set())
 
     def test_zero_page_limit_is_unlimited(self):
         pm = self._make_manager(page_limit=0)
-        pm._pages_with_downloads.update(["a", "b", "c"])
-        self.assertFalse(pm.page_limit > 0 and len(pm._pages_with_downloads) >= pm.page_limit)
+        items = [
+            self._media_item("https://img.example/a.jpg", "https://site.com/album-a"),
+            self._media_item("https://img.example/b.jpg", "https://site.com/album-b"),
+            self._media_item("https://img.example/c.jpg", "https://site.com/album-c"),
+        ]
+        self._run_downloader(pm, items)
+        self.assertEqual(len(pm._pages_with_downloads), 3)
+
+        async def run_gate():
+            pm.is_running = True
+            pm._stop_event = asyncio.Event()
+            task = asyncio.create_task(pm._parser_worker(None))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(run_gate())
+        # page_limit=0 → the gate never fires; the worker keeps looping.
+        self.assertFalse(pm._completed_naturally)
+        self.assertFalse(pm._stop_event.is_set())
 
 
 if __name__ == "__main__":

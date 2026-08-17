@@ -58,7 +58,7 @@ src/
 extension/              # Chrome MV3 (content script, sieve, popup)
 resources/              # dark_theme.qss, domain_blocklist, site_patterns.json
 tests/                  # pytest unit tests
-CONTEXT.md              # Deep architecture notes (may lag code slightly)
+CONTEXT.md              # As-built architecture notes (updated 2026-08-16; Audit.md holds known defects)
 ```
 
 Ignore/generated (do not commit as product code): `venv/`, `build/`, `dist/`, `downloads/`, `__pycache__/`, `settings.json`, `task_queue.json`, session state under `sessions/`.
@@ -158,9 +158,10 @@ Note: `setup.py` install_requires is **stale** relative to `requirements.txt` â€
 | File | Use when |
 |------|----------|
 | `README.md` | User-facing features, install, extension usage |
-| `CONTEXT.md` | Historical design of task queue, ParserManager lifecycle, known pitfalls |
-| `Audit/` | External design/audit write-ups |
-| `Analysis_Results.md` | Ad-hoc bug notes during analysis |
+| `CONTEXT.md` | As-built architecture (2026-08-16): task lifecycle, threading model, persistence, known defects summary |
+| `Audit.md` | Full engineering audit 2026-08-16 (app + extension blocks) with ready-to-apply fixes |
+| `docs/DENO_JS_ENGINE_DESIGN.md` | Design + status log of the P0â€“P4 Deno/HTTP-engine work |
+| `docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md` | Historical work plan for crawl/junk/fullsize improvements (mostly implemented) |
 
 If `CONTEXT.md` conflicts with code, **trust the code** and update CONTEXT only when asked.
 

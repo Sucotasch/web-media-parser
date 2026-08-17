@@ -165,35 +165,39 @@ class JSONWebpageParser:
                 abs_url = urljoin(self.url, value)
                 # Determine media type (used to pick the right format allowlist)
                 media_type = self._guess_media_type(abs_url)
-                if not is_format_allowed(abs_url, media_type, self.settings):
-                    # Disabled format (e.g. GIF/SVG by default) — keep as link
-                    self.links.add(abs_url)
-                elif is_image_url(abs_url):
-                    self.media_files.append(("image", abs_url, {"source": f"json-{path}", "path": path}))
-                elif is_media_url(abs_url):
-                    self.media_files.append((media_type, abs_url, {"source": f"json-{path}", "path": path}))
+                if is_image_url(abs_url) or is_media_url(abs_url):
+                    # CORE-19: a direct media URL with a disabled format is
+                    # DROPPED — queueing it as a crawl link made the crawler
+                    # fetch image bytes as a "webpage" on every such URL
+                    # (media-lookup bypasses stay-in-domain/depth).
+                    if is_format_allowed(abs_url, media_type, self.settings):
+                        self.media_files.append((media_type, abs_url, {"source": f"json-{path}", "path": path}))
                 else:
-                    # Add as link for further processing
+                    # Non-media URL — keep as link for further processing
                     self.links.add(abs_url)
         elif isinstance(value, list):
             # Process list of potential URLs
             for item in value:
                 if isinstance(item, str) and self._looks_like_url(item):
                     abs_url = urljoin(self.url, item)
+                    media_type = self._guess_media_type(abs_url)
                     if is_media_url(abs_url):
-                        media_type = self._guess_media_type(abs_url)
-                        self.media_files.append((media_type, abs_url, {"source": f"json-{path}", "path": path}))
+                        # CORE-19: disabled-format media dropped (see above).
+                        if is_format_allowed(abs_url, media_type, self.settings):
+                            self.media_files.append((media_type, abs_url, {"source": f"json-{path}", "path": path}))
                 elif isinstance(item, dict) and "url" in item:
                     # Handle objects with url field
                     url_value = item["url"]
                     if isinstance(url_value, str) and self._looks_like_url(url_value):
                         abs_url = urljoin(self.url, url_value)
                         media_type = self._guess_media_type(abs_url)
-                        if is_media_url(abs_url) and is_format_allowed(abs_url, media_type, self.settings):
-                            attrs = {k: v for k, v in item.items() if k != "url"}
-                            attrs["source"] = f"json-{path}"
-                            attrs["path"] = path
-                            self.media_files.append((media_type, abs_url, attrs))
+                        if is_media_url(abs_url):
+                            # CORE-19: disabled-format media dropped (see above).
+                            if is_format_allowed(abs_url, media_type, self.settings):
+                                attrs = {k: v for k, v in item.items() if k != "url"}
+                                attrs["source"] = f"json-{path}"
+                                attrs["path"] = path
+                                self.media_files.append((media_type, abs_url, attrs))
                         else:
                             self.links.add(abs_url)
 

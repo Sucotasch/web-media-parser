@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import pytest
 from src.parser.webpage_parser import WebpageParser
 import asyncio
 from bs4 import BeautifulSoup
 
-
-class _DummySession:
-    """Minimal stand-in for aiohttp.ClientSession (icon parsing makes no I/O)."""
-
-    def __init__(self):
-        self.cookie_jar = _DummyCookieJar()
-
-
-class _DummyCookieJar:
-    def update_cookies(self, *a, **k):
-        pass
+from helpers import _DummySession
 
 
 def _make_parser(html):
@@ -53,6 +42,42 @@ def _make_parser_html(html, url="https://example.com/threads/123-test", process_
 async def _dynamic(parser, soup):
     await parser._handle_dynamic_content(soup)
     return parser.media_files
+
+
+def test_framework_lazy_attributes_extracted():
+    """CORE-8: framework lazy-load markers (vue v-lazy, angular lazyLoad,
+    react data-src) are detected via attributes instead of re-serializing each
+    element with str(elem) — the scan must keep extracting them."""
+    html = """
+    <html><body>
+      <img v-lazy="https://example.com/vue-img.jpg">
+      <img lazyLoad="https://example.com/ng-img.jpg">
+      <img data-src="https://example.com/react-img.jpg" class="lazy-load">
+    </body></html>
+    """
+    parser, soup = _make_parser_html(html, process_js=True)
+    media = asyncio.run(_dynamic(parser, soup))
+    urls = [u for _, u, _ in media]
+    # v-lazy / lazyLoad are NOT covered by the lazy-data-* loop, so they prove
+    # the framework path still fires after the str(elem) removal.
+    assert "https://example.com/vue-img.jpg" in urls, urls
+    assert "https://example.com/ng-img.jpg" in urls, urls
+    assert "https://example.com/react-img.jpg" in urls, urls
+
+
+def test_framework_attr_present_uses_attributes():
+    """CORE-8: the attribute-based framework marker check mirrors what
+    _process_framework_element reads per framework."""
+    parser, _ = _make_parser_html("<html></html>")
+    el_vue = BeautifulSoup('<img v-lazy="x">', "lxml").find("img")
+    el_angular = BeautifulSoup('<img ng-src="x">', "lxml").find("img")
+    el_plain = BeautifulSoup('<img src="x">', "lxml").find("img")
+    assert parser._framework_attr_present(el_vue, "vue") is True
+    assert parser._framework_attr_present(el_vue, "react") is False
+    assert parser._framework_attr_present(el_angular, "angular") is True
+    assert parser._framework_attr_present(el_plain, "react") is False
+    assert parser._framework_attr_present(el_plain, "vue") is False
+    assert parser._framework_attr_present(el_plain, "angular") is False
 
 
 def test_preview_transition_skipped_in_dynamic_scan():
@@ -134,12 +159,3 @@ def test_regular_link_tag_not_treated_as_media():
     urls = {u for _, u, _ in media}
     assert urls == {"https://example.com/img/real.jpg"}, urls
 
-
-@pytest.mark.skip(reason="Requires network access and external session — manual test only")
-def test_js_processing():
-    """Test that JavaScript processing works correctly.
-    
-    Requires network and aiohttp session — not suitable for automated CI.
-    Run manually: python -m pytest tests/test_js_processing.py -v -k test_js_processing --no-header -rN
-    """
-    pass

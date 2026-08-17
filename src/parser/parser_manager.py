@@ -57,7 +57,9 @@ class ParserManager(QObject):
     current_progress_updated = Signal(int)
     parsing_finished = Signal()
     status_updated = Signal(str)
-    task_ended = Signal(str)  # "completed" | "stopped" | "failed"
+    # GUI-2: (task_id, reason) — the queue/GUI must be able to tell a late
+    # signal from a previous task apart from the current one.
+    task_ended = Signal(str, str)  # (task_id, "completed"|"stopped"|"failed")
 
     def __init__(
         self, url: str, download_path: str, settings: Dict[str, Any], log_handler,
@@ -140,38 +142,14 @@ class ParserManager(QObject):
         self._active_tasks_lock = threading.Lock()
         
         self.loop = asyncio.new_event_loop()
-        self.async_client_manager: AsyncClientManager = AsyncClientManager(self.settings)
+        # DL-7: start_url is passed so browser-extension cookies are scoped to the
+        # start domain instead of leaking to every crawled host.
+        self.async_client_manager: AsyncClientManager = AsyncClientManager(self.settings, start_url=self.start_url)
         self._shared_downloader_session = None  # Created in _main_task, closed in _main_task.finally
         
         self.parser_tasks = []
         self.downloader_tasks = []
         self.blocked_domains: Set[str] = self._load_domain_blocklist()
-
-    def reset(self) -> None:
-        """Reset the manager state for a new parsing task"""
-        # Ensure we're in the right event loop if called during start
-        self.url_queue = PriorityURLQueue(settings=self.settings)
-        self.url_queue.reset_async_primitives()
-        self.download_queue = asyncio.Queue()
-        self.quarantine_queue = asyncio.Queue()
-        self._active_tasks = 0
-        self.processed_urls.clear()
-        self.downloaded_files.clear()
-        self._pages_with_downloads.clear()
-        self.stats = {
-            "images_found": 0, "videos_found": 0, "files_downloaded": 0,
-            "files_skipped": 0, "pages_processed": 0, "bytes_downloaded": 0
-        }
-        self.domain_health.clear()
-        self.quarantined_domains.clear()
-        self._consent_cookies.clear()
-        self._stop_event.clear()
-        self._pause_event.set()
-        self.is_running = False
-        self.is_paused = False
-        self._completed_naturally = False
-        self._had_critical_error = False
-        self._last_activity_time = time.time()
 
     def _load_domain_blocklist(self, blocklist_file_name: str = K.DOMAIN_BLOCKLIST_FILENAME) -> Set[str]:
         blocked_domains: Set[str] = set()
@@ -295,37 +273,57 @@ class ParserManager(QObject):
         # created inside a running event loop context.
         self.url_queue.reset_async_primitives()
 
-        # Load saved state (processed_urls, downloaded_files, queue items)
-        # This runs in the correct event loop thread, unlike the dead
-        # run_coroutine_threadsafe(self.loop) call that was previously in
-        # MainWindow._launch_parser_for_task.
-        await self.load_state(self.download_path)
+        # CORE-11: the pre-worker section (state load, seeding, shared session
+        # creation) must also emit task_ended on failure. Previously any
+        # exception here escaped _main_task without emitting anything, so the
+        # GUI kept showing a zombie "running" task forever. The shared session
+        # is created as the LAST step of this block: if it succeeded, nothing
+        # after it within the block can fail, so the early-return path never
+        # leaks an open session (and a raised create has nothing to close).
+        try:
+            # Load saved state (processed_urls, downloaded_files, queue items)
+            # This runs in the correct event loop thread, unlike the dead
+            # run_coroutine_threadsafe(self.loop) call that was previously in
+            # MainWindow._launch_parser_for_task.
+            await self.load_state(self.download_path)
 
-        # If we have pre-populated download items (from extension one-shot),
-        # add them to download_queue — extension did full scanning, no parsing needed
-        if self.pending_downloads:
-            for item in self.pending_downloads:
-                await self.download_queue.put(item)
-                self.stats["images_found"] += 1
-            # Set pages_processed so completion monitor can trigger
-            self.stats["pages_processed"] = 1
-            logger.info(f"One-shot: {len(self.pending_downloads)} items added to download_queue")
-            self.pending_downloads = []
-            # Don't seed start_url — items are already in download_queue
-            # Skip to waiting for downloads to complete
-        elif len(self.processed_urls) == 0:
-            # Seed the initial URL ONLY for fresh sessions (no state loaded, no pending downloads)
-            await self.url_queue.put(
-                self.start_url, 0, self.start_url,
-                {"is_start_url": True, "start_url": self.start_url}
-            )
+            # If we have pre-populated download items (from extension one-shot),
+            # add them to download_queue — extension did full scanning, no parsing needed
+            if self.pending_downloads:
+                for item in self.pending_downloads:
+                    await self.download_queue.put(item)
+                    self.stats["images_found"] += 1
+                # Set pages_processed so completion monitor can trigger
+                self.stats["pages_processed"] = 1
+                logger.info(f"One-shot: {len(self.pending_downloads)} items added to download_queue")
+                self.pending_downloads = []
+                # Don't seed start_url — items are already in download_queue
+                # Skip to waiting for downloads to complete
+            elif len(self.processed_urls) == 0:
+                # Seed the initial URL ONLY for fresh sessions (no state loaded, no pending downloads)
+                await self.url_queue.put(
+                    self.start_url, 0, self.start_url,
+                    {"is_start_url": True, "start_url": self.start_url}
+                )
 
-        # Create the shared requests.Session here so its lifecycle is entirely
-        # within _main_task: created before workers start, closed in finally
-        # after all workers are cancelled+gathered. A local reference prevents
-        # race conditions if start_parsing() is called again before this task ends.
-        shared_dl_session = create_shared_downloader_session(self.settings)
-        self._shared_downloader_session = shared_dl_session
+            # Create the shared requests.Session here so its lifecycle is entirely
+            # within _main_task: created before workers start, closed in finally
+            # after all workers are cancelled+gathered. A local reference prevents
+            # race conditions if start_parsing() is called again before this task ends.
+            shared_dl_session = create_shared_downloader_session(self.settings)
+            self._shared_downloader_session = shared_dl_session
+        except Exception as e:
+            logger.error(f"Critical error before parser workers started: {e}", exc_info=True)
+            self._had_critical_error = True
+            self.task_ended.emit(self.task_id or "", "failed")
+            # MONITOR-LEAK: this early-return path bypasses the finally of the
+            # main try below, so stop the progress monitor thread here too —
+            # otherwise it loops forever after a pre-worker crash.
+            self.is_running = False
+            thread_stop = getattr(self, "_thread_stop_event", None)
+            if thread_stop is not None:
+                thread_stop.set()
+            return
         try:
             async with self.async_client_manager as session:
                 parser_count = self.settings.get(K.SETTING_PARSER_THREADS, K.DEFAULT_PARSER_THREADS)
@@ -355,6 +353,14 @@ class ParserManager(QObject):
             self._had_critical_error = True
         finally:
             logger.info("_main_task finished.")
+            # MONITOR-LEAK: stop the progress monitor thread even on NATURAL
+            # completion or an early crash — stop_parsing() is the only other
+            # place that clears these, so without this the daemon monitor
+            # looped forever emitting progress signals on a finished task.
+            self.is_running = False
+            thread_stop = getattr(self, "_thread_stop_event", None)
+            if thread_stop is not None:
+                thread_stop.set()
             # Shut down the Deno JS worker (if any) — terminates the subprocess.
             if self.pattern_manager is not None and self.pattern_manager.js_engine is not None:
                 try:
@@ -373,11 +379,11 @@ class ParserManager(QObject):
                 self.parsing_finished.emit()
             # Always emit task_ended so the queue manager knows the task finished
             if getattr(self, "_had_critical_error", False):
-                self.task_ended.emit("failed")
+                self.task_ended.emit(self.task_id or "", "failed")
             elif self._completed_naturally:
-                self.task_ended.emit("completed")
+                self.task_ended.emit(self.task_id or "", "completed")
             else:
-                self.task_ended.emit("stopped")
+                self.task_ended.emit(self.task_id or "", "stopped")
 
     async def _completion_monitor(self) -> None:
         """Monitors queue emptiness and triggers natural completion when all work is done.
@@ -469,8 +475,14 @@ class ParserManager(QObject):
         media_files_found: List[Tuple[str, str, Dict[str, Any]]] = []
         if is_json_api:
             logger.debug(f"Using JSONWebpageParser for {url}")
-            async with JSONWebpageParser(url=url, settings=self.settings, external_session=session) as p:
-                links_found, media_files_found = await p.parse()
+            # CORE-1: JSONWebpageParser manages its session externally (the
+            # AsyncClientManager passed as external_session) and deliberately
+            # does NOT implement __aenter__/__aexit__ — `async with` raised
+            # TypeError on every JSON-classified URL, silently killing the
+            # JSON API parser in production (each URL was logged as an error
+            # and no media was ever extracted). Call parse() directly.
+            p = JSONWebpageParser(url=url, settings=self.settings, external_session=session)
+            links_found, media_files_found = await p.parse()
         else:
             logger.debug(f"Using WebpageParser for {url}")
             # P4: inject per-domain consent cookies learned from earlier
@@ -587,31 +599,45 @@ class ParserManager(QObject):
                 headers = {"Accept": "text/html"}
                 if post_data:
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
-                    resp = await session.post(fetch_url, data=post_data, headers=headers,
-                                              timeout=timeout, proxy=proxy_url)
-                else:
-                    resp = await session.get(fetch_url, headers=headers,
+
+                async def _fetch():
+                    if post_data:
+                        return await session.post(fetch_url, data=post_data, headers=headers,
+                                                  timeout=timeout, proxy=proxy_url)
+                    return await session.get(fetch_url, headers=headers,
                                              timeout=timeout, proxy=proxy_url)
-                content_type = resp.headers.get("Content-Type", "") or ""
-                if "image/" in content_type or "video/" in content_type:
-                    final_url = str(resp.url)
-                    media_type = "video" if "video/" in content_type else "image"
-                    discovered.append((media_type, final_url, {"source": "link-direct"}))
-                    if thumb:
-                        resolved_thumbnails.add(thumb)
-                    return
-                if "text/html" not in content_type:
-                    return
-                html = await resp.text()
-                for u in self.pattern_manager.extract_res_urls(
-                        rule, html, page_url=page_url, groups=link_groups, href=link_url):
-                    if not is_format_allowed(u, "image", self.settings):
-                        continue
-                    discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
-                    if thumb:
-                        resolved_thumbnails.add(thumb)
+
+                # CORE-2: `async with` guarantees the pooled connection is
+                # released even on the early returns below (image/video content,
+                # non-HTML) — without it the unread body pinned the connection
+                # until the server's keepalive timeout.
+                async with await _fetch() as resp:
+                    content_type = resp.headers.get("Content-Type", "") or ""
+                    if "image/" in content_type or "video/" in content_type:
+                        final_url = str(resp.url)
+                        media_type = "video" if "video/" in content_type else "image"
+                        discovered.append((media_type, final_url, {"source": "link-direct"}))
+                        if thumb:
+                            resolved_thumbnails.add(thumb)
+                        return
+                    if "text/html" not in content_type:
+                        return
+                    html = await resp.text()
+                    for u in self.pattern_manager.extract_res_urls(
+                            rule, html, page_url=page_url, groups=link_groups, href=link_url):
+                        if not is_format_allowed(u, "image", self.settings):
+                            continue
+                        discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
+                        if thumb:
+                            resolved_thumbnails.add(thumb)
             except Exception as e:
                 logger.debug(f"Fullsize discovery failed for {link_url}: {e}")
+                # CORE-20: the linked page was NOT resolved — release it back
+                # to the normal crawl path instead of silently discarding it.
+                # consumed.add() happens before the fetch; without the discard,
+                # a transient network error excluded the viewer page from the
+                # crawl and its remaining content was lost.
+                consumed.discard(link_url)
 
         async def limited(link_url, ctx):
             async with sem:
@@ -800,7 +826,15 @@ class ParserManager(QObject):
                 await self._process_parser_results(current_url, depth, links_found, media_files_found, context, session)
             except Exception as e:
                 logger.error(f"Error processing URL {current_url}: {str(e)}", exc_info=True)
-                if current_url not in self.processed_urls: self.processed_urls.add(current_url)
+                # CORE-10: count a failed page as processed so the completion
+                # monitor (which requires pages_processed > 0) can still
+                # trigger natural finish. Without this, an exception on the
+                # only seeded URL left the task hanging forever — queues
+                # empty, pages_processed == 0, monitor kept skipping.
+                if current_url not in self.processed_urls:
+                    self.processed_urls.add(current_url)
+                self.stats["pages_processed"] += 1
+                self._last_activity_time = time.time()
             finally:
                 with self._active_tasks_lock:
                     self._active_tasks -= 1
@@ -968,16 +1002,29 @@ class ParserManager(QObject):
                 self.download_queue.task_done()
         logger.info(f"Downloader worker {threading.get_ident()} finished.")
 
+    def _schedule_on_loop(self, callback) -> None:
+        """Run `callback` on the event-loop thread; fall back to calling it
+        directly when the loop is closed/unavailable.
+
+        CORE-12: call_soon_threadsafe can raise RuntimeError if the loop closes
+        between the is_closed() check and the call (race from a GUI thread) —
+        never let that escape.
+        """
+        try:
+            if self.loop and not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(callback)
+                return
+        except RuntimeError:
+            pass
+        callback()
+
     def pause_parsing(self) -> None:
         self.is_paused = True
         logger.info("Parsing paused")
         if self._pause_event is None:
             return
         # Schedule _pause_event.clear() in the correct event loop thread
-        if self.loop and not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._pause_event.clear)
-        else:
-            self._pause_event.clear()
+        self._schedule_on_loop(self._pause_event.clear)
 
     def resume_parsing(self) -> None:
         self.is_paused = False
@@ -985,10 +1032,7 @@ class ParserManager(QObject):
         if self._pause_event is None:
             return
         # Schedule _pause_event.set() in the correct event loop thread
-        if self.loop and not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._pause_event.set)
-        else:
-            self._pause_event.set()
+        self._schedule_on_loop(self._pause_event.set)
 
     def _drain_queues(self) -> None:
         """Drain asyncio queues. Must run in the event loop thread."""
@@ -1013,17 +1057,11 @@ class ParserManager(QObject):
         logger.info("Attempting to stop parsing...")
         self.is_running = False
         # Thread-safe signaling to the event loop thread
-        if self._stop_event is not None and self.loop and not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._stop_event.set)
-            self.loop.call_soon_threadsafe(self._pause_event.set)
-            self.loop.call_soon_threadsafe(self._drain_queues)
-        else:
-            if self._stop_event is not None:
-                self._stop_event.set()
-            if self._pause_event is not None:
-                self._pause_event.set()
+        if self._stop_event is not None:
+            self._schedule_on_loop(self._stop_event.set)
+            self._schedule_on_loop(self._pause_event.set)
             if self.download_queue is not None:
-                self._drain_queues()
+                self._schedule_on_loop(self._drain_queues)
         # Signal cross-thread stop for download threads and progress monitor
         if self._thread_stop_event is not None:
             self._thread_stop_event.set()

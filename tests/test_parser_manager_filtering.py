@@ -3,16 +3,9 @@ import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from src.parser.parser_manager import ParserManager
-from src.parser.utils import get_domain # Assuming get_domain is correctly importable
 from src import constants as K
 
-# Minimal mock for GUILogHandler if needed for ParserManager instantiation
-class MockGUILogHandler:
-    def __init__(self, *args, **kwargs): pass
-    def info(self, msg): print(f"INFO: {msg}") # Or pass
-    def warning(self, msg): print(f"WARN: {msg}") # Or pass
-    def error(self, msg): print(f"ERROR: {msg}") # Or pass
-    def debug(self, msg): print(f"DEBUG: {msg}") # Or pass
+from helpers import MockGUILogHandler
 
 
 class TestParserManagerFiltering(unittest.TestCase):
@@ -104,19 +97,10 @@ class TestParserManagerFiltering(unittest.TestCase):
         self.assertNotIn("http://anotherblock.org/resource.jpg", actual_queued_urls)
         self.assertNotIn("ftp://blockeddomain.com/file", actual_queued_urls) 
 
-        # Verify logging for skipped domains
-        # Check that logger.debug was called with messages indicating skipping
-        # This requires the logger in ParserManager to be the mocked one (mock_pm_logger)
-        
-        # Example: check if specific log messages were emitted
-        # This is a bit fragile as it depends on the exact log message format.
-        # A more robust way might be to check call_args for specific parts of the message.
-        debug_logs = [call[0][0] for call in mock_pm_logger.debug.call_args_list]
-        
-        self.assertTrue(any("Skipping blocked domain for URL https://blockeddomain.com/badpage" in log for log in debug_logs))
-        self.assertTrue(any("Skipping blocked domain for URL http://anotherblock.org/resource.jpg" in log for log in debug_logs))
-        self.assertTrue(any("Skipping blocked domain for URL ftp://blockeddomain.com/file" in log for log in debug_logs))
-        
+        # TST-3: behavior is asserted above (blocked URLs absent from the queue);
+        # the per-line log-message assertions were removed — they were fragile
+        # to message rephrasing and duplicated the assertNotIn checks.
+
         # Ensure it tried to queue exactly two URLs
         self.assertEqual(parser_manager.url_queue.put.call_count, 2)
 
