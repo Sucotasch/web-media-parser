@@ -202,6 +202,145 @@ def test_allowlist_candidates_include_resources():
     assert resources_path in candidates, "resources/ candidate missing (PAT-8)"
 
 
+def test_imagus_off_rule_skipped(tmp_path):
+    """C-3a: sieve rules with `off: 1` are disabled in the source and must not
+    be loaded (Mod semantics). Name is NOT marked as loaded so a later file
+    can supply an enabled variant.
+    """
+    import json
+    sieve = tmp_path / "sieve.json"
+    sieve.write_text(json.dumps({
+        "Disabled_Rule": {"link": "^https?://off[.]example/", "to": "img", "off": 1},
+        "Enabled_Rule": {"link": "^https?://on[.]example/", "to": "img"},
+    }), encoding="utf-8")
+    pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=str(sieve))
+    assert pm.get_link_rule("https://off.example/pic/1") is None
+    rule, m = pm.get_link_rule("https://on.example/pic/1")
+    assert rule is not None
+
+
+def test_imagus_off_rule_shadowed_name_can_reappear(tmp_path):
+    """C-3a: an off rule must not claim its name — a second file with an
+    enabled variant of the same name still loads."""
+    import json
+    s1 = tmp_path / "s1.json"
+    s1.write_text(json.dumps({
+        "Same_Name": {"link": "^https?://a[.]example/", "to": "img", "off": 1},
+    }), encoding="utf-8")
+    s2 = tmp_path / "s2.json"
+    s2.write_text(json.dumps({
+        "Same_Name": {"link": "^https?://b[.]example/", "to": "img"},
+    }), encoding="utf-8")
+    pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=str(s1))
+    pm._load_imagus_file(str(s2))
+    assert pm.get_link_rule("https://b.example/pic") is not None
+
+
+def test_imagus_dc_rule_debug_logged(tmp_path, caplog):
+    """C-3b: dc rules load but are flagged in debug logs (support deferred)."""
+    import json
+    import logging
+    sieve = tmp_path / "sieve_dc.json"
+    sieve.write_text(json.dumps({
+        "DC_Rule": {"link": "^https?://dc[.]example/", "to": "img", "dc": 2},
+    }), encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="src.parser.site_pattern_manager"):
+        pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=str(sieve))
+    assert any("dc" in r.message.lower() for r in caplog.records), "dc debug log missing"
+    # Rule still loads (dc does not block loading)
+    assert pm.get_link_rule("https://dc.example/pic/1") is not None
+
+
+def _make_sieve_pm(tmp_path, rules=None):
+    """Build a SitePatternManager with a writable sieve file."""
+    import json
+    if rules is None:
+        rules = {"Base_Rule": {"link": "^https?://base[.]example/", "to": "img"}}
+    p = tmp_path / "sieve.json"
+    p.write_text(json.dumps(rules), encoding="utf-8")
+    return SitePatternManager(enable_built_in=False, imagus_sieve_path=str(p))
+
+
+class _FakeResp:
+    def __init__(self, status=200, content=b""):
+        self.status_code = status
+        self.content = content
+
+
+class _FakeSession:
+    def __init__(self, resp):
+        self._resp = resp
+        self.closed = False
+    def get(self, url, timeout=None):
+        return self._resp
+    def close(self):
+        self.closed = True
+
+
+def test_download_imagus_valid_replaces(tmp_path, monkeypatch):
+    """C-1: a valid downloaded sieve atomically replaces the file and reloads."""
+    import json
+    pm = _make_sieve_pm(tmp_path)
+    new_rules = {"New_Rule": {"link": "^https?://new[.]example/", "to": "img"}}
+    payload = json.dumps(new_rules).encode("utf-8")
+    from src.downloader import media_downloader as md_mod
+    monkeypatch.setattr(md_mod, "create_shared_downloader_session",
+                        lambda settings: _FakeSession(_FakeResp(content=payload)))
+
+    ok, msg = pm.download_imagus_from_url("https://example.com/sieve.json")
+    assert ok, msg
+    # File replaced
+    on_disk = json.load(open(tmp_path / "sieve.json", encoding="utf-8"))
+    assert "New_Rule" in on_disk
+    # Rules reloaded from the new file
+    assert pm.get_link_rule("https://new.example/pic/1") is not None
+    # No temp file left behind
+    assert not (tmp_path / "sieve.json.tmp").exists()
+
+
+def test_download_imagus_invalid_keeps_old(tmp_path, monkeypatch):
+    """C-1: invalid payloads must never touch the working sieve."""
+    import json
+    pm = _make_sieve_pm(tmp_path)
+    old_rule = pm.get_link_rule("https://base.example/pic/1")
+    assert old_rule is not None
+
+    from src.downloader import media_downloader as md_mod
+
+    # Not JSON at all
+    monkeypatch.setattr(md_mod, "create_shared_downloader_session",
+                        lambda settings: _FakeSession(_FakeResp(content=b"<html>404 page</html>")))
+    ok, msg = pm.download_imagus_from_url("https://example.com/sieve.json")
+    assert not ok and "Invalid JSON" in msg
+
+    # Valid JSON but zero usable rules (Mod's validRuleCount === 0)
+    zero_rules_payload = b'{"a": {}, "b": {"x": 1}}'
+    monkeypatch.setattr(md_mod, "create_shared_downloader_session",
+                        lambda settings: _FakeSession(_FakeResp(content=zero_rules_payload)))
+    ok, msg = pm.download_imagus_from_url("https://example.com/sieve.json")
+    assert not ok and "no valid rules" in msg
+
+    # HTTP error status
+    monkeypatch.setattr(md_mod, "create_shared_downloader_session",
+                        lambda settings: _FakeSession(_FakeResp(status=404, content=b"{}")))
+    ok, msg = pm.download_imagus_from_url("https://example.com/sieve.json")
+    assert not ok and "404" in msg
+
+    # Old sieve untouched in all cases
+    assert pm.get_link_rule("https://base.example/pic/1") is not None
+    on_disk = json.load(open(tmp_path / "sieve.json", encoding="utf-8"))
+    assert "Base_Rule" in on_disk
+
+
+def test_jsdelivr_mirror_conversion():
+    """C-1: raw.githubusercontent URL converts to jsDelivr CDN form."""
+    pm = SitePatternManager(enable_built_in=False)
+    url = "https://raw.githubusercontent.com/user/repo/master/data/sieve.json"
+    assert pm.jsdelivr_mirror(url) == "https://cdn.jsdelivr.net/gh/user/repo@master/data/sieve.json"
+    assert pm.jsdelivr_mirror("https://example.com/other.json") is None
+    assert pm.jsdelivr_mirror("") is None
+
+
 if __name__ == "__main__":
     test_site_pattern_manager_loading()
     test_url_transformation()

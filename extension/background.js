@@ -7,7 +7,7 @@
 importScripts("shared.js");
 
 const API_BASE = "http://127.0.0.1:19876";
-const SIEVE_VERSION = "2026.04.01"; // Bump when shipping new sieve.json
+const SIEVE_VERSION = "2026.07.15"; // Bump when shipping new sieve.json
 
 // Load sieve rules from bundled file into storage
 async function loadSieveRules(force = false) {
@@ -38,6 +38,49 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 // Also load on startup
 loadSieveRules();
+
+// --- C-1: online sieve update (port of Mod's updateSieve) ---
+// sieve_updater.js is an ES module (importScripts cannot load it), so its
+// pure logic is mirrored via dynamic import when the worker supports it;
+// the weekly alarm and merge semantics live there.
+let _sieveUpdater = null;
+async function getSieveUpdater() {
+  if (!_sieveUpdater) {
+    try {
+      _sieveUpdater = await import(chrome.runtime.getURL("sieve_updater.js"));
+    } catch (e) {
+      console.warn("Sieve updater module unavailable:", e.message);
+      return null;
+    }
+  }
+  return _sieveUpdater;
+}
+
+async function runSieveUpdate() {
+  const updater = await getSieveUpdater();
+  if (!updater) return null;
+  const stored = (await chrome.storage.local.get("sieveRepository")) || {};
+  const result = await updater.updateSieve(stored.sieveRepository);
+  console.info("Sieve update:", result.status, "—", result.message);
+  if (result.status === "updated") {
+    // New rules in storage — refresh the in-memory regex cache.
+    await loadSieveResPatterns();
+  }
+  return result;
+}
+
+// Weekly auto-update (MV3 alarms survive worker suspension)
+chrome.alarms.create("sieve-update-weekly", { periodInMinutes: 7 * 24 * 60 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "sieve-update-weekly") runSieveUpdate();
+});
+
+// Check once shortly after every service-worker cold start (cheap: 304 or
+// early-exit when the module is unavailable — no network storm). Note: MV3
+// may suspend the SW before the timer fires; that is acceptable — the weekly
+// alarm below is the authoritative update trigger, and the popup's
+// "Update sieve now" button covers on-demand checks.
+setTimeout(runSieveUpdate, 15000);
 
 // --- Linked page discovery (CORS bypass via service worker) ---
 
@@ -129,8 +172,11 @@ function applyUrlTransform(template, matchGroups) {
   if (!template || !matchGroups) return null;
   try {
     let result = template;
-    // Replace $1, $2, etc. with captured groups (literal string replacement)
-    for (let i = 1; i < matchGroups.length; i++) {
+    // Replace $1, $2, etc. with captured groups (literal string replacement).
+    // B-2: substitute in DESCENDING order — ascending order corrupts $10
+    // (its $1 substring is replaced first, leaving "(g1)0"). Mirrors the
+    // desktop twin in site_pattern_manager.apply_link_url_transform.
+    for (let i = matchGroups.length - 1; i >= 1; i--) {
       const placeholder = `$${i}`;
       if (result.includes(placeholder) && matchGroups[i] !== undefined) {
         // Use split/join to avoid regex escaping issues with $
@@ -172,7 +218,9 @@ async function discoverFullsize(links, pageUrl) {
           // Apply url transform if present and is string type
           if (urlPattern && urlPattern.type === "string") {
             const transformed = applyUrlTransform(urlPattern.template, matchedGroups);
-            if (transformed) {
+            // C-4: data:-templates (e.g. "data:,$&") are no-fetch markers in
+            // Imagus, not URLs — fetching them produced https://data:,... garbage.
+            if (transformed && !transformed.startsWith("data:")) {
               // Preserve protocol if template doesn't include it
               if (!transformed.startsWith("http") && !transformed.startsWith("//")) {
                 const protocol = linkUrl.startsWith("https") ? "https://" : "http://";
@@ -245,8 +293,15 @@ async function discoverFullsize(links, pageUrl) {
     }
   }
 
+  // B-4: shared page-level deadline (mirrors desktop FULLSIZE_DISCOVER_TIME_BUDGET).
+  // A page full of dead hosts must not stall the popup for minutes.
+  const deadline = Date.now() + 45000;
   // Process links in chunks of DISCOVER_CONCURRENCY
   for (let i = 0; i < links.length; i += DISCOVER_CONCURRENCY) {
+    if (Date.now() >= deadline) {
+      console.info("discoverFullsize: 45s budget exhausted; remaining links skipped");
+      break;
+    }
     const chunk = links.slice(i, i + DISCOVER_CONCURRENCY);
     const results = await Promise.all(chunk.map(processLink));
     for (const r of results) discovered.push(...r);
@@ -330,7 +385,10 @@ async function chromeDownload(items, concurrentLimit = 2) {
             if (delta.id === downloadId && delta.state?.current) {
               const state = delta.state.current;
               if (state === 'complete' || state === 'interrupted') {
-                clearTimeout(watchdog);
+                // B-3: guard — watchdog is assigned by the setTimeout below,
+                // after this listener is registered. A synchronous event
+                // dispatch before assignment would hit the TDZ ReferenceError.
+                if (watchdog) clearTimeout(watchdog);
                 chrome.downloads.onChanged.removeListener(listener);
                 activeCount--; // Release the slot
                 if (state === 'complete') saved++;
@@ -343,7 +401,10 @@ async function chromeDownload(items, concurrentLimit = 2) {
           // EXT-5: safety net — if onChanged never fires (download cancelled
           // from Chrome's shelf, extension reloaded), don't hang the promise
           // (and the popup's "Saving…") forever.
-          const watchdog = setTimeout(() => {
+          // B-3: `let` (not `const`) so reassignment in the timeout callback
+          // keeps the listener's guard simple and the TDZ window minimal.
+          let watchdog = setTimeout(() => {
+            watchdog = null;
             chrome.downloads.onChanged.removeListener(listener);
             activeCount--; // Release the slot
             completed++;
@@ -527,6 +588,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === "getStatus") {
     getStatus().then(sendResponse);
+    return true;
+  }
+  if (request.action === "updateSieve") {
+    runSieveUpdate().then((r) => sendResponse(r || { status: "error", message: "updater unavailable" }));
     return true;
   }
 });

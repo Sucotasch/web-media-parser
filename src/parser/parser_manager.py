@@ -492,8 +492,15 @@ class ParserManager(QObject):
             consent = self._consent_cookies.get(get_domain(url))
             if consent:
                 parser_context["consent_cookies"] = consent
+            # A-3: also mirror the source page into settings via a copy so the
+            # Referer logic (which reads `_source_url`) works even for code
+            # paths that only look at settings, never the context.
+            settings_for_parser = dict(self.settings)
+            src_page = parser_context.get("source_url")
+            if src_page:
+                settings_for_parser["_source_url"] = src_page
             p = WebpageParser(
-                url=url, settings=self.settings,
+                url=url, settings=settings_for_parser,
                 process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
                 external_session=session, pattern_manager=self.pattern_manager,
                 context=parser_context
@@ -588,6 +595,11 @@ class ParserManager(QObject):
                 # consuming it blindly.
                 return
             consumed.add(link_url)
+            # A-5/BUG-5 note: only the ORIGINAL link_url is ever added to
+            # `consumed` (intermediate loop hops are transient fetch targets,
+            # not crawled links), so the exception handler below releasing
+            # exactly link_url is correct for every hop.
+            original_link_url = link_url
             if transformed:
                 fetch_url, post_data = transformed
             else:
@@ -596,40 +608,87 @@ class ParserManager(QObject):
                 fetch_url, post_data = link_url, None
             thumb = ctx.get("thumbnail_url")
             try:
-                headers = {"Accept": "text/html"}
-                if post_data:
-                    headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-                async def _fetch():
+                # C-2 (loop): Mod semantics (src/includes/content.js:1481/4478) —
+                # a rule with `loop & 1` whose res yields a single URL matching
+                # another sieve rule re-enters the engine with that URL (recurs-
+                # ive re-resolution), up to SIEVE_LOOP_MAX_HOPS, self-reference
+                # aborts. Implemented as a bounded chain: each iteration fetches
+                # the current hop's page; if the result is exactly one URL that
+                # matches another link-rule (and the current rule allows loop),
+                # the chain continues; otherwise all accumulated URLs are media.
+                seen_fetch_urls = {fetch_url}
+                loop_guard = 0
+                while True:
+                    headers = {"Accept": "text/html"}
                     if post_data:
-                        return await session.post(fetch_url, data=post_data, headers=headers,
-                                                  timeout=timeout, proxy=proxy_url)
-                    return await session.get(fetch_url, headers=headers,
-                                             timeout=timeout, proxy=proxy_url)
+                        headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-                # CORE-2: `async with` guarantees the pooled connection is
-                # released even on the early returns below (image/video content,
-                # non-HTML) — without it the unread body pinned the connection
-                # until the server's keepalive timeout.
-                async with await _fetch() as resp:
-                    content_type = resp.headers.get("Content-Type", "") or ""
-                    if "image/" in content_type or "video/" in content_type:
-                        final_url = str(resp.url)
-                        media_type = "video" if "video/" in content_type else "image"
-                        discovered.append((media_type, final_url, {"source": "link-direct"}))
-                        if thumb:
-                            resolved_thumbnails.add(thumb)
-                        return
-                    if "text/html" not in content_type:
-                        return
-                    html = await resp.text()
-                    for u in self.pattern_manager.extract_res_urls(
-                            rule, html, page_url=page_url, groups=link_groups, href=link_url):
-                        if not is_format_allowed(u, "image", self.settings):
-                            continue
-                        discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
-                        if thumb:
-                            resolved_thumbnails.add(thumb)
+                    async def _fetch():
+                        if post_data:
+                            return await session.post(fetch_url, data=post_data, headers=headers,
+                                                      timeout=timeout, proxy=proxy_url)
+                        return await session.get(fetch_url, headers=headers,
+                                                 timeout=timeout, proxy=proxy_url)
+
+                    # CORE-2: `async with` guarantees the pooled connection is
+                    # released even on the early returns below (image/video content,
+                    # non-HTML) — without it the unread body pinned the connection
+                    # until the server's keepalive timeout.
+                    async with await _fetch() as resp:
+                        content_type = resp.headers.get("Content-Type", "") or ""
+                        if "image/" in content_type or "video/" in content_type:
+                            final_url = str(resp.url)
+                            media_type = "video" if "video/" in content_type else "image"
+                            discovered.append((media_type, final_url, {"source": "link-direct"}))
+                            if thumb:
+                                resolved_thumbnails.add(thumb)
+                            return
+                        if "text/html" not in content_type:
+                            return
+                        html = await resp.text()
+
+                    res_urls = [u for u in self.pattern_manager.extract_res_urls(
+                        rule, html, page_url=page_url, groups=link_groups, href=link_url)
+                        if is_format_allowed(u, "image", self.settings)]
+
+                    # Loop continuation check: rule opted in via `loop & 1`,
+                    # exactly ONE res-URL, that URL matches another rule, and we
+                    # have hops/time left and haven't seen this fetch before.
+                    next_link = None
+                    if (res_urls and len(res_urls) == 1
+                            and rule.get('loop') and (rule.get('loop') & 1)
+                            and loop_guard < K.SIEVE_LOOP_MAX_HOPS
+                            and time.monotonic() < deadline):
+                        candidate = res_urls[0]
+                        cand_match = self.pattern_manager.get_link_rule(candidate)
+                        if cand_match is not None and candidate not in seen_fetch_urls:
+                            cand_rule, cand_m = cand_match
+                            cand_transformed = self.pattern_manager.apply_link_url_transform(
+                                cand_rule, cand_m, page_url)
+                            cand_fetch = cand_transformed[0] if cand_transformed else candidate
+                            if cand_fetch not in seen_fetch_urls:
+                                # Re-resolve: promote candidate to the next hop.
+                                next_link = candidate
+                                seen_fetch_urls.add(cand_fetch)
+                                rule = cand_rule
+                                match = cand_m
+                                link_groups = [cand_m.group(0)]
+                                link_groups += [cand_m.group(i) for i in range(1, cand_m.re.groups + 1)]
+                                link_url = candidate
+                                transformed = cand_transformed
+                                if transformed:
+                                    fetch_url, post_data = transformed
+                                else:
+                                    fetch_url, post_data = candidate, None
+                                loop_guard += 1
+
+                    if next_link is None:
+                        # Chain ended — everything found on this hop is media.
+                        for u in res_urls:
+                            discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
+                            if thumb:
+                                resolved_thumbnails.add(thumb)
+                        break
             except Exception as e:
                 logger.debug(f"Fullsize discovery failed for {link_url}: {e}")
                 # CORE-20: the linked page was NOT resolved — release it back
@@ -637,7 +696,9 @@ class ParserManager(QObject):
                 # consumed.add() happens before the fetch; without the discard,
                 # a transient network error excluded the viewer page from the
                 # crawl and its remaining content was lost.
-                consumed.discard(link_url)
+                # BUG-5: release the ORIGINAL link (link_url mutates across
+                # loop hops) so a mid-chain failure never loses the source.
+                consumed.discard(original_link_url)
 
         async def limited(link_url, ctx):
             async with sem:

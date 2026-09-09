@@ -43,6 +43,95 @@ from src.app_paths import queue_path
 logger = logging.getLogger(__name__)
 
 
+def build_extension_task_settings(base_settings, user_agent="", cookies=""):
+    """A-2: one-shot settings for an extension task.
+
+    get_settings() returns the dialog's LIVE dict; injecting one-shot extension
+    UA/cookies directly into it leaked the values into every subsequent task
+    and into settings.json on next save. Returns an independent copy with the
+    overrides applied — the original dict is never mutated.
+    """
+    settings = dict(base_settings)
+    if user_agent:
+        settings["user_agent"] = user_agent
+    if cookies:
+        settings["extension_cookies"] = cookies
+    return settings
+
+
+def build_extension_task_payload(urls, settings, download_dir, one_shot=False, timestamp=None):
+    """A-5: pure payload computation for extension task creation.
+
+    Runs on the HTTP server thread; performs NO filesystem or queue mutations
+    (TaskQueueManager is GUI-thread-only by contract). The returned dict is
+    materialized by MainWindow._apply_extension_task_payload on the GUI thread.
+    Returns None when nothing valid was requested.
+    """
+    if not urls:
+        return None
+    if one_shot:
+        # EXT-4: the popup sends the page as `referer` (scan results use
+        # `source` for ORIGIN — two meanings on one key).
+        source_page = (urls[0].get("referer") or urls[0].get("source") or "")
+        ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            domain = source_page.split("/")[2].replace(".", "_") if source_page else "extension"
+        except IndexError:
+            domain = "extension"
+        task_folder = f"{domain}_{ts}"
+        download_path = os.path.join(download_dir, task_folder)
+        items = []
+        for item in urls:
+            url = item.get("url", "").strip()
+            if not url or not url.startswith(("http://", "https://", "//")):
+                continue
+            if url.startswith("//"):
+                url = "https:" + url
+            url = normalize_url(url)
+            # GUI-9: the old ternary had "image" on both branches — dead conditional
+            media_type = item.get("type", "image")
+            basename = os.path.basename(url.split("?")[0])
+            if not basename or "." not in basename:
+                basename = f"media_{len(items)}.jpg"
+            items.append({
+                "url": url,
+                "source_url": source_page,
+                "media_type": media_type,
+                "original_url": item.get("original_url"),
+                "transformed": item.get("transformed", False),
+                "attrs": {},
+                "filepath": os.path.join(download_path, basename),
+            })
+        if not items:
+            return None
+        return {
+            "one_shot": True,
+            "task_url": source_page or urls[0]["url"],
+            "settings": settings,
+            "download_path": download_path,
+            "task_folder": task_folder,
+            "items": items,
+            "added": len(items),
+        }
+    tasks = []
+    # One timestamp for the whole batch (BUG-2 note): same-second folder names
+    # per domain are intentional — legacy behavior kept, per-item timestamps
+    # only differed when requests crossed a second boundary mid-batch.
+    ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    for item in urls:
+        url = item.get("url", "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        try:
+            domain = url.split("/")[2].replace(".", "_")
+        except IndexError:
+            domain = "unknown"
+        tasks.append((url, settings, os.path.join(download_dir, f"{domain}_{ts}")))
+    if not tasks:
+        return None
+    return {"one_shot": False, "tasks": tasks, "added": len(tasks)}
+
+
 class MainWindow(QMainWindow):
     """
     Main window class for the application
@@ -68,6 +157,10 @@ class MainWindow(QMainWindow):
 
         # Task queue
         self.task_queue = TaskQueueManager(self.download_dir)
+
+        # A-5: payloads computed on the HTTP thread, materialized on the GUI
+        # thread (see _updateUiFromExtension).
+        self._pending_extension_payloads = []
 
         # Periodic timer to update active task stats during download
         self._stats_timer = QTimer(self)
@@ -590,6 +683,10 @@ class MainWindow(QMainWindow):
         if self.task_queue.active_task:
             self.stop_parsing()
 
+        # A-5 follow-up: drop any unmaterialized extension payloads — the user
+        # just asked to clear everything.
+        self._pending_extension_payloads = []
+
         # Clear task queue
         count = len(self.task_queue.queue)
         self.task_queue._queue.clear()
@@ -607,17 +704,13 @@ class MainWindow(QMainWindow):
         except OSError as e:
             self.log_handler.error(f"Error deleting task_queue.json: {e}")
 
-        # Delete all session files
-        sessions_dir = os.path.join(self.download_dir, "sessions")
-        deleted = 0
-        if os.path.isdir(sessions_dir):
-            import shutil
-            try:
-                shutil.rmtree(sessions_dir)
-                deleted = 1
-                self.log_handler.info("Deleted all session files")
-            except OSError as e:
-                self.log_handler.error(f"Error deleting sessions: {e}")
+        # Delete all session files — A-4: per-task layout is
+        # {download_dir}/{task_folder}/sessions/{task_id}/, so walk task
+        # folders (the old code removed a nonexistent top-level dir).
+        from src.app_paths import clear_task_sessions
+        deleted = clear_task_sessions(self.download_dir)
+        if deleted:
+            self.log_handler.info(f"Deleted {deleted} task session dir(s)")
 
         self.status_bar.showMessage(f"History cleared ({count} tasks, {deleted} session dirs)")
         self.log_handler.info("Download history cleared")
@@ -1033,10 +1126,12 @@ class MainWindow(QMainWindow):
         """
         self.log_handler.info("Parsing finished")
         self.status_bar.showMessage("Parsing finished")
-        # Cleanup
+        # Cleanup — A-7: bounded wait; an unbounded wait on the GUI thread
+        # freezes the window if the QThread is stuck in a blocking call.
         if self.parser_thread and self.parser_thread.isRunning():
             self.parser_thread.quit()
-            self.parser_thread.wait()
+            if not self.parser_thread.wait(10000):
+                self.log_handler.warning("Parser thread did not stop within 10s")
         self.update_ui_state(False)
         # Log stats
         if self.parser_manager:
@@ -1077,10 +1172,11 @@ class MainWindow(QMainWindow):
                     active.mark_failed("Critical error during parsing")
                 self._update_task_row(active.id)
 
-        # Cleanup thread
+        # Cleanup thread — A-7: bounded wait (see on_parsing_finished).
         if self.parser_thread and self.parser_thread.isRunning():
             self.parser_thread.quit()
-            self.parser_thread.wait()
+            if not self.parser_thread.wait(10000):
+                self.log_handler.warning("Parser thread did not stop within 10s")
         self.task_queue.clear_active()
         self.update_ui_state(False)
         self._update_start_button_state()
@@ -1103,81 +1199,24 @@ class MainWindow(QMainWindow):
             """Callback: add tasks from extension to queue. Runs in HTTP thread."""
             added = 0
             auto_start_id = ""  # one-shot task to auto-start on the GUI thread (GUI-1)
-            settings = self.settings_dialog.get_settings()
+            # A-2: build an independent copy — the dialog's live settings dict
+            # must never be mutated from the HTTP thread.
+            settings = build_extension_task_settings(
+                self.settings_dialog.get_settings(), user_agent, cookies
+            )
 
-            # Override settings with browser context from extension
-            if user_agent:
-                settings["user_agent"] = user_agent
-            if cookies:
-                settings["extension_cookies"] = cookies
+            # A-5: compute the payload without touching the queue or the
+            # filesystem (TaskQueueManager is GUI-thread-only by contract);
+            # materialization happens in _apply_extension_task_payload.
+            payload = build_extension_task_payload(
+                urls, settings, self.download_dir, one_shot=one_shot)
+            if payload is not None:
+                self._pending_extension_payloads.append(payload)
+                added = payload["added"]
 
-            if one_shot and urls:
-                # EXT-4: the popup now sends the page as `referer` (the scan
-                # results use `source` for ORIGIN — two meanings on one key).
-                # Keep `source` as a fallback for older extension builds.
-                source_page = (urls[0].get("referer") or urls[0].get("source") or "") if urls else ""
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                try:
-                    domain = source_page.split("/")[2].replace(".", "_") if source_page else "extension"
-                except IndexError:
-                    domain = "extension"
-                task_folder = f"{domain}_{timestamp}"
-                download_path = os.path.join(self.download_dir, task_folder)
-                os.makedirs(download_path, exist_ok=True)
-
-                task = self.task_queue.add_task(source_page or urls[0]["url"], settings, download_path, one_shot=True)
-
-                items = []
-                for item in urls:
-                    url = item.get("url", "").strip()
-                    if not url or not url.startswith(("http://", "https://", "//")):
-                        continue
-                    if url.startswith("//"):
-                        url = "https:" + url
-                    url = normalize_url(url)
-                    # GUI-9: the old ternary had "image" on both branches — dead conditional
-                    media_type = item.get("type", "image")
-                    basename = os.path.basename(url.split("?")[0])
-                    if not basename or "." not in basename:
-                        basename = f"media_{len(items)}.jpg"
-                    items.append({
-                        "url": url,
-                        "source_url": source_page,
-                        "media_type": media_type,
-                        "original_url": item.get("original_url"),
-                        "transformed": item.get("transformed", False),
-                        "attrs": {},
-                        "filepath": os.path.join(download_path, basename),
-                    })
-
-                task._pending_downloads = items
-                added = len(items)
-                self.log_handler.info(f"One-shot: {added} items -> {task_folder}")
-
-                # Auto-start one_shot task if no active task — executed on the
-                # GUI thread via extension_tasks_added (GUI-1).
-                if self.task_queue.active_task is None:
-                    auto_start_id = task.id
-            else:
-                for item in urls:
-                    url = item.get("url", "").strip()
-                    if not url or not url.startswith(("http://", "https://")):
-                        continue
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    try:
-                        domain = url.split("/")[2].replace(".", "_")
-                    except IndexError:
-                        domain = "unknown"
-                    task_folder = f"{domain}_{timestamp}"
-                    download_path = os.path.join(self.download_dir, task_folder)
-                    os.makedirs(download_path, exist_ok=True)
-                    self.task_queue.add_task(url, settings, download_path)
-                    added += 1
-
-            # GUI-1: run the UI work on the GUI thread via a signal. The aiohttp
-            # worker thread has no Qt event loop, so QTimer.singleShot created
-            # there never fired reliably (stale table, one-shot tasks never
-            # auto-started).
+            # GUI-1/A-5: hand the payload to the GUI thread via a signal. The
+            # aiohttp worker thread has no Qt event loop and must not mutate
+            # TaskQueueManager directly.
             self.extension_tasks_added.emit(auto_start_id)
             return {"added": added}
 
@@ -1214,6 +1253,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event — save queue and active task state."""
+        # A-5 follow-up: materialize any extension payloads still buffered on
+        # the HTTP thread BEFORE saving the queue — otherwise tasks requested
+        # seconds before shutdown are silently lost.
+        try:
+            payloads, self._pending_extension_payloads = (
+                self._pending_extension_payloads, [])
+            for payload in payloads:
+                self._apply_extension_task_payload(payload)
+        except Exception as e:
+            self.log_handler.error(f"Error materializing extension payloads on close: {e}")
+
         # Always save the queue state (canonical path next to the exe)
         try:
             self.task_queue.save(queue_path())
@@ -1277,9 +1327,17 @@ class MainWindow(QMainWindow):
             )
 
     def _updateUiFromExtension(self, task_id=""):
-        """Slot (GUI thread): auto-start an extension one-shot task if the queue
-        is idle, then refresh the task table (GUI-1 — connected to
-        extension_tasks_added, emitted from the HTTP server thread)."""
+        """Slot (GUI thread): materialize buffered extension payloads (add_task
+        + download-dir creation — A-5: queue mutations are GUI-thread-only),
+        auto-start an extension one-shot task if the queue is idle, then
+        refresh the task table (GUI-1 — connected to extension_tasks_added,
+        emitted from the HTTP server thread)."""
+        payloads, self._pending_extension_payloads = (
+            self._pending_extension_payloads, [])
+        for payload in payloads:
+            applied_task_id = self._apply_extension_task_payload(payload)
+            if payload.get("one_shot") and not task_id:
+                task_id = applied_task_id or ""
         if task_id and self.task_queue.active_task is None:
             task = self.task_queue.find_task(task_id)
             if task is not None:
@@ -1290,6 +1348,24 @@ class MainWindow(QMainWindow):
         if self.task_queue.queue:
             self.task_table.selectRow(0)
             self._update_start_button_state()
+
+    def _apply_extension_task_payload(self, payload):
+        """GUI thread (A-5): materialize one buffered extension payload —
+        create the download dir, add the task, attach pending downloads.
+        Returns the new task id (one-shot) or None."""
+        if payload.get("one_shot"):
+            os.makedirs(payload["download_path"], exist_ok=True)
+            task = self.task_queue.add_task(
+                payload["task_url"], payload["settings"],
+                payload["download_path"], one_shot=True)
+            task._pending_downloads = payload["items"]
+            self.log_handler.info(
+                f"One-shot: {payload['added']} items -> {payload['task_folder']}")
+            return task.id
+        for url, settings, download_path in payload["tasks"]:
+            os.makedirs(download_path, exist_ok=True)
+            self.task_queue.add_task(url, settings, download_path)
+        return None
 
     def clear_log(self):
         """

@@ -27,6 +27,81 @@ from src.parser.webpage_parser import WebpageParser
 from helpers import _DummySession
 
 
+# --- A-3: Referer from crawl context ----------------------------------------
+
+
+class _FakeAiohttpResponse:
+    """Async context manager standing in for aiohttp ClientResponse."""
+
+    def __init__(self, status=200, headers=None):
+        self.status = status
+        self.headers = headers or {"Content-Type": "text/html"}
+
+    async def read(self):
+        return b"<html><body>ok</body></html>"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _CapturingSession(_DummySession):
+    """_DummySession + get() capturing request kwargs like a real aiohttp session."""
+
+    def __init__(self):
+        super().__init__()
+        self.captured = {}
+
+    def get(self, url, **kwargs):
+        self.captured["url"] = url
+        self.captured.update(kwargs)
+        return _FakeAiohttpResponse()
+
+
+def _make_referer_parser(context):
+    return WebpageParser(
+        url="https://example.com/page2",
+        settings={},
+        process_js=False,
+        external_session=_CapturingSession(),
+        context=context,
+    )
+
+
+def test_referer_from_context_source_url():
+    """A-3: policy 'auto' must send Referer from context['source_url'].
+    Before the fix the code only read settings['_source_url'], which nothing
+    ever wrote — the Referer branch was dead code.
+    """
+    parser = _make_referer_parser({"source_url": "https://example.com/page1"})
+    # js_redirect_count guard: Referer only on the first fetch
+    assert parser.js_redirect_count == 0
+    content, err, msg, status = asyncio.run(parser._get_content())
+    assert content is not None
+    assert err is None
+    captured = parser.session.captured
+    assert captured["headers"]["Referer"] == "https://example.com/page1"
+
+
+def test_referer_not_sent_for_self_source():
+    """A-3: when source page == fetched URL, no Referer (existing policy)."""
+    parser = _make_referer_parser({"source_url": "https://example.com/page2"})
+    asyncio.run(parser._get_content())
+    captured = parser.session.captured
+    assert "Referer" not in captured.get("headers", {})
+
+
+def test_referer_suppressed_with_policy_none():
+    """A-3: policy 'none' must suppress Referer even with context present."""
+    parser = _make_referer_parser({"source_url": "https://example.com/page1"})
+    parser.settings["referrer"] = "none"  # K.SETTING_REFERRER_POLICY == "referrer"
+    asyncio.run(parser._get_content())
+    captured = parser.session.captured
+    assert "Referer" not in captured.get("headers", {})
+
+
 def _make_parser(html, context=None, pattern_manager=None):
     parser = WebpageParser(
         url="https://example.com/threads/123-test",

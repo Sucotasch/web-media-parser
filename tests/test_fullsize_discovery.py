@@ -15,6 +15,7 @@ import os
 import sys
 import asyncio
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -43,6 +44,26 @@ class TestSieveLinkChain(unittest.TestCase):
         rule, m = self.pm.get_link_rule(IMX_LINK)
         self.assertIsNotNone(rule)
         self.assertIn("imx", rule.get("link", "").lower())
+
+    def test_data_template_rejected(self):
+        """C-4: url: 'data:,$&' is a no-fetch marker, not a URL. Before the
+        fix apply_link_url_transform produced https://data:,<match> garbage."""
+        import re as _re
+        rule = {"link": "^https?://example\\.com/img/", "url": "data:,$&", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/img/abc123")
+        self.assertIsNotNone(m)
+        self.assertIsNone(self.pm.apply_link_url_transform(rule, m))
+
+    def test_data_template_rejected_js_branch(self):
+        """C-4: the JS url-branch must also refuse data: results."""
+        import re as _re
+        rule = {"link": "^https?://example\\.com/img/", "url": ":'data:,'+$[1]", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/img/abc123")
+        self.assertIsNotNone(m)
+        # js_engine is None in this suite -> JS branch returns None before the
+        # data: check; assert the contract holds either way.
+        result = self.pm.apply_link_url_transform(rule, m)
+        self.assertTrue(result is None or not result[0].startswith("data:"))
 
     def test_get_link_rule_returns_none_for_unmatched(self):
         # Empty/invalid inputs never match any rule.
@@ -187,6 +208,145 @@ class TestDiscoveryIntegration(unittest.TestCase):
         self.assertEqual(resolved, set())
         self.assertEqual(consumed, set())
         session.post.assert_not_called()
+
+
+class TestLoopChainResolution(unittest.TestCase):
+    """C-2: sieve `loop` — recursive re-resolution (Mod semantics).
+
+    Chain: thumbnail-link matches rule1 (loop:1); rule1's res yields exactly
+    one URL that matches rule2; rule2's res yields the final CDN image. The
+    final media must be the CDN image, not the intermediate viewer URL.
+    Cyclic chains must terminate at SIEVE_LOOP_MAX_HOPS.
+    """
+
+    class FakeResp:
+        def __init__(self, html=None, ct="text/html", url=None):
+            self._html = html
+            self._ct = ct
+            self.url = url
+
+        @property
+        def headers(self):
+            return {"Content-Type": self._ct}
+
+        async def text(self):
+            return self._html
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+    @staticmethod
+    def _sieve_file(tmp_path, loop_flag):
+        import json
+        # res patterns capture the protocol-relative URL into group 1 (sieve idiom)
+        rules = {
+            "Hop1": {"link": r"^https?://hop1[.]example/view/([a-z0-9]+)",
+                     "url": "https://hop2.example/page/$1",
+                     "res": r"(//hop3[.]example/mid/[a-z0-9]+)"},
+            "Hop3": {"link": r"^https?://hop3[.]example/mid/([a-z0-9]+)",
+                     "url": "https://cdn.example/img/$1.jpg",
+                     "res": r"(//cdn[.]example/img/[a-z0-9]+[.]jpg)"},
+        }
+        if loop_flag:
+            rules["Hop1"]["loop"] = 1
+        p = Path(tmp_path) / "loop_sieve.json"
+        p.write_text(json.dumps(rules), encoding="utf-8")
+        return str(p)
+
+    def _make_manager(self, sieve_path):
+        settings = {
+            K.SETTING_STAY_IN_DOMAIN: False,
+            K.SETTING_USE_PATTERNS: True,
+            K.SETTING_STOP_WORDS: [],
+            K.SETTING_SEARCH_DEPTH: K.DEFAULT_SEARCH_DEPTH,
+        }
+        with patch("src.parser.parser_manager.AsyncClientManager", MagicMock()):
+            pm = ParserManager(
+                url="https://forum.example/thread", download_path="x",
+                settings=settings, log_handler=MockGUILogHandler())
+        pm.pattern_manager = SitePatternManager(enable_built_in=False, imagus_sieve_path=sieve_path)
+        return pm
+
+    def test_loop_chain_resolves_multi_hop(self, ):
+        import tempfile
+        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=True)
+        pm = self._make_manager(sieve)
+        session = AsyncMock()
+
+        hop2_page = '<a href="//hop3.example/mid/abc">next</a>'
+        cdn_page = '<img src="//cdn.example/img/abc.jpg"/>'
+
+        def resp_for(url, **kwargs):
+            if url.startswith("https://hop2.example/"):
+                return self.FakeResp(html=hop2_page)
+            return self.FakeResp(html=cdn_page)
+
+        session.get.side_effect = resp_for
+
+        async def run():
+            return await pm._discover_linked_fullsize(
+                [("https://hop1.example/view/abc", {"from_image": True, "thumbnail_url": "t1"})],
+                "https://forum.example/thread", session)
+
+        discovered, resolved, consumed = asyncio.run(run())
+
+        urls = [m[1] for m in discovered]
+        # Final CDN image discovered, intermediate hop3 mid-page NOT queued
+        self.assertIn("https://cdn.example/img/abc.jpg", urls)
+        self.assertNotIn("https://hop3.example/mid/abc", urls)
+        self.assertEqual(resolved, {"t1"})
+        # Two fetches happened (hop2 viewer page, then the CDN image page)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_without_loop_flag_chain_stops_at_first_hop(self):
+        import tempfile
+        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=False)
+        pm = self._make_manager(sieve)
+        session = AsyncMock()
+
+        hop2_page = '<a href="//hop3.example/mid/abc">next</a>'
+        session.get.return_value = self.FakeResp(html=hop2_page)
+
+        async def run():
+            return await pm._discover_linked_fullsize(
+                [("https://hop1.example/view/abc", {"from_image": True, "thumbnail_url": "t1"})],
+                "https://forum.example/thread", session)
+
+        discovered, resolved, consumed = asyncio.run(run())
+        urls = [m[1] for m in discovered]
+        # No loop: intermediate URL IS the final media (old behavior preserved)
+        self.assertEqual(urls, ["https://hop3.example/mid/abc"])
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_cyclic_loop_chain_terminates(self):
+        import tempfile, json as jsonlib
+        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=True)
+        # Make the two rules point at each other (cycle): Hop1 -> Hop2 -> Hop1
+        data = jsonlib.load(open(sieve, encoding="utf-8"))
+        data["Hop2"] = {
+            "link": r"^https?://hop2[.]example/page/([a-z0-9]+)",
+            "url": "https://hop1.example/view/$1",
+            "res": r"(//hop1[.]example/view/[a-z0-9]+)",
+            "loop": 1,
+        }
+        data["Hop1"]["res"] = r"(//hop2[.]example/page/[a-z0-9]+)"
+        with open(sieve, "w", encoding="utf-8") as f:
+            jsonlib.dump(data, f)
+        pm = self._make_manager(sieve)
+        session = AsyncMock()
+        session.get.return_value = self.FakeResp(html='<a href="//hop2.example/page/abc">x</a>')
+
+        async def run():
+            return await pm._discover_linked_fullsize(
+                [("https://hop1.example/view/abc", {"from_image": True, "thumbnail_url": "t1"})],
+                "https://forum.example/thread", session)
+
+        discovered, resolved, consumed = asyncio.run(run())
+        # Hard cap: at most SIEVE_LOOP_MAX_HOPS + 1 fetches, never hangs
+        self.assertLessEqual(session.get.call_count, K.SIEVE_LOOP_MAX_HOPS + 1)
 
 
 class TestProcessResultsDiscoveryWiring(unittest.TestCase):

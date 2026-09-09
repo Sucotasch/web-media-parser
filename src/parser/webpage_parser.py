@@ -126,7 +126,10 @@ class WebpageParser:
                 referrer_policy = self.settings.get(K.SETTING_REFERRER_POLICY, "auto")
                 
                 if referrer_policy != "none" and self.js_redirect_count == 0:
-                    source_url = self.settings.get("_source_url")
+                    # A-3: `_source_url` was never written anywhere — read the
+                    # crawl context's source_url too, else Referer for policy
+                    # 'auto' stayed dead code and photo hosts 403'd.
+                    source_url = self.settings.get("_source_url") or (self.context or {}).get("source_url")
                     if source_url and source_url != self.url:
                         request_specific_headers["Referer"] = source_url
                     elif referrer_policy == "origin":
@@ -290,7 +293,7 @@ class WebpageParser:
                     session = self._get_sync_session()
                     # Aggressive timeout for sync to prevent blocking thread pool
                     fb_timeout = 10 
-                    resp = session.get(self.url, headers=fb_headers, timeout=fb_timeout, allow_redirects=True, verify=False)
+                    resp = session.get(self.url, headers=fb_headers, timeout=fb_timeout, allow_redirects=True, verify=http_engine.tls_verify(self.settings))
                     return resp
 
                 resp = await loop.run_in_executor(None, _sync_fetch)
@@ -357,7 +360,9 @@ class WebpageParser:
         try:
             loop = asyncio.get_running_loop()
             headers = {}
-            source_url = self.settings.get("_source_url")
+            # A-3: same fallback as _get_content — context is the only real
+            # source of the source page URL.
+            source_url = self.settings.get("_source_url") or (self.context or {}).get("source_url")
             if source_url and source_url != self.url:
                 headers["Referer"] = source_url
 
@@ -365,7 +370,7 @@ class WebpageParser:
                 # Aggressive timeout: escalation is a bonus, never a hang.
                 resp = session.get(
                     self.url, headers=headers, timeout=10,
-                    allow_redirects=True, verify=False,
+                    allow_redirects=True, verify=http_engine.tls_verify(self.settings),
                 )
                 return resp
 
@@ -507,9 +512,9 @@ class WebpageParser:
             def _sync_bypass():
                 session = self._get_sync_session()
                 if method == 'POST':
-                    resp = session.post(target_url, data=data, headers=headers, timeout=10, verify=False, allow_redirects=True)
+                    resp = session.post(target_url, data=data, headers=headers, timeout=10, verify=http_engine.tls_verify(self.settings), allow_redirects=True)
                 else:
-                    resp = session.get(target_url, headers=headers, timeout=10, verify=False, allow_redirects=True)
+                    resp = session.get(target_url, headers=headers, timeout=10, verify=http_engine.tls_verify(self.settings), allow_redirects=True)
                 return resp.status_code < 400
             
             return await loop.run_in_executor(None, _sync_bypass)

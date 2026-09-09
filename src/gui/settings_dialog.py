@@ -482,7 +482,45 @@ class SettingsDialog(QDialog):
         )
         http_grid.addWidget(self.http_escalate_check, 7, 1)
 
+        # A-6: TLS verification toggle for sync fallback paths (default off =
+        # historical behavior; enables protection against MITM on download).
+        http_grid.addWidget(QLabel("Verify TLS:"), 8, 0)
+        self.verify_tls_check = QCheckBox()
+        self.verify_tls_check.setChecked(K.DEFAULT_VERIFY_TLS)
+        self.verify_tls_check.setToolTip(
+            "Verify TLS certificates on fallback/escalation requests. Leave off "
+            "if you use an intercepting proxy with a self-signed certificate; "
+            "turn on to protect downloads against man-in-the-middle tampering."
+        )
+        http_grid.addWidget(self.verify_tls_check, 8, 1)
+
         http_layout.addWidget(http_group)
+
+        # C-1: sieve repository download (explicit user action — sieve rules
+        # contain executable JS, so no auto-update in the desktop app).
+        sieve_group = QGroupBox("Imagus Sieve Update")
+        sieve_grid = QGridLayout(sieve_group)
+
+        sieve_grid.addWidget(QLabel("Sieve repository URL:"), 0, 0)
+        self.sieve_repo_edit = QLineEdit()
+        self.sieve_repo_edit.setPlaceholderText(
+            "https://raw.githubusercontent.com/kuzn123/Imagus-Sieve-RuBoard/master/update.txt")
+        self.sieve_repo_edit.setToolTip(
+            "URL of the Imagus sieve JSON to download. Only use trusted sources "
+            "(official Imagus repositories) — sieve rules may contain executable "
+            "code. raw.githubusercontent.com URLs automatically fall back to the "
+            "jsDelivr CDN mirror when GitHub rate-limits."
+        )
+        sieve_grid.addWidget(self.sieve_repo_edit, 0, 1)
+
+        self.sieve_download_btn = QPushButton("Download latest")
+        self.sieve_download_btn.clicked.connect(self._on_sieve_download)
+        sieve_grid.addWidget(self.sieve_download_btn, 1, 0)
+
+        self.sieve_status_label = QLabel("")
+        sieve_grid.addWidget(self.sieve_status_label, 1, 1)
+
+        http_layout.addWidget(sieve_group)
 
         # Logging tab
         logging_tab = QWidget()
@@ -537,6 +575,40 @@ class SettingsDialog(QDialog):
             self.speed_value_label.setText("0 (unlimited)")
         else:
             self.speed_value_label.setText(f"{value}")
+
+    def _on_sieve_download(self):
+        """C-1: download the sieve from the repository URL (explicit user click)
+        and apply it to the configured sieve file. Runs synchronously on the
+        GUI thread with a bounded timeout — the download is small (~1-2 MB).
+        """
+        from src.parser.site_pattern_manager import SitePatternManager
+
+        url = self.sieve_repo_edit.text().strip()
+        if not url:
+            self.sieve_status_label.setText("Enter a repository URL first.")
+            return
+        sieve_path = self.settings.get(K.SETTING_IMAGUS_SIEVE_PATH, "") or None
+        if not sieve_path:
+            self.sieve_status_label.setText(
+                "Configure a sieve file path first (Patterns tab).")
+            return
+
+        self.sieve_download_btn.setEnabled(False)
+        self.sieve_status_label.setText("Downloading…")
+        try:
+            pm = SitePatternManager(
+                enable_built_in=False, imagus_sieve_path=sieve_path)
+            ok, msg = pm.download_imagus_from_url(url)
+            if not ok and url.startswith("https://raw.githubusercontent.com/"):
+                mirror = pm.jsdelivr_mirror(url)
+                if mirror:
+                    self.sieve_status_label.setText("Primary failed — trying jsDelivr mirror…")
+                    ok, msg = pm.download_imagus_from_url(mirror)
+            self.sieve_status_label.setText(msg)
+        except Exception as e:
+            self.sieve_status_label.setText(f"Error: {e}")
+        finally:
+            self.sieve_download_btn.setEnabled(True)
 
     def browse_log_file(self):
         """Open file dialog to select log file path."""
@@ -721,6 +793,9 @@ class SettingsDialog(QDialog):
         self.http_escalate_check.setChecked(
             self.settings.get(K.SETTING_HTTP_ESCALATE, K.DEFAULT_HTTP_ESCALATE)
         )
+        self.verify_tls_check.setChecked(
+            self.settings.get(K.SETTING_VERIFY_TLS, K.DEFAULT_VERIFY_TLS)
+        )
 
         # Logging
         self.log_to_file_check.setChecked(self.settings.get("log_to_file", False))
@@ -803,6 +878,7 @@ class SettingsDialog(QDialog):
         settings[K.SETTING_PROXY] = self.proxy_edit.text().strip()
         settings[K.SETTING_HTTP_ENGINE] = self.http_engine_combo.currentData() or "aiohttp"
         settings[K.SETTING_HTTP_ESCALATE] = self.http_escalate_check.isChecked()
+        settings[K.SETTING_VERIFY_TLS] = self.verify_tls_check.isChecked()
         # GUI-6: no impersonation UI — preserve the loaded value (fail-open at
         # session creation if the profile is unavailable).
         settings[K.SETTING_HTTP_IMPERSONATE] = self.settings.get(

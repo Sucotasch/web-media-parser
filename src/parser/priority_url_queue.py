@@ -72,7 +72,7 @@ class PriorityURLQueue:
         """Extract domain from URL"""
         try:
             return urlparse(url).netloc
-        except:
+        except (ValueError, TypeError):
             return ""
             
     def _is_downward_url(self, url: str, source_url: str, context: dict = None) -> bool:

@@ -508,3 +508,19 @@ document.getElementById("sieve-file").addEventListener("change", async (e) => {
   }
   e.target.value = "";
 });
+
+// C-1: online sieve update — runs in the service worker (which can fetch
+// cross-origin), then the popup just reflects the result.
+document.getElementById("sieve-update-btn").addEventListener("click", async () => {
+  const infoEl = document.getElementById("sieve-info");
+  const btn = document.getElementById("sieve-update-btn");
+  btn.textContent = "Updating…";
+  try {
+    const resp = await chrome.runtime.sendMessage({ action: "updateSieve" });
+    infoEl.textContent = resp && resp.message ? resp.message : "Update failed";
+  } catch (e) {
+    infoEl.textContent = `Update error: ${e.message}`;
+  }
+  btn.textContent = "Update sieve now";
+  setTimeout(updateSieveInfo, 1500);
+});

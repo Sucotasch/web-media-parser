@@ -75,3 +75,29 @@ def task_state_path(task_download_path: str, task_id) -> str:
         session_dir = os.path.join(session_dir, task_id)
     os.makedirs(session_dir, exist_ok=True)
     return os.path.join(session_dir, "last_session.pkl")
+
+
+def clear_task_sessions(download_dir: str) -> int:
+    """A-4: remove per-task session dirs created by task_state_path.
+
+    Session pickles live at `{download_dir}/{task_folder}/sessions/{task_id}/`.
+    The old Clear-History code removed `{download_dir}/sessions`, which never
+    exists — a silent no-op. Walks task folders one level down and deletes
+    only their `sessions` subdirs. Returns the number of session dirs removed.
+    Never raises on missing/unreadable paths.
+    """
+    deleted = 0
+    try:
+        entries = os.listdir(download_dir)
+    except OSError:
+        return 0
+    for entry in entries:
+        sessions_dir = os.path.join(download_dir, entry, "sessions")
+        if os.path.isdir(sessions_dir):
+            import shutil
+            try:
+                shutil.rmtree(sessions_dir)
+                deleted += 1
+            except OSError:
+                pass
+    return deleted

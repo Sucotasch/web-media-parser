@@ -222,9 +222,14 @@ class MediaDownloader:
         try:
             # curl_cffi carries the browser UA/headers from its profile; only
             # per-request media headers (Accept, Referer) are merged on top.
+            # A-6 (revised): this path historically did NOT pass verify →
+            # curl_cffi defaulted to verify=True. legacy_default=False keeps
+            # verification ON unless the user explicitly disables it — a
+            # verify=False default here would silently weaken TLS.
             resp = session.get(
                 self.url, headers=headers, timeout=timeout,
                 stream=True, allow_redirects=True,
+                verify=http_engine.tls_verify(self.settings, legacy_default=False),
             )
             if resp.status_code >= 400:
                 resp.close()
@@ -669,7 +674,10 @@ class MediaDownloader:
                                     time.sleep(sleep_needed)
                             if len(write_buffer_chunk) >= K.WRITE_BUFFER_SIZE:
                                 f.write(write_buffer_chunk); write_buffer_chunk.clear()
-                if write_buffer_chunk: f.write(write_buffer_chunk) 
+                    # A-1: flush the residual buffer INSIDE the with-block —
+                    # writing it after the file was closed raised ValueError
+                    # and silently failed every MT download to single-thread.
+                    if write_buffer_chunk: f.write(write_buffer_chunk)
             finally:
                 # DL-12: always release the connection, including on errors —
                 # otherwise it hangs in the pool until GC.

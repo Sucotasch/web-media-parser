@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from src.parser.parser_manager import ParserManager
 from src.parser.priority_url_queue import PriorityURLQueue
+from src.gui.main_window import build_extension_task_settings, build_extension_task_payload
 from src import constants as K
 
 from helpers import MockGUILogHandler
@@ -136,9 +137,73 @@ class TestScheduleOnLoop(unittest.TestCase):
         fake_loop = MagicMock()
         fake_loop.is_closed.return_value = False
         pm.loop = fake_loop
-        cb = lambda: None
+
+        def cb():
+            pass
+
         pm._schedule_on_loop(cb)
         fake_loop.call_soon_threadsafe.assert_called_once_with(cb)
+
+
+class TestExtensionSettingsIsolation(unittest.TestCase):
+    """A-2: extension one-shot overrides must never touch the global settings dict."""
+
+    def test_extension_add_does_not_mutate_global_settings(self):
+        base = {"user_agent": "GUI-UA", "page_limit": 1000}
+        result = build_extension_task_settings(
+            base, user_agent="EXT-UA", cookies="session=abc"
+        )
+        # Overrides applied to the copy...
+        self.assertEqual(result["user_agent"], "EXT-UA")
+        self.assertEqual(result["extension_cookies"], "session=abc")
+        self.assertEqual(result["page_limit"], 1000)
+        # ...and the original is untouched.
+        self.assertEqual(base["user_agent"], "GUI-UA")
+        self.assertNotIn("extension_cookies", base)
+
+    def test_extension_add_without_overrides_keeps_base_values(self):
+        base = {"user_agent": "GUI-UA"}
+        result = build_extension_task_settings(base)
+        self.assertEqual(result["user_agent"], "GUI-UA")
+        self.assertNotIn("extension_cookies", result)
+        self.assertIsNot(result, base)
+
+
+class TestExtensionPayloadBuffering(unittest.TestCase):
+    """A-5: payload computation is pure — no FS/queue side effects — so tasks
+    can be materialized on the GUI thread."""
+
+    def test_extension_payload_buffered_one_shot(self):
+        payload = build_extension_task_payload(
+            [{"url": "https://img.example/a.jpg", "type": "image",
+              "referer": "https://page.example/gallery"}],
+            settings={"user_agent": "UA"},
+            download_dir=os.path.join("dl"),
+            one_shot=True,
+            timestamp="20260101_000000",
+        )
+        self.assertIsNotNone(payload)
+        self.assertTrue(payload["one_shot"])
+        self.assertEqual(payload["added"], 1)
+        self.assertEqual(payload["task_url"], "https://page.example/gallery")
+        self.assertEqual(payload["items"][0]["url"], "https://img.example/a.jpg")
+        # Pure function: no side effects beyond the returned dict
+        self.assertFalse(os.path.exists(payload["download_path"]))
+
+    def test_extension_payload_buffered_multi(self):
+        payload = build_extension_task_payload(
+            [{"url": "https://site1.com/page"}, {"url": "https://site2.com/page"}],
+            settings={}, download_dir="dl", one_shot=False,
+            timestamp="20260101_000000",
+        )
+        self.assertFalse(payload["one_shot"])
+        self.assertEqual(payload["added"], 2)
+        self.assertEqual(len(payload["tasks"]), 2)
+
+    def test_extension_payload_rejects_invalid(self):
+        self.assertIsNone(build_extension_task_payload([], {}, "dl", True))
+        self.assertIsNone(build_extension_task_payload(
+            [{"url": "ftp://bad"}], {}, "dl", True))
 
 
 class TestMainTaskEmitsFailedOnPreCrash(unittest.TestCase):

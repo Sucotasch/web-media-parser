@@ -91,6 +91,7 @@ MAX_URL_LENGTH = 2000        # Max total length of a queued URL
 FULLSIZE_DISCOVER_CONCURRENCY = 5   # Concurrent probes (extension uses 5)
 FULLSIZE_DISCOVER_TIMEOUT = 8       # Seconds per probe (extension uses 8000ms)
 FULLSIZE_DISCOVER_TIME_BUDGET = 45  # Max total probe time per source page
+SIEVE_LOOP_MAX_HOPS = 5             # C-2: max recursive re-resolutions for loop-rules (Mod cap)
 
 # Gateway & Visibility Filtering
 DEFAULT_FILTER_HIDDEN_LINKS = True
@@ -249,6 +250,12 @@ DEFAULT_HTTP_IMPERSONATE = "chrome"
 # installed; 429 is never escalated (rate-limit backoff already exists).
 SETTING_HTTP_ESCALATE = "http_escalate"
 DEFAULT_HTTP_ESCALATE = True
+# A-6: TLS verification for sync fallback paths. Default False preserves the
+# historical behavior (some users run self-signed proxies); the checkbox in
+# Settings → HTTP turns verification on. A one-shot warning is logged when a
+# request goes out unverified (see http_engine.warn_if_unverified).
+SETTING_VERIFY_TLS = "verify_tls"
+DEFAULT_VERIFY_TLS = False
 SETTING_PROCESS_JS = "process_js"
 SETTING_BYPASS_COOKIE_CONSENT = "bypass_cookie_consent"
 SETTING_BYPASS_JS_REDIRECTS = "bypass_js_redirects"
@@ -287,6 +294,7 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_HTTP_ENGINE: DEFAULT_HTTP_ENGINE,
     SETTING_HTTP_IMPERSONATE: DEFAULT_HTTP_IMPERSONATE,
     SETTING_HTTP_ESCALATE: DEFAULT_HTTP_ESCALATE,
+    SETTING_VERIFY_TLS: DEFAULT_VERIFY_TLS,
     SETTING_PROCESS_JS: DEFAULT_PROCESS_JS,
     # SETTING_PROCESS_DYNAMIC: DEFAULT_PROCESS_DYNAMIC, # Removed
     SETTING_BYPASS_COOKIE_CONSENT: DEFAULT_BYPASS_COOKIE_CONSENT,

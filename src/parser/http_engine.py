@@ -71,6 +71,33 @@ def impersonate_profile(settings: Dict[str, Any]) -> str:
     return settings.get(K.SETTING_HTTP_IMPERSONATE, DEFAULT_IMPERSONATE) or DEFAULT_IMPERSONATE
 
 
+_unverified_warned = False
+
+
+def tls_verify(settings: Dict[str, Any], legacy_default: bool = True) -> bool:
+    """A-6: TLS verification flag for sync requests paths.
+
+    legacy_default=True (default): paths that historically sent verify=False
+    keep that default — behavior unchanged unless the user enables the setting.
+    legacy_default=False: paths that historically did NOT pass verify (curl_cffi
+    default is verify=True) keep verification ON unless the user explicitly
+    disabled it — passing verify=False by default there would silently WEAKEN
+    the previous behavior. A one-shot warning logs whenever a request goes out
+    unverified so the risk stays visible.
+    """
+    global _unverified_warned
+    default = K.DEFAULT_VERIFY_TLS if legacy_default else True
+    verify = bool(settings.get(K.SETTING_VERIFY_TLS, default))
+    if not verify and not _unverified_warned:
+        _unverified_warned = True
+        logger.warning(
+            "TLS verification is disabled for sync fallback requests "
+            f"({K.SETTING_VERIFY_TLS}=false). Enable it in Settings → HTTP if "
+            "your network does not require intercepting proxies."
+        )
+    return verify
+
+
 def should_escalate(settings: Dict[str, Any], code) -> bool:
     """True when an HTTP status is an explicit-block signal worth one curl_cffi
     retry: 403 (canonical block) or 5xx (bot-protection often answers 5xx to
@@ -148,7 +175,7 @@ def create_sync_session(settings: Dict[str, Any]):
 # curl_cffi raises its own exception hierarchy (curl_cffi.requests.exceptions.*),
 # which is NOT a subclass of requests.exceptions.* — callers that catch
 # "network errors" must use these tuples instead of bare requests classes.
-import requests as _requests
+import requests as _requests  # noqa: E402 — intentional lazy import (curl_cffi optional)
 
 if CURL_CFFI_AVAILABLE:
     _CURL_REQ_EXC = _curl_requests.exceptions.RequestException

@@ -44,6 +44,89 @@ class SitePatternManager:
         # Load patterns
         self.load_patterns()
     
+    def download_imagus_from_url(self, url, timeout=30):
+        """C-1 (desktop): fetch a sieve from a user-provided URL, validate it,
+        atomically replace the current sieve file and reload.
+
+        Security contract: sieve rules contain executable JS (Deno worker /
+        exec) — downloading must remain an EXPLICIT user action (Settings →
+        "Download latest"), never an auto-update, unlike the sandboxed MV3
+        extension. Port of Mod's updateSieve validation (service.js:74-146):
+        validRuleCount must be > 0 and the file is replaced atomically via
+        os.replace so a failed download never corrupts the working sieve.
+
+        Returns (ok: bool, message: str) — message is user-presentable.
+        """
+        try:
+            # Downloader's battle-tested session factory (retry total=0 so a
+            # hung mirror cannot stall the GUI; UA/proxy from defaults).
+            from src.downloader.media_downloader import create_shared_downloader_session
+            session = create_shared_downloader_session({})
+        except Exception as e:
+            return False, f"Could not create HTTP session: {e}"
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code >= 400:
+                return False, f"HTTP {resp.status_code} from {url}"
+            raw = resp.content
+        except Exception as e:
+            return False, f"Download failed: {e}"
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+        try:
+            new_sieve = json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError) as e:
+            return False, f"Invalid JSON: {e}"
+        if not isinstance(new_sieve, dict):
+            return False, "Invalid sieve format: must be a JSON object"
+        # Mod's validRuleCount: a rule is usable when it has link or img
+        valid_rule_count = sum(
+            1 for v in new_sieve.values()
+            if isinstance(v, dict) and (v.get('link') or v.get('img'))
+        )
+        if valid_rule_count == 0:
+            return False, "Sieve contains no valid rules (need link or img fields)"
+
+        if not self.imagus_sieve_path:
+            return False, "No sieve file configured to replace"
+        tmp_path = self.imagus_sieve_path + ".tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_path, self.imagus_sieve_path)
+        except OSError as e:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False, f"Could not write sieve file: {e}"
+
+        # Reload all patterns from (now-updated) sources
+        try:
+            self.load_patterns()
+        except Exception as e:
+            return False, f"Sieve saved but reload failed: {e}"
+        total = len(self.imagus_global_rules) + sum(
+            len(r) for r in self.imagus_rules.values())
+        logger.info(f"Sieve updated from {url}: {len(new_sieve)} rules "
+                    f"({valid_rule_count} valid), {total} loaded after reload")
+        return True, f"Sieve updated: {len(new_sieve)} rules ({valid_rule_count} valid)"
+
+    def jsdelivr_mirror(self, repo_url):
+        """C-1: convert a raw.githubusercontent.com URL to its jsDelivr CDN
+        equivalent (no GitHub rate limiting). Port of Mod's jsDelivrMirror
+        (service.js:74-83). Returns None when the URL is not a raw-GitHub URL."""
+        m = re.match(
+            r'^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$',
+            repo_url or "", re.I)
+        if not m:
+            return None
+        return f"https://cdn.jsdelivr.net/gh/{m.group(1)}/{m.group(2)}@{m.group(3)}/{m.group(4)}"
+
     def load_patterns(self):
         """
         Load patterns from built-in and custom sources
@@ -211,6 +294,16 @@ class SitePatternManager:
                 # PAT-2: a newer sieve file already provided this rule — skip.
                 if rule_name in self._loaded_sieve_rule_names:
                     continue
+                # C-3a: `off: 1` = rule disabled in the sieve source (Mod
+                # semantics, src/js/background.js:401). Checked BEFORE marking
+                # the name loaded so a later file may still supply an enabled
+                # variant of the same rule name.
+                if rule_data.get('off'):
+                    continue
+                # C-3b: dc rules (domain-code macros) are not supported yet —
+                # load them but flag at debug level so we can measure usage.
+                if rule_data.get('dc'):
+                    logger.debug(f"Sieve rule '{rule_name}' uses unsupported 'dc' field (dc={rule_data['dc']})")
                 self._loaded_sieve_rule_names.add(rule_name)
                 
                 # Rules must have a 'to' rule to be useful
@@ -574,13 +667,13 @@ def _transform(m):
         lines = text.split('\n')
         all_variants = []
 
-        def expand_line(l: str) -> List[str]:
-            match = re.search(r'#([^#]+)#', l)
+        def expand_line(line: str) -> List[str]:
+            match = re.search(r'#([^#]+)#', line)
             if not match:
-                return [l]
-            prefix = l[:match.start()]
+                return [line]
+            prefix = line[:match.start()]
             options = match.group(1).split()
-            suffix = l[match.end():]
+            suffix = line[match.end():]
             res = []
             for opt in options:
                 res.extend(expand_line(f"{prefix}{opt}{suffix}"))
@@ -928,6 +1021,9 @@ def _transform(m):
             post_data = post_match.group(1).strip() if post_match else None
             if not template:
                 return None
+            # C-4: data:-templates are no-fetch markers (Mod semantics), not URLs.
+            if template.startswith('data:'):
+                return None
             if template.startswith('//'):
                 template = 'https:' + template
             elif not template.startswith(('http://', 'https://')):
@@ -946,6 +1042,12 @@ def _transform(m):
         if '$&' in result:
             result = result.replace('$&', match.group(0) or '')
         if not result:
+            return None
+        # C-4: data:-templates (29 rules in shipped sieve, e.g. "data:,$&") are
+        # no-fetch markers in Imagus, not URLs — the old code produced
+        # https://data:,... garbage fetches. Returning None makes the caller
+        # probe the linked page itself (existing fallback path).
+        if result.startswith('data:'):
             return None
         if result.startswith('//'):
             result = 'https:' + result
@@ -995,8 +1097,17 @@ def _transform(m):
                 for m in re.finditer(pat, html, re.I):
                     if m.lastindex and m.group(1):
                         u = m.group(1)
-                        if not u.startswith('http'):
+                        # New-found defect (was hidden by thumb→fullsize flows
+                        # where group 1 always contained a scheme): the old
+                        # `https:+u` mangled bare relative matches into
+                        # https:abc.jpg garbage. Extension semantics kept for
+                        # protocol-relative matches; relative matches are
+                        # resolved against the fetched page (href), not the
+                        # source page.
+                        if u.startswith('//'):
                             u = 'https:' + u
+                        elif not u.startswith(('http://', 'https://')):
+                            u = urljoin(href or page_url or "", u)
                         if u not in seen:
                             seen.add(u)
                             urls.append(u)

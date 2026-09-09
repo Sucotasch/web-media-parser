@@ -78,7 +78,9 @@ def test_escalation_session_kept_open_on_success():
 
 
 def test_escalation_get_keeps_tls_verification():
-    """DL-4: the escalation GET must not disable TLS verification."""
+    """DL-4 (updated by A-6 revision): the escalation GET keeps verification ON
+    by default (curl_cffi's historical default), off only when the user
+    explicitly sets verify_tls=False."""
     d = MediaDownloader(url="http://example.com/1.jpg", filepath="/tmp/x.jpg",
                         settings={}, media_type="image")
     mock_session = MagicMock()
@@ -89,7 +91,7 @@ def test_escalation_get_keeps_tls_verification():
                return_value=mock_session):
         assert d._try_escalate_get({}, 30) is True
     _, kwargs = mock_session.get.call_args
-    assert "verify" not in kwargs, "escalation GET must not pass verify=False"
+    assert kwargs["verify"] is True, "escalation keeps verify=True (no silent weakening)"
     d._close_escalation_session()
 
 
@@ -215,6 +217,79 @@ def test_mt_chunk_closes_response_on_error(tmp_path):
     resp.close.assert_called_once()
     assert progress_dict["success"] is False
     assert progress_dict["errors"]
+
+
+def test_verify_tls_flag_passed_to_session():
+    """A-6: the verify_tls setting must reach the sync session calls.
+    Default (False) keeps legacy behavior; True must propagate verify=True.
+    """
+    from src import constants as K
+    from src.parser import http_engine
+
+    # tls_verify returns the flag and warns once on unverified use
+    assert http_engine.tls_verify({}) is False
+    assert http_engine.tls_verify({K.SETTING_VERIFY_TLS: True}) is True
+
+    # Escalation path keeps curl_cffi's verify=True default unless explicitly
+    # disabled (legacy_default=False — A-6 revision: don't weaken TLS silently).
+    d = MediaDownloader(url="http://example.com/1.jpg", filepath="/tmp/x.jpg",
+                        settings={K.SETTING_VERIFY_TLS: True}, media_type="image")
+    mock_session = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_session.get.return_value = mock_resp
+    with patch("src.downloader.media_downloader.http_engine.create_escalation_session",
+               return_value=mock_session):
+        assert d._try_escalate_get({}, 30) is True
+    _, kwargs = mock_session.get.call_args
+    assert kwargs["verify"] is True
+
+    d2 = MediaDownloader(url="http://example.com/1.jpg", filepath="/tmp/x.jpg",
+                         settings={}, media_type="image")
+    with patch("src.downloader.media_downloader.http_engine.create_escalation_session",
+               return_value=mock_session):
+        assert d2._try_escalate_get({}, 30) is True
+    _, kwargs2 = mock_session.get.call_args
+    assert kwargs2["verify"] is True, "escalation must keep verify=True by default"
+    d2._close_escalation_session()
+
+    # Explicitly disabled: setting wins.
+    d3 = MediaDownloader(url="http://example.com/1.jpg", filepath="/tmp/x.jpg",
+                         settings={K.SETTING_VERIFY_TLS: False}, media_type="image")
+    with patch("src.downloader.media_downloader.http_engine.create_escalation_session",
+               return_value=mock_session):
+        assert d3._try_escalate_get({}, 30) is True
+    _, kwargs3 = mock_session.get.call_args
+    assert kwargs3["verify"] is False
+    d3._close_escalation_session()
+
+
+def test_mt_chunk_success_writes_full_file(tmp_path):
+    """A-1 regression: the residual (< WRITE_BUFFER_SIZE) buffer must be flushed
+    INSIDE the open-file context. Before the fix it was written after the
+    with-block closed → ValueError → every MT download fell back to single-thread.
+    3 x 600KB chunks guarantee a residual buffer at stream end (1.8MB total,
+    buffer threshold is 1MB → two flushes + residual).
+    """
+    d = MediaDownloader(url="http://example.com/1.jpg", filepath=str(tmp_path / "x.jpg"),
+                        settings=ZERO_MIN_SIZE, media_type="image")
+    d.session = MagicMock()
+    resp = MagicMock()
+    resp.headers = {"Content-Type": "image/jpeg", "Content-Length": str(3 * 600 * 1024)}
+    chunk = b"x" * (600 * 1024)
+    resp.iter_content.return_value = iter([chunk, chunk, chunk])
+    d.session.get.return_value = resp
+
+    progress_dict = {"total": 0, "success": True, "errors": []}
+    lock = threading.Lock()
+    part_path = tmp_path / "c0.part"
+    d._download_chunk(0, 3 * 600 * 1024 - 1, str(part_path), 3 * 600 * 1024,
+                      progress_dict, lock, 30)
+
+    assert progress_dict["success"] is True, progress_dict["errors"]
+    assert progress_dict["errors"] == []
+    assert part_path.exists()
+    assert part_path.stat().st_size == 3 * 600 * 1024
 
 
 def test_downloader_filters_webpage_files():
