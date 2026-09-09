@@ -1,11 +1,18 @@
 # Audit.md — полный инженерный аудит репозитория (2026-09-09)
 
+> **АКТУАЛИЗАЦИЯ 2026-09-10:** находки A-1…A-8, B-1…B-4 и C-1…C-4 (частично) ИСПРАВЛЕНЫ
+> в коммите **`7415163`** (`fix: audit P1-P5 — MT-download closed-file bug, settings
+> isolation, sieve parity + online update`). Конкретные решения, гейты приёмки и журнал
+> новых дефектов, найденных при реализации — в `PLAN.md` (§8) и `GATES.md`. Ниже в тексте
+> у каждого пункта стоит маркер статуса. Не выполнено: A-9.1/A-9.2/A-9.5 (низкий
+> приоритет), C-5 (отдельная задача), C-6.3-хвост, часть B-4.1 (дедуп в popup).
+
 **Дата:** 2026-09-09 · **Baseline:** коммит `7bac98b` (после `chore: extend review prompt scope…`).
 **Метод:** сплошное чтение кода всех модулей приложения и расширения, прогон тестов,
 линта и статического анализа, точечные runtime-проверки подозрений. Предыдущий аудит
 (2026-08-16) заменён этим документом — история сохранена в git.
 
-**Прогон валидации:**
+**Прогон валидации (исходный, на бейзлайне `7bac98b`):**
 - `python -m pytest tests -q` → **265 passed, 30 skipped** (12.3 c). Скипы: Deno-зависимые
   тесты (нет deno на PATH в этом окружении), curl_cffi-тесты (P3), сетевой плейсхолдер.
 - `python -m pyflakes src/ tests/` → 1 замечание (намеренный side-effect import `brotli`
@@ -15,20 +22,31 @@
   реальные: 1×E722 (bare `except`), 1×E402 (import после кода), 1×E741, 1×E731.
 - Type-checker: mypy отсутствует в проекте (не настроен).
 
-**Сводка по severity:**
+**Прогон валидации (после исправлений, `7415163`):**
+- `python -m pytest tests -q` → **289 passed, 30 skipped** (+24 новых теста, 0 failed).
+- `python -m ruff check src/ tests/ --select E722,E402,E741,E731` → 0 ошибок.
+- Расширение: `node --check` на всех затронутых файлах — чисто; `node extension/tests/
+  url_transform.test.mjs` и `sieve_merge.test.mjs` — ALL PASS.
+- curl_cffi **установлен** в текущем окружении (0.14.0) — остаточный риск №3 исходного
+  аудита снят (venv обновлён).
 
-| Уровень | Кол-во | Ключевое |
-|---|---|---|
-| Critical | 1 | MT-download пишет в закрытый файл — фича «Threads per File > 1» не работает |
-| High | 3 | Загрязнение глобальных настроек из HTTP-потока; мёртвый Referer (`_source_url`); неверный путь очистки session-файлов |
-| Medium | 7 | Гонка очереди из HTTP-потока; `verify=False`; unbounded `wait()`; sieve: `off`/`loop`/`data:,` игнорируются; рассинхрон sieve-версий расширения |
-| Low | 8 | Bare except, мёртвый код, стиль, мелкие edge-case'ы |
+**Сводка по severity (исходная):**
+
+| Уровень | Кол-во | Ключевое | Статус |
+|---|---|---|---|
+| Critical | 1 | MT-download пишет в закрытый файл | ✅ FIX (7415163) |
+| High | 3 | Загрязнение настроек; мёртвый Referer; неверный путь session-очистки | ✅ FIX (7415163) |
+| Medium | 7 | Гонка очереди; `verify=False`; unbounded `wait()`; sieve: `off`/`loop`/`data:,`; рассинхрон sieve | ✅ FIX (7415163) |
+| Low | 8 | Bare except, мёртвый код, стиль, мелкие edge-case'ы | ✅ частично (A-9.1/9.2/9.5 и B-4.1 остались) |
 
 ---
 
 # БЛОК A — Приложение (Python)
 
 ## A-1 · CRITICAL — `_download_chunk` пишет остаток буфера в уже закрытый файл; «Threads per File > 1» не работает никогда
+
+> **✅ ИСПРАВЛЕНО (`7415163`)** — flush перенесён внутрь `with`; добавлен успешный
+> MT-тест `test_mt_chunk_success_writes_full_file` (3×600 KB — остаток буфера гарантирован).
 
 `src/downloader/media_downloader.py:642-672`
 
@@ -98,6 +116,10 @@ with open(filename, "wb") as f:
 
 ## A-2 · HIGH — Загрязнение глобальных настроек приложения из HTTP-потока расширения
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `build_extension_task_settings()` возвращает независимую
+> копию; тесты `test_extension_add_does_not_mutate_global_settings` и
+> `test_extension_add_without_overrides_keeps_base_values`.
+
 `src/gui/main_window.py:1106-1113` (`add_tasks_from_extension`, выполняется в потоке aiohttp-сервера):
 
 ```python
@@ -134,6 +156,12 @@ if cookies:
 
 ## A-3 · HIGH — Referer-заголовок никогда не отправляется: `_source_url` нигде не устанавливается
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — обе точки чтения теперь берут
+> `settings.get("_source_url") or context.get("source_url")`; ParserManager дополнительно
+> зеркалирует context в копию settings. Тесты: `test_referer_from_context_source_url`,
+> `test_referer_not_sent_for_self_source`, `test_referer_suppressed_with_policy_none`
+> (последний поймал ловушку: ключ настроек — `"referrer"`, не `"referrer_policy"`).
+
 `src/parser/webpage_parser.py:129` и `:360`:
 
 ```python
@@ -167,6 +195,10 @@ if context and context.get("source_url"):
 ---
 
 ## A-4 · HIGH — «Clear History» не удаляет session-файлы: неверный путь
+
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `app_paths.clear_task_sessions()` (тестируемая чистая
+> функция) обходит `{download_dir}/{task}/sessions/`; user-файлы не трогает. Тесты:
+> `tests/test_app_paths.py` (3 шт.).
 
 `src/gui/main_window.py` (`_clear_download_history`):
 
@@ -209,6 +241,12 @@ for entry in os.listdir(self.download_dir):
 
 ## A-5 · MEDIUM — `TaskQueueManager` мутируется из HTTP-потока, несмотря на контракт «GUI thread only»
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — чистая функция `build_extension_task_payload()` считает
+> payload в HTTP-потоке; материализация (`add_task` + mkdir) — в GUI-слоте
+> `_apply_extension_task_payload` через существующий сигнал. Реализация вскрыла два
+> дефекта (журнал PLAN.md §8): потеря задач при шатдауне (closeEvent теперь сбрасывает
+> буфер перед сохранением очереди) и очистка буфера в Clear History.
+
 `src/gui/main_window.py:1128` (`self.task_queue.add_task(...)` внутри `add_tasks_from_extension`)
 и `task_queue_manager.py:26-27` («All methods are synchronous and must be called from the
 GUI thread»). Python-операции над списком атомарны под GIL, поэтому краха нет, но:
@@ -231,6 +269,16 @@ self.extension_tasks_added.emit(auto_start_id)
 ---
 
 ## A-6 · MEDIUM — `verify=False` на всех sync-фолбэках: TLS-верификация отключена
+
+> **✅ ИСПРАВЛЕНО (`7415163`, доработано повторной проверкой)** — настройка
+> `verify_tls` (чекбокс Settings → HTTP) + `http_engine.tls_verify(settings,
+> legacy_default=…)`. Важная поправка повторной проверки: пути с историческим
+> `verify=False` сохраняют дефолт False, но escalation GET раньше НЕ передавал verify
+> вообще (curl_cffi-дефолт = True) — первая версия фикса молча ослабила бы TLS там;
+> `legacy_default=False` возвращает verify=True по умолчанию. Однократный warning при
+> каждом невифицированном запросе. Проверено по документации curl_cffi: `verify`
+> поддерживается её requests-совместимым API. Тесты: DL-4 обновлён + три состояния в
+> `test_verify_tls_flag_passed_to_session`.
 
 `webpage_parser.py` — `_sync_fetch` (fallback requests), `_execute_bypass`, `_try_escalate_fetch`;
 `media_downloader.py` — `_try_escalate_get`. Все `session.get(..., verify=False)`.
@@ -255,6 +303,9 @@ resp = session.get(url, headers=..., timeout=..., verify=verify, ...)
 
 ## A-7 · MEDIUM — `on_task_ended` и `on_parsing_finished`: неограниченный `thread.wait()`
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `quit()` + `wait(10000)` + warning при таймауте в обоих
+> обработчиках (в closeEvent уже был).
+
 `src/gui/main_window.py` — `on_task_ended`: `self.parser_thread.wait()` без таймаута;
 `on_parsing_finished`: `self.parser_thread.wait()` тоже. В `stop_parsing` уже есть bounded
 `wait(10000)`, в `_launch_parser_for_task` — `wait(5000)`. Неограниченный wait на GUI-потоке
@@ -274,6 +325,9 @@ if self.parser_thread and self.parser_thread.isRunning():
 
 ## A-8 · LOW — Bare `except` и прочий мусор от ruff
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `ruff --select E722,E402,E741,E731` чист; E701/E702
+> намеренно не тронуты.
+
 - `src/parser/priority_url_queue.py:75` — `except:` без типа (в `_get_domain`). Глотает
   всё, включая `KeyboardInterrupt/SystemExit`. Фикс: `except (ValueError, TypeError):`.
 - `src/parser/site_pattern_manager.py:577` — переменная `l` (E741). Переименовать в `line`.
@@ -286,6 +340,10 @@ if self.parser_thread and self.parser_thread.isRunning():
 ---
 
 ## A-9 · LOW — Прочее
+
+> **СТАТУС:** п.3 — подтверждён и остаётся осознанным поведением (см. исходный текст);
+> п.4 — подтверждён, оставить; п.1, п.2, п.5 — **не выполнены** (низкий приоритет,
+> решения описаны ниже и готовы к применению).
 
 1. `src/parser/json_parser.py` — `_get_json` ловит все исключения внутри `parse()` и
    **повторно поднимает** (`raise`), а `ParserManager._invoke_parser` для JSON-ветки не
@@ -311,6 +369,10 @@ if self.parser_thread and self.parser_thread.isRunning():
 
 ## B-1 · MEDIUM — Рассинхрон версий sieve: расширение тащит 849 старых правил
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `extension/sieve.json` = 823 правила от 2026.07.15;
+> `SIEVE_VERSION = "2026.07.15"`; сверх минимального фикса внедрён полный C-1
+> (онлайн-обновление) — рассинхрон больше не накапливается.
+
 `extension/sieve.json` — **849 правил от 2026.04.01**, `background.js:9` — жёстко
 зашитый `SIEVE_VERSION = "2026.04.01"`. В корне репозитория лежит более свежий
 `Imagus_sieve_2026.07.15_823.json` (823 правила), который desktop-сборка копирует в
@@ -323,6 +385,9 @@ if self.parser_thread and self.parser_thread.isRunning():
 найти `sieve.json` рядом с `Imagus_sieve_*` — нет, это уже C-блок.
 
 ## B-2 · MEDIUM — `applyUrlTransform` заменяет `$n` в порядке возрастания: `$10` ломается
+
+> **✅ ИСПРАВЛЕНО (`7415163`)** — замена в нисходящем порядке (зеркало Python-твина);
+> тест `extension/tests/url_transform.test.mjs` (6 кейсов, ALL PASS).
 
 `extension/background.js` (`applyUrlTransform`):
 ```js
@@ -349,6 +414,9 @@ for (let i = matchGroups.length - 1; i >= 1; i--) {
 
 ## B-3 · LOW — `chromeDownload`: TDZ-зависимость от `watchdog` в listener
 
+> **✅ ИСПРАВЛЕНО (`7415163`)** — `let watchdog` с гардом `if (watchdog)` и сбросом в
+> таймаут-колбэке; TDZ-окно устранено.
+
 `background.js` — `const watchdog` объявлен **после** `addListener(listener)`, а listener
 вызывает `clearTimeout(watchdog)`. В MV3-окружении событие не может прийти между
 синхронными строками (events — асинхронные), поэтому TDZ на практике не срабатывает, но
@@ -359,6 +427,14 @@ for (let i = matchGroups.length - 1; i >= 1; i--) {
 `chrome.downloads.download`, и в listener проверять `if (watchdog) clearTimeout(watchdog)`.
 
 ## B-4 · LOW — Прочее (расширение)
+
+> **СТАТУС:** п.3 (45s-бюджет `discoverFullsize`) — **✅ ИСПРАВЛЕНО (`7415163`)**;
+> п.2 (`JUNK_PATTERNS` с `\b` после alternation) — подтверждён чтением
+> `content_script.js:18-32`, паттерны `/\/(prev|next|close|…)\b/i` действительно могут
+> отсечь легитимные пути (например `/nextgen/photo.jpg`) — решение описано ниже,
+> НЕ применено (нужна проверка на живых сайтах, чтобы не потерять фильтрацию); п.1
+> (дедуп popup) — подтверждён: `mediaItems.push(...response.media)` (popup.js:118) и
+> `push(...linked.media)` (popup.js:127) без сквозного дедупа — решение ниже, НЕ применено.
 
 1. `popup.js` — после скана `mediaItems.push(...)` без дедупликации против
    `discoverFullsize`-результатов: один и тот же URL из `img` и из `res`-правила попадёт
@@ -381,6 +457,13 @@ for (let i = matchGroups.length - 1; i >= 1; i--) {
 JS-правил, merge пользовательских правил.
 
 ## C-1 · Online sieve update — добавить в расширение и приложение
+
+> **✅ РЕАЛИЗОВАНО (`7415163`)** — десктоп: `SitePatternManager.download_imagus_from_url`
+> (validRuleCount>0, атомарный os.replace, reload), поле + кнопка в Settings → HTTP,
+> jsDelivr-фолбэк, ТОЛЬКО ручной запуск. Расширение: `extension/sieve_updater.js`
+> (порт updateSieve: conditional GET, зеркало, backoff, merge с сохранением
+> `_-правил`/`off`/ghost-правил), weekly `chrome.alarms` + кнопка "Update sieve now".
+> Тесты: mock-HTTP (3), `sieve_merge.test.mjs` (12).
 
 **Что есть в Mod** (`background/service.js:74-200`, `855-895`):
 - настройка `sieveRepository` (URL raw.githubusercontent, по умолчанию
@@ -415,6 +498,13 @@ JS-правил, merge пользовательских правил.
 
 ## C-2 · Поле `loop` (95 правил в `extension/sieve.json`, 96 в файле 2026.07.15) — не поддерживается
 
+> **✅ РЕАЛИЗОВАНО (`7415163`, desktop)** — рекурсивное повторное разрешение в
+> `_discover_linked_fullsize`: `loop & 1`, ровно один res-URL, совпадающий с другим
+> правилом → следующий хоп; лимит `K.SIEVE_LOOP_MAX_HOPS = 5`, seen-set против циклов,
+> общий 45s-бюджет (без деградации). Тесты: multi-hop разрешает CDN, no-loop сохраняет
+> старое поведение, цикл обрывается. **В расширении НЕ реализовано** — сделать после
+> стабилизации desktop-семантики (см. Остаточные риски).
+
 > **Исправлено 2026-09-09:** первоначальная редакция этого пункта описывала `loop` как
 > «N итераций url-шаблона» — это неверно. Ниже — семантика, verified по исходникам Mod
 > (`src/includes/content.js:1481` и `:4478`; `background/service.js:547`).
@@ -444,6 +534,11 @@ sieve-правилу, и `rule.get('loop') & 1` — повторить get_link_
 
 ## C-3 · Поле `off` (8 правил) и `dc` (16 правил) игнорируются
 
+> **✅ РЕАЛИЗОВАНО (`7415163`)** — `off: 1` скипается при загрузке (ДО отметки имени —
+> поздний файл может дать включённую вариацию); `dc` загружается с debug-логом.
+> Тесты: `test_imagus_off_rule_skipped`, `test_imagus_off_rule_shadowed_name_can_reappear`,
+> `test_imagus_dc_rule_debug_logged`.
+
 **В Mod:** `"off": 1` — правило отключено пользователем (и это состояние сохраняется при
 обновлении, см. C-1 merge); `dc` — domain-code: ссылка на другой домен/макрос поддомена.
 
@@ -459,6 +554,12 @@ if rule_data.get("off"):
 документированы в самих файлах), полную поддержку — отдельной задачей.
 
 ## C-4 · `data:,`-шаблоны (29 правил) дают мусорные URL
+
+> **✅ РЕАЛИЗОВАНО (`7415163`)** — `apply_link_url_transform` возвращает None для
+> `data:`-результатов в обеих ветках (строковой и JS); расширение — гард
+> `startsWith("data:")` в discoverFullsize. Caller корректно зондирует саму страницу.
+> Тесты: `test_data_template_rejected`, `test_data_template_rejected_js_branch`,
+> data:-кейс в url_transform.test.mjs.
 
 **В Mod:** `url: "data:,$&"` (напр. `[Google_Images]`) — **не fetch**, а маркер «использовать
 совпадение как есть» (или встроенная data-заглушка). Mod обрабатывает `data:` отдельно от
@@ -485,6 +586,10 @@ if result.startswith("data:"):
 
 ## C-5 · JS-правила в расширении: in-page выполнение вместо `new Function`
 
+> **СТАТУС: НЕ РЕАЛИЗОВАНО** — отдельная задача (изменение архитектуры расширения:
+> перенос исполнения JS-правил в content script с URL-шимом для `this.node`);
+> решение в исходном тексте ниже остаётся актуальным.
+
 **В Mod:** JS-правила (`to:`/`res:`/`url:` с `:`) выполняются **в контексте страницы**
 (content script), где есть реальный `this.node`, `document`, hover-элемент; правила с
 `IMGS_ext_data`/асинхронными запросами работают.
@@ -502,6 +607,11 @@ shim по URL). Это как минимум вернёт правила, тре
 
 ## C-6 · Прочие улучшения из Mod, которые стоит скопировать
 
+> **СТАТУС:** п.1 (валидация перед заменой) — **✅ РЕАЛИЗОВАНО** в
+> `download_imagus_from_url`; п.3 (merge) — **✅ РЕАЛИЗОВАНО** в расширении
+> (`mergeSieve`); для desktop native-паттерны остаются отдельным файлом, ничего делать
+> не нужно; п.2 (grants) — не нужно (осознанно, см. исходный текст).
+
 1. **Валидация нового sieve перед заменой** (Mod): `validRuleCount === 0` → отказ;
    невалидный формат → ошибка, старый sieve сохраняется. У нас `_load_imagus_file` уже
    защищён try/except, но при скачивании нового файла нужно то же: не перезаписывать
@@ -517,11 +627,17 @@ shim по URL). Это как минимум вернёт правила, тре
 
 # БЛОК D — Тесты
 
-**Покрытие в целом хорошее** (265 passed / 30 skipped, модули: url-detection, js-processing,
+> **АКТУАЛИЗАЦИЯ:** дыры №1-5 закрыты в `7415163` (24 новых теста, 265 → 289 passed).
+> Актуальны №6 (Deno в CI) и №7 (вынос чистых функций GUI — частично сделан:
+> `build_extension_task_settings`/`build_extension_task_payload`/`clear_task_sessions`
+> уже тестируются без Qt; полный вынос — по мере надобности).
+
+**Покрытие в целом хорошее** (было 265 passed / 30 skipped, модули: url-detection, js-processing,
 js-engine, pattern-manager, parser-manager-filtering, media-downloader, shared-session,
 http-engine, gateway-bypass, crawler-frontier, fullsize-discovery, format-filter, junk-filter,
 bugfixes, sec3-fixes, parser-lifecycle, parser-phase2/5, task-queue-persistence, http-server,
-json-parser).
+json-parser; стало 289 passed — добавлены app_paths, settings-isolation, referer,
+MT-success, loop-chain, off/dc/data:, sieve-download, payload-buffering, verify-tls).
 
 **Дыры (по убыванию важности):**
 
@@ -554,15 +670,68 @@ json-parser).
    подменённого файла. Папка `sessions/` — внутри download-папки пользователя; файл пишет
    только наше приложение. Полный отказ от pickle — большая переделка; оставить, но
    задокументировать «не давайте чужим файлам записываться в папки задач».
-3. **`http_engine` импорты в `try/except` на уровне модуля** — curl_cffi отсутствует в
-   venv (PKG-1 из прошлого аудита): `requirements.txt` содержит `curl_cffi>=0.14.0`, но
-   venv его не имеет (проверено: `import curl_cffi` → ModuleNotFoundError). Все места
-   fail-open, но P3-функциональность (эскалация, impersonation) в dev-окружении мертва.
-   Решение — переустановить venv: `pip install -r requirements.txt`.
-4. **Расширение отстаёт от приложения по sieve** — B-1; не фиксить «в лоб» без C-1,
-   иначе опять разойдётся при следующем обновлении.
+3. ~~**`http_engine` импорты в `try/except` на уровне модуля** — curl_cffi отсутствует в
+   venv~~ **✅ СНЯТО 2026-09-10:** curl_cffi 0.14.0 установлен, `import curl_cffi`
+   проходит — P3-функциональность (эскалация, impersonation) в этом окружении жива.
+4. ~~**Расширение отстаёт от приложения по sieve** — B-1~~ **✅ СНЯТО:** bundled sieve
+   синхронизирован (823/2026.07.15) и внедрён C-1 — онлайн-обновление не даёт
+   рассинхрону накапливаться.
 5. **GIF/SVG/ICO выключены по умолчанию** — часть галерей (эмодзи-паки, стикеры) будет
    пропущена; это намеренная настройка по умолчанию (Settings → Filters), не баг.
+
+---
+
+# БЛОК E — Дефекты, найденные ПРИ внедрении фиксов (второй проход, 2026-09-09/10)
+
+Все исправлены в `7415163`; полный журнал с гейтами — `PLAN.md` §8, `GATES.md`.
+
+## E-1 · NEW DEFECT — `extract_res_urls` калечил относительные res-совпадения
+
+`site_pattern_manager.py` (ветка regex-res): старый код
+```python
+u = m.group(1)
+if not u.startswith('http'):
+    u = 'https:' + u   # 'abc.jpg' → 'https:abc.jpg' — мусор
+```
+Проблема была скрыта, потому что в поставляемом sieve группа 1 почти всегда захватывает
+protocol-relative URL (`//host/path`). Вскрылось тестами loop-цепочки.
+**Фикс (в `7415163`):** `//`-префикс → `https:` (семантика расширения сохранена); всё
+остальное относительное → `urljoin(href or page_url, u)` — базой служит СФЕТЧЕННАЯ
+страница (правильно для multi-hop), а не исходная страница краула.
+
+## E-2 · REGRESSION INTRODUCED & FIXED — A-6 ослабил TLS на escalation-пути
+
+Первая версия `tls_verify()` подставляла `verify=False` по умолчанию ВЕЗДЕ, включая
+`_try_escalate_get`, который исторически вообще не передавал `verify` (curl_cffi-дефолт
+= True) — т.е. верифицированный путь стал бы невифицированным. Проверено по докам
+curl_cffi (requests-совместимый API принимает `verify`).
+**Фикс:** сигнатура `tls_verify(settings, legacy_default=True)`; escalation-вызов
+передаёт `legacy_default=False`. Урок: «дефолт по умолчанию» — не всегда legacy-поведение;
+проверяй исходный контракт каждой точки вызова.
+
+## E-3 · NEW DEFECT — потеря extension-задач при шатдауне (следствие A-5)
+
+Буферизация payload'ов в HTTP-потоке создала окно: `closeEvent` сохранял очередь ДО
+материализации отложенных payload'ов — задачи, запрошенные из расширения за секунды до
+выхода, терялись.
+**Фикс:** `closeEvent` сбрасывает `_pending_extension_payloads` через
+`_apply_extension_task_payload` перед `task_queue.save()`; `_clear_download_history`
+отбрасывает буфер (пользователь попросил очистить всё).
+
+## E-4 · NEW DEFECT — loop-цепочка освобождала не тот URL при ошибке
+
+Обработчик исключений делал `consumed.discard(link_url)`, но `link_url` мутирует между
+хопами — сбой на середине цепочки возвращал бы в краул промежуточный хоп, а исходная
+thumbnail-ссылка терялась.
+**Фикс:** `original_link_url` фиксируется до цикла; в `consumed` кладётся/убирается
+только он (промежуточные хопы — временные fetch-цели, в `consumed` не попадают).
+
+## E-5 · Ловушка ключей настроек — `"referrer"`, не `"referrer_policy"`
+
+`K.SETTING_REFERRER_POLICY = "referrer"` (constants.py:225). Тест, написанный с
+`"referrer_policy"`, молча ничего не проверял (dict.get вернул дефолт). Ключи настроек
+брать ТОЛЬКО из `K.*` — рукописные строковые ключи не проходят линт и создают такие
+ловушки (там же: `page_limit` в parser_manager.py:87 до сих пор строкой — A-9.5).
 
 ---
 
@@ -570,17 +739,38 @@ json-parser).
 
 1. Сравнение sieve-механик проведено по исходникам Mod-расширения
    (`background/service.js`, `data/sieve.json`, `content/content.js`); runtime-прогон Mod не
-   выполнялся (это сторонний проект вне репозитория).
-2. Баг A-1 воспроизведён изолированно (запись в закрытый файл) и подтверждён чтением
-   кода; полный сквозной MT-прогон с сетью не выполнялся (нет живого Accept-Ranges-сервера
-   в окружении) — тест из A-1 закроет это.
+   выполнялся (сторонний проект вне репозитория). **Обновление:** Mod принадлежит автору
+   этого проекта (MIT в его README) — копирование механик/кода разрешено; C-1 реализован
+   как перенос с адаптацией к нашей архитектуре, C-2 — по исправленной семантике из
+   `src/includes/content.js`.
+2. Баг A-1 воспроизведён изолированно; **после фикса** успешный MT-путь покрыт тестом
+   `test_mt_chunk_success_writes_full_file`; сквозной прогон с живой сетью не выполнялся
+   (нет Accept-Ranges-сервера в окружении).
 3. Ключи настроек считались каноническими из `src/constants.py` (`K.*`); несоответствия
-   (`page_limit` строкой) отмечены как minor.
+   (`page_limit` строкой) отмечены как minor (A-9.5, не исправлено).
 4. «Clear History» не удаляет скачанные файлы — по заявленному поведению UI; аудит не
    меняет этого, только чинит session-путь (A-4).
 5. Стиль `t1.start(); t2.start(); ...` и компактные однострочники — намеренная
-   Karpathy-дисциплина проекта; ruff E701/E702 не чинились (кроме E722 — реальный баг).
-6. Предыдущий `Audit.md` (2026-08-16) содержал ~90 находок; большинство из них уже
-   исправлены в коде (маркеры `CORE-*`, `DL-*`, `EXT-*`, `GUI-*`, `PAT-*` в комментариях).
-   В этот аудит вошли только **нерешённые** проблемы + новые, найденные при повторном
-   проходе. История — в git.
+   Karpathy-дисциплина проекта; ruff E701/E702 не чинились.
+6. Предыдущий `Audit.md` (2026-08-16) содержал ~90 находок; большинство уже исправлено
+   (маркеры `CORE-*`, `DL-*`, `EXT-*`, `GUI-*`, `PAT-*`). История — в git.
+7. **Реализация фиксов (7415163) проверена повторным проходом** — найдено и исправлено
+   3 собственных дефекта (E-2, E-3, E-4) + 1 скрытый баг движка (E-1); это записано в
+   `PLAN.md` §8 с полными гейтами.
+8. Ручные гейты, требующие человека за машиной, НЕ выполнялись: (а) `python main.py` →
+   Settings → «Download latest» против живого репозитория; (б) load-unpacked расширения →
+   «Update sieve now». Код покрыт юнит-тестами с mock-HTTP.
+
+---
+
+# Итоговый статус для ReviewPrompt.txt
+
+| Требование ReviewPrompt | Статус |
+|---|---|
+| Коммит всех изменений перед ревью | ✅ `7bac98b` перед аудитом, `7415163` после внедрения |
+| Валидация: tests / lint / static analysis | ✅ pytest (265→289), pyflakes, ruff; mypy в проекте отсутствует (зафиксировано); build не прогонялся — не затрагивался |
+| Сплошной code review обоих компонентов + Mod-сравнение | ✅ Блоки A-D + Блок C (сравнение) — с исправленной семантикой `loop` (C-2) |
+| Конкретные решения с готовым кодом в Audit.md | ✅ у каждого пункта; для внедрённых — код в `7415163`, гейты в GATES.md |
+| Тесты для зафиксированных фиксов | ✅ 24 новых Python-теста + 2 node-набора (18 кейсов) |
+| Оставшиеся опасения, не исправляемые автоматически | ✅ блок «Остаточные риски» (№1, №2, №5) + нерешённые хвосты A-9/B-4/C-5 |
+| Допущения | ✅ этот раздел (8 пунктов) |
