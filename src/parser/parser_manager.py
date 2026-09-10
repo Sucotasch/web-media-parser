@@ -619,7 +619,12 @@ class ParserManager(QObject):
                 seen_fetch_urls = {fetch_url}
                 loop_guard = 0
                 while True:
-                    headers = {"Accept": "text/html"}
+                    # ERR-1 (desktop twin): the viewer/fullsize page is fetched
+                    # on behalf of a thumbnail on `page_url` — send it as
+                    # Referer, else hotlink-protected hosts 302 the probe to an
+                    # HTML page and fullsize discovery silently degrades
+                    # (mirrors extension discoverFullsize.processLink).
+                    headers = {"Accept": "text/html", "Referer": page_url}
                     if post_data:
                         headers["Content-Type"] = "application/x-www-form-urlencoded"
 

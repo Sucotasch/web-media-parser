@@ -16,13 +16,14 @@
     const links = [];
 
     const JUNK_PATTERNS = [
-      /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo\./i,
+      /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo[._-]|logo\./i,
       /\/favicon/i, /\/emoji/i, /\/gravatar/i, /\/icon[s]?\//i,
       /ljcounter/i, /\/blank\./i, /\/spacer\./i, /\/pixel\./i,
-      /1x1\./i, /\/spinner/i, /\/loading/i, /\.svg$/i,
+      /1x1\./i, /\/spinner/i, /\/loading/i, /\.svg([?#]|$)/i,
       /\/button[s]?\//i, /\/badge/i, /\/arrow/i,
       /\/(nav|menu|search|cart|share|social|widget|advert|tracker)\b/i,
       /\/(prev|next|close|expand|collapse|play|pause|mute|volume)\b/i,
+      /\$\{/i, // un-interpolated template placeholder (e.g. products/${imgSrc})
       // EXT-8: no hard format drop here — GIF/PNG/ICO filtering belongs to the
       // desktop app's format allowlist (which keeps .png ON by default). A
       // gallery with PNG art was invisible to "Save (Chrome)" otherwise.
@@ -59,9 +60,21 @@
     // <img> — direct images
     doc.querySelectorAll("img").forEach((img) => {
       const src = img.currentSrc || img.src;
+      // Tiny-layout backstop: a not-yet-loaded image has naturalWidth 0, so
+      // the element's laid-out size is the only size signal — drop layout-tiny
+      // elements (icons/spacers) up front. A REAL file displayed small
+      // (1110×1375 in a 192px <img>) has naturalWidth > 0 and is NOT dropped.
+      const laidW = img.naturalWidth || img.width || 0;
+      const laidH = img.naturalHeight || img.height || 0;
+      if (laidW > 0 && laidH > 0 && laidW < 50 && laidH < 50) return;
       if (src) addMedia(src, "image", {
-        width: img.naturalWidth || img.width || 0,
-        height: img.naturalHeight || img.height || 0,
+        // Record ONLY natural dimensions (the file's real size). Falling back
+        // to layout/attribute size would make the popup show THUMBNAIL dims
+        // for a full-size file — e.g. 192×240 preview vs real 1110×1375.
+        // Natural is 0 until the image loads, which the popup treats as
+        // "dimensions unknown" (not shown) — unknown beats wrong.
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
         alt: img.alt || "",
         source: "img"
       });

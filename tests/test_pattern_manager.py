@@ -332,6 +332,49 @@ def test_download_imagus_invalid_keeps_old(tmp_path, monkeypatch):
     assert "Base_Rule" in on_disk
 
 
+def test_resize_param_strip_colorsuper():
+    """ERR-7 / Errors.txt #1: native [Resize] port — Shopify &width=500 URLs
+    resolve to the original file on the desktop (the sieve's own [Resize]
+    rule is JS with this.node, so it was skipped at load)."""
+    pm = SitePatternManager(enable_built_in=False)
+    src = "https://colorsuper.com/products/palette-triple-pink-brazilian-bikini"
+    # width=500 preview -> original (trailing & preserved, Imagus parity)
+    res = pm.transform_image_url(
+        "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149&width=500",
+        src,
+    )
+    assert res[0] == "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149&"
+    # width=2048 og:image variant -> same original
+    res = pm.transform_image_url(
+        "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149&width=2048",
+        src,
+    )
+    assert res[0] == "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149&"
+    # No width param -> untouched
+    res = pm.transform_image_url(
+        "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149",
+        src,
+    )
+    assert res[0] == "https://colorsuper.com/cdn/shop/files/Colorsuper-Bikini-Palette-Tripple-Pink-Brazilian-3.jpg?v=1718457149"
+
+
+def test_resize_param_strip_exclusions_and_generic():
+    """ERR-7: excluded hosts (reddit) untouched; generic w/h/resize stripped."""
+    pm = SitePatternManager(enable_built_in=False)
+    # Excluded host never stripped
+    res = pm.transform_image_url(
+        "https://i.redd.it/abc123.jpg?width=500", "https://reddit.com/r/test")
+    assert res[0] == "https://i.redd.it/abc123.jpg?width=500"
+    # Generic CDN params (w/h/q) stripped
+    res = pm.transform_image_url(
+        "https://cdn.example.com/img.jpg?w=100&h=200&q=80", "https://example.com/page")
+    assert res[0] == "https://cdn.example.com/img.jpg?"
+    # Plain image path untouched
+    res = pm.transform_image_url(
+        "https://img10.reactor.cc/pics/post/full/abc.jpg", "https://pr.reactor.cc/post/1")
+    assert res[0] == "https://img10.reactor.cc/pics/post/full/abc.jpg"
+
+
 def test_jsdelivr_mirror_conversion():
     """C-1: raw.githubusercontent URL converts to jsDelivr CDN form."""
     pm = SitePatternManager(enable_built_in=False)

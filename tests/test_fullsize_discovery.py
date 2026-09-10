@@ -174,6 +174,9 @@ class TestDiscoveryIntegration(unittest.TestCase):
         kwargs = session.post.call_args.kwargs
         self.assertEqual(kwargs["data"], "imgContinue=")
         self.assertEqual(kwargs["headers"]["Content-Type"], "application/x-www-form-urlencoded")
+        # ERR-1 (desktop twin): the probe must send the source page as Referer
+        # (hotlink-protected hosts 302 referer-less probes to an HTML page).
+        self.assertEqual(kwargs["headers"]["Referer"], "https://vipergirls.to/threads/123")
 
     def test_discover_link_direct_image_response(self):
         pm = self._make_manager()

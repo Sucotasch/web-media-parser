@@ -87,6 +87,13 @@ function populateDomainFilter() {
 }
 
 // --- Scan page ---
+// ERR-4: the scan runs in the background service worker, not the popup.
+// Action popups are closed by Chrome on blur (moving the mouse away kills
+// the popup); keeping mediaItems only in popup memory meant a mid-scan blur
+// lost everything and the user had to start over. The SW scan writes progress
+// to storage.scanProgress and the result to storage.scanResult; this popup
+// listens to storage.onChanged and re-renders live, and re-opening restores
+// the last result for the current tab.
 
 scanBtn.addEventListener("click", async () => {
   scanBtn.disabled = true;
@@ -96,78 +103,150 @@ scanBtn.addEventListener("click", async () => {
   activeSourceFilter = "fullsize";
   domainFilter.value = "";
   sourceFilter.value = "fullsize";
+  resultsDiv.classList.add("hidden");
+  emptyDiv.classList.add("hidden");
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
       showError("No active tab found");
+      scanBtn.disabled = false;
+      scanBtn.textContent = "Scan This Page";
       return;
     }
 
-    let response;
-    try {
-      response = await chrome.tabs.sendMessage(tab.id, {
-        action: "scanMedia",
-      });
-    } catch (e) {
-      showError(`Content script not loaded on this page. Please refresh the page (F5) first. Error: ${e.message}`);
-      return;
+    // Drop the previous result so a stale list can't flash while scanning.
+    try { await chrome.runtime.sendMessage({ action: "resetScan" }); } catch (e) {}
+    const resp = await chrome.runtime.sendMessage({ action: "startScan", tabId: tab.id });
+    if (resp && resp.error) {
+      showError(`Scan failed: ${resp.error}`);
+      scanBtn.disabled = false;
+      scanBtn.textContent = "Scan This Page";
     }
-
-    if (response && response.media) {
-      mediaItems.push(...response.media);
-      // Ask background to discover fullsize from linked pages (CORS bypass)
-      if (response.links && response.links.length > 0) {
-        const linked = await chrome.runtime.sendMessage({
-          action: "discoverFullsize",
-          links: response.links.slice(0, LINKS_CAP),
-          pageUrl: response.url,
-        });
-        if (linked && linked.media) {
-          mediaItems.push(...linked.media);
-        }
-      }
-      // Apply sieve transforms (string rules only — JS rules need page DOM)
-      try {
-        const stored = await chrome.storage.local.get("sieveRules");
-        if (stored.sieveRules && typeof parseSieve === "function") {
-          const rules = parseSieve(JSON.parse(stored.sieveRules));
-          const pageUrl = response.url;
-          for (const item of mediaItems) {
-            if (item.source === "sieve-res" || item.source === "sieve-to") continue;
-            const transformed = applySieveRules(item.url, pageUrl, rules);
-            if (transformed && transformed !== item.url) {
-              item.original_url = item.url;
-              item.url = transformed;
-              item.transformed = true;
-              item.source = "sieve-to";
-            }
-          }
-        }
-      } catch (e) {
-        console.warn("Sieve transform failed:", e);
-      }
-      pageInfoDiv.textContent = response.title || response.url;
-      pageInfoDiv.classList.remove("hidden");
-      populateDomainFilter();
-      // Fallback to "all" if no fullsize sources found
-      const fsCount = mediaItems.filter(m => FULLSIZE_SOURCES.has(m.source)).length;
-      if (fsCount === 0) {
-        activeSourceFilter = "";
-        sourceFilter.value = "";
-      }
-      renderMediaList();
-      updateCount();
-    } else {
-      showError("No media found on this page");
-    }
+    // Progress + final result arrive via storage.onChanged (below).
   } catch (e) {
     showError(`Scan failed: ${e.message}`);
+    scanBtn.disabled = false;
+    scanBtn.textContent = "Scan This Page";
   }
-
-  scanBtn.disabled = false;
-  scanBtn.textContent = "Scan This Page";
 });
+
+// --- Scan/download progress via storage (survives popup close) ---
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.scanProgress) {
+    const p = changes.scanProgress.newValue;
+    if (!p) return;
+    if (p.status === "scanning") {
+      // The x/y counter counts LINKED PAGES probed for fullsize discovery,
+      // capped at LINKS_CAP=50 — not media found. Surface the found count
+      // too so the numbers mean something (Errors.txt #2).
+      scanBtn.textContent = p.phase === "links" && p.total > 0
+        ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
+        : "Scanning...";
+    } else if (p.status === "error") {
+      showError(`Scan failed: ${p.error || "unknown error"}`);
+      scanBtn.disabled = false;
+      scanBtn.textContent = "Scan This Page";
+    }
+  }
+  if (changes.scanResult) {
+    const r = changes.scanResult.newValue;
+    if (r && Array.isArray(r.media)) {
+      // Render only results for the CURRENT tab — a scan finishing for a
+      // background tab must not paint its media into this popup (and a
+      // stale result for a navigated-away tab must not re-appear).
+      chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+        if (!tab || r.tabId !== tab.id) return;
+        if (r.pageUrl && tab.url && r.pageUrl.split("#")[0] !== tab.url.split("#")[0]) return;
+        applyScanResult(r);
+      }).catch(() => {});
+    }
+  }
+  if (changes.downloadProgress) {
+    const d = changes.downloadProgress.newValue;
+    if (d) updateDownloadProgressUI(d);
+  }
+});
+
+function applyScanResult(result) {
+  mediaItems.length = 0;
+  mediaItems.push(...result.media);
+  pageInfoDiv.textContent = result.title || result.pageUrl || "";
+  pageInfoDiv.classList.remove("hidden");
+  populateDomainFilter();
+  // Fallback to "all" if no fullsize sources found
+  const fsCount = mediaItems.filter(m => FULLSIZE_SOURCES.has(m.source)).length;
+  if (fsCount === 0) {
+    activeSourceFilter = "";
+    sourceFilter.value = "";
+  }
+  renderMediaList();
+  updateCount();
+  scanBtn.disabled = false;
+  scanBtn.textContent = `✓ ${mediaItems.length} found`;
+  setTimeout(() => { scanBtn.textContent = "Scan This Page"; }, 2500);
+}
+
+function updateDownloadProgressUI(d) {
+  if (!d || d.total === 0) return;
+  if (d.status === "done") {
+    const failed = (d.failed || 0);
+    chromeDownloadBtn.innerHTML = `✓ Saved ${d.saved}${failed ? ` (${failed} failed)` : ""}`;
+    chromeDownloadBtn.disabled = false;
+    try {
+      chrome.action.setBadgeText({ text: `${d.saved}` });
+      chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+    } catch (e) {}
+    setTimeout(() => {
+      chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
+      updateCount();
+    }, 3000);
+  } else if (d.status === "active") {
+    chromeDownloadBtn.innerHTML = `Saving ${d.started}/${d.total} (${d.saved} ok)...`;
+    chromeDownloadBtn.disabled = true;
+  }
+}
+
+// Restore state when the popup re-opens (ERR-4): a finished scan for this
+// tab is re-rendered without re-scanning; a running scan shows its progress;
+// an in-flight download shows its counter.
+async function restoreScanState() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const stored = await chrome.storage.local.get(["scanResult", "scanProgress", "downloadProgress"]);
+    // Stale-state guard (Errors.txt follow-up): a cached scanResult belongs to
+    // a specific PAGE. Matching only tabId left the previous page's list
+    // "stuck forever" after an in-page (SPA) navigation, BFCache restore or
+    // extension reload. Full reloads are cleared by the SW's tabs.onUpdated
+    // handler; the URL check covers every other path. Hash is ignored — a
+    // #-anchor change is the same document.
+    const samePage = (a, b) => !!a && !!b && a.split("#")[0] === b.split("#")[0];
+    const resultStale = stored.scanResult && (!tab || stored.scanResult.tabId !== tab.id
+      || !samePage(stored.scanResult.pageUrl, tab.url));
+    const progressStale = stored.scanProgress && stored.scanProgress.status === "scanning"
+      && (!tab || stored.scanProgress.tabId !== tab.id);
+    if (resultStale || progressStale) {
+      chrome.storage.local.remove(["scanResult", "scanProgress"]).catch(() => {});
+      stored.scanResult = null;
+      stored.scanProgress = null;
+    }
+    if (stored.scanProgress && stored.scanProgress.status === "scanning") {
+      const p = stored.scanProgress;
+      scanBtn.disabled = true;
+      scanBtn.textContent = p.phase === "links" && p.total > 0
+        ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
+        : "Scanning...";
+    }
+    if (stored.scanResult && stored.scanResult.tabId === (tab && tab.id)) {
+      applyScanResult(stored.scanResult);
+    }
+    if (stored.downloadProgress && stored.downloadProgress.status === "active") {
+      updateDownloadProgressUI(stored.downloadProgress);
+    }
+  } catch (e) {}
+}
 
 // --- Domain filter ---
 
@@ -182,6 +261,19 @@ sourceFilter.addEventListener("change", () => {
   renderMediaList();
   updateCount();
 });
+
+// --- Dimensions display ---
+// The dims we record come from the DOM element, so they describe the FILE at
+// item.url only when that URL is the very image the browser loaded, untouched:
+// a plain, untransformed <img> with natural dimensions. In every other case
+// (transformed/upgraded URLs — sieve/[Resize] strip; a-link/link-direct/
+// sieve-res sources) the dims are the THUMBNAIL's — showing 192×240 while the
+// file is really 1110×1375 misleads the user (Errors.txt follow-up).
+// Unknown beats wrong: hide dims there.
+function shouldShowDims(item) {
+  return !!(item && item.source === "img" && !item.transformed
+    && item.width > 0 && item.height > 0);
+}
 
 // --- Render media list ---
 
@@ -253,7 +345,7 @@ function renderMediaList() {
     typeBadge.textContent = item.type.toUpperCase();
     metaDiv.appendChild(typeBadge);
 
-    if (item.width && item.height) {
+    if (shouldShowDims(item)) {
       const sizeSpan = document.createElement("span");
       sizeSpan.textContent = ` \u00B7 ${item.width}\u00D7${item.height}`;
       metaDiv.appendChild(sizeSpan);
@@ -328,7 +420,15 @@ chromeDownloadBtn.addEventListener("click", async () => {
       const item = mediaItems[parseInt(cb.dataset.index)];
       if (item) {
         const baseName = item.url.split("/").pop().split("?")[0] || "";
-        selected.push({ url: item.url, referer: item.pageUrl || "", filename: baseName });
+        selected.push({
+          url: item.url,
+          referer: item.pageUrl || "",
+          filename: baseName,
+          // ERR-5: "link-direct" items were network-verified during the scan
+          // (processLink fetched them and saw image/video) — the background
+          // skips the resolve round-trip so downloads start immediately.
+          verified: item.source === "link-direct",
+        });
       }
     });
 
@@ -337,26 +437,31 @@ chromeDownloadBtn.addEventListener("click", async () => {
   chromeDownloadBtn.disabled = true;
   chromeDownloadBtn.innerHTML = `Saving <span>${selected.length}</span>...`;
 
-  // Send to background for download
+  // Send to background for download. Live per-file progress arrives via
+  // storage.onChanged (downloadProgress) — the popup is not blocked until
+  // every file finishes, and a popup close mid-download loses nothing.
   try {
     await chrome.action.setBadgeText({ text: `${selected.length}` });
     await chrome.action.setBadgeBackgroundColor({ color: "#FFA000" });
     const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected, concurrentLimit });
     const saved = resp && resp.saved ? resp.saved : 0;
-    chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
-    await chrome.action.setBadgeText({ text: `${saved}` });
-    await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
-    chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 5000 });
+    if (saved > 0) {
+      chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
+      try {
+        await chrome.action.setBadgeText({ text: `${saved}` });
+        await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
+      } catch (e) {}
+      chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 5000 });
+      setTimeout(() => {
+        chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
+        chromeDownloadBtn.disabled = false;
+        updateCount();
+      }, 3000);
+    }
   } catch (e) {
     showError(`Download failed: ${e.message}`);
     updateCount();
   }
-
-  setTimeout(() => {
-    chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
-    chromeDownloadBtn.disabled = false;
-    updateCount();
-  }, 1500);
 });
 
 // --- Download ---
@@ -446,6 +551,7 @@ function showError(msg) {
 // Init
 checkConnection();
 updateSieveInfo();
+restoreScanState();
 
 // Load concurrent limit setting
 chrome.storage.local.get("concurrentLimit", (data) => {

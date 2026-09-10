@@ -750,6 +750,42 @@ def _transform(m):
             return url, False
         return (new_url, True) if new_url != url else (url, False)
     
+    # --- ERR-7 / Errors.txt #1: native [Resize] rule port ---
+    # The sieve's generic [Resize] rule strips CDN resize query params
+    # (Shopify `&width=500`, Cloudflare `?w=`, `?h=`, `?resize=`, ...) to
+    # reach the original file. Its `to` is a JS expression containing
+    # `this.node` — not Deno-capable, so the rule was silently skipped on
+    # the desktop too, and colorsuper.com-style full-size URLs were never
+    # resolved. This is the pure-string equivalent: same `img` regex match
+    # + same param strip, no JS evaluation needed.
+    _RESIZE_EXCLUDED_RE = re.compile(r'(?:^|\.)(?:reddit\.com|redd\.it|jtvnw\.net|cdn\.tv2\.no)/', re.I)
+    _RESIZE_IMG_RE = re.compile(
+        r'^((?:https?://)?[^/]{4,70}/[^?]+)'
+        r'((?:\?(?:[^&]*&)*?)(?:w(?:idth)?|h(?:eight)?|(?:cro|stri)p|q(?:uality)?(?==[\d.]+(?:&|$))|auto|f(?:orma|i)t|resize|im)=[\w%.,]+(?:&|$).*)$',
+        re.I,
+    )
+    _RESIZE_STRIP_RE = re.compile(
+        r'(?<=[?&])(?:w(?:idth)?|h(?:eight)?|(?:cro|stri)p|q(?:uality)?(?==[\d.]+(?:&|$))|auto|f(?:orma|i)t|resize|im)=[\w%.,]+(?:&|$)',
+        re.I,
+    )
+
+    def _strip_resize_params(self, url: str) -> str:
+        """Native port of the [Resize] sieve rule (ERR-7).
+
+        Returns the URL with CDN resize params removed, or the original URL
+        unchanged when nothing matches.
+        """
+        if not url or self._RESIZE_EXCLUDED_RE.search(url):
+            return url
+        m = self._RESIZE_IMG_RE.match(url)
+        if not m:
+            return url
+        stripped = self._RESIZE_STRIP_RE.sub('', m.group(2))
+        if stripped == m.group(2):
+            return url
+        result = m.group(1) + stripped
+        return result if result != url else url
+
     def transform_image_url(self, url: str, source_url: str) -> List[str]:
         """
         Apply patterns to transform thumbnail URLs to fullsize image URLs
@@ -933,6 +969,14 @@ def _transform(m):
             if global_transformed != url:
                 results = [global_transformed]
                 transformed = True
+
+        # 3.5 ERR-7: native [Resize] port — strip CDN resize query params
+        # (Shopify &width=500 etc.). The sieve's own [Resize] rule is JS
+        # (this.node) and was skipped at load; this is the pure-string twin.
+        if not transformed:
+            stripped = self._strip_resize_params(results[0])
+            if stripped != results[0]:
+                results = [stripped]
 
         # 4. WordPress-style size suffix strip (e.g., -300x200.jpg → .jpg)
         if not transformed:
