@@ -6,7 +6,7 @@ Global constants for the Web Media Parser application.
 """
 
 # Application version (single source of truth — used by main.py and setup.py)
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # Localhost port for the browser-extension HTTP API (ExtensionServer).
 # Mirrored in extension/background.js API_BASE (JS cannot import Python).
@@ -99,9 +99,13 @@ DEFAULT_BYPASS_GATEWAYS = True
 GATEWAY_MIN_MEDIA_THRESHOLD = 2
 
 # CSS and attribute values that typically hide elements (bot-traps)
+# R-C-2: only unambiguous, value-independent forms stay here. Zero-valued
+# opacity/width/height are decided by parsing the declaration in
+# WebpageParser._is_element_visible — as bare substrings "opacity: 0" matched
+# "opacity: 0.9" and "height: 0.5em", silently dropping real media.
 VISIBILITY_HIDDEN_KEYWORDS = [
-    "display: none", "display:none", "visibility: hidden", "visibility:hidden", 
-    "opacity: 0", "opacity:0", "left: -999", "top: -999", "width: 0", "height: 0"
+    "display: none", "display:none", "visibility: hidden", "visibility:hidden",
+    "left: -999", "top: -999"
 ]
 VISIBILITY_HIDDEN_CLASSES = [
     "hidden", "sr-only", "visually-hidden", "bot-trap", "honeypot", "invisible", "d-none"
@@ -162,6 +166,11 @@ THUMBNAIL_URL_HINTS = [
     "/small/", "/s/", "/preview/", "/lqip/", "w=150", "w=200",
 ]
 SIGNIFICANT_MEDIA_MIN_DIMENSION = 100 # Minimum width/height if specified in HTML
+
+# R-C-7: an aspect-ratio test only marks a banner when the creative is
+# physically small — otherwise 3:1+ panoramas (3000x1000, 4096x1024) were
+# dropped as ads while a 970x250 billboard was missed.
+BANNER_MAX_AREA = 1_000_000
 
 # Minimum dimension (px) for a <link rel=icon/apple-touch-icon> to be kept;
 # smaller sizes (57..152 family that vBulletin emits as a dozen <link> tags)
@@ -337,6 +346,30 @@ JSON_LINK_KEY_PATTERNS = [
     "next", "next_page", "nextpage", "pagination", "paging", "links", 
     "href", "url", "link", "related", "canonical", "alternate", "viewMoreUrl"
 ]
+# R-C-4: the subset that is safe to follow as a crawl link. JSON_LINK_KEY_PATTERNS
+# itself must NOT be used for crawling — its generic url/href/link entries would
+# turn every URL in a payload into a crawl target.
+JSON_PAGINATION_KEY_PATTERNS = [
+    "next", "next_page", "nextpage", "pagination", "paging", "links",
+]
+# R-C-5 / R-C-6: machine-readable failure kinds. The downloader tags a failure
+# result with one of these and ParserManager decides domain-health penalties from
+# the kind instead of matching human-readable error substrings (the old substring
+# list both punished local faults and listed messages nothing ever produced).
+# Fail-open: a result with NO kind is never counted as a domain fault.
+FAILURE_NETWORK = "network"
+FAILURE_HTTP_5XX = "http_5xx"
+FAILURE_HTTP_429 = "http_429"
+FAILURE_HTTP_4XX = "http_4xx"
+FAILURE_CONTENT_PAGE = "content_page"   # HTML/script/JSON body instead of media
+FAILURE_UNEXPECTED = "unexpected"
+# Only these justify quarantining a host; everything else is our own or content-side.
+FAILURE_PENALISING = (FAILURE_NETWORK, FAILURE_HTTP_5XX, FAILURE_HTTP_429, FAILURE_UNEXPECTED)
+
+# Bounds for the JSON pagination scan (R-C-4): a pathological payload must not
+# cost unbounded time, and the walk is iterative so depth is only a sanity limit.
+JSON_LINK_SCAN_MAX_NODES = 100_000
+JSON_LINK_SCAN_MAX_DEPTH = 32
 
 # Comprehensive File Extensions
 IMAGE_EXTENSIONS = [

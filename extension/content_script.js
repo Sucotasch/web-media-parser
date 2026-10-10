@@ -41,6 +41,12 @@
     function addMedia(url, type, attrs = {}) {
       url = toAbsolute(url);
       if (!url || seen.has(url)) return;
+      // R-E-7 (NEW-1): only http(s) is downloadable media. A `data:` URI is a
+      // LAZY-LOAD PLACEHOLDER (src="data:image/gif;base64,…") — it reached the
+      // media list and the desktop queue, where it can only fail, and
+      // "Save (Chrome)" saved it under the generated name download.png.
+      // `blob:`/`javascript:` are not media either.
+      if (!/^https?:/i.test(url)) return;
       if (isJunkUrl(url)) return;
       if (attrs.width && attrs.height && attrs.width < 50 && attrs.height < 50) return;
       seen.add(url);
@@ -144,22 +150,59 @@
     return { media, links };
   }
 
-  function parseSrcset(srcset) {
-    // EXT-12: w- and x-descriptors are different scales (a 600w candidate is
-    // NOT smaller than a 1.5x one) — compare only candidates of the same type.
-    let bestUrl = null, bestScore = -1, bestType = null;
-    srcset.split(",").forEach((item) => {
-      const parts = item.trim().split(/\s+/);
-      if (!parts[0]) return;
-      let score = 1, type = "bare";
-      if (parts[1]) {
-        if (parts[1].endsWith("w")) { score = parseInt(parts[1], 10) || 1; type = "w"; }
-        else if (parts[1].endsWith("x")) { score = parseFloat(parts[1]) || 1; type = "x"; }
+  // R-E-7 (NEW-2): split a srcset into { url, descriptor } candidates. A
+  // `data:` URI is read as ONE candidate — its own commas are data separators,
+  // not candidate separators. Splitting the raw string on "," turned
+  // `data:image/png;base64,AAAA 1x` into `data:image/png;base64` PLUS a second
+  // "candidate" whose base64 tail looked like a relative URL (`iVBOR…`).
+  // (The HTML grammar would require %2C in a URL, but pages ship raw data:
+  // URIs in srcset and browsers tolerate them.)
+  function splitSrcsetCandidates(srcset) {
+    const out = [];
+    const raw = srcset || "";
+    const isSpace = (c) => c === " " || c === "\n" || c === "\t" || c === "\r" || c === "\f";
+    let i = 0;
+    while (i < raw.length) {
+      while (i < raw.length && (raw[i] === "," || isSpace(raw[i]))) i++;
+      if (i >= raw.length) break;
+      const isData = raw.slice(i, i + 5).toLowerCase() === "data:";
+      let url = "";
+      if (isData) {
+        // commas belong to the data URI — only whitespace ends it
+        while (i < raw.length && !isSpace(raw[i])) url += raw[i++];
+      } else {
+        while (i < raw.length && raw[i] !== "," && !isSpace(raw[i])) url += raw[i++];
       }
-      if (bestType !== null && type !== bestType) return; // not comparable
-      if (score > bestScore) { bestScore = score; bestUrl = parts[0]; bestType = type; }
+      while (i < raw.length && isSpace(raw[i])) i++;
+      let descriptor = "";
+      while (i < raw.length && raw[i] !== "," && !isSpace(raw[i])) descriptor += raw[i++];
+      if (url) out.push({ url, descriptor });
+    }
+    return out;
+  }
+
+  function parseSrcset(srcset) {
+    // EXT-12: w- and x- descriptors are different scales (a 600w candidate is
+    // NOT smaller than a 1.5x one) — scores are only comparable inside one
+    // type, so each type keeps its own best candidate.
+    // R-E-3: the old code locked onto the type of the FIRST candidate and
+    // returned early for every other one, so a leading bare candidate
+    // ("c.jpg, a.jpg 600w, b.jpg 1.5x") discarded the whole rest of the list.
+    // Type priority: w (absolute widths) → x (device ratios) → bare.
+    const bestUrl = { w: null, x: null, bare: null };
+    const bestScore = { w: -1, x: -1, bare: -1 };
+    splitSrcsetCandidates(srcset).forEach(({ url, descriptor }) => {
+      // A `data:` candidate is a lazy-load placeholder, never a media file: it
+      // must not win the comparison and hide a real candidate (R-E-7).
+      if (/^data:/i.test(url)) return;
+      let score = 1, type = "bare";
+      if (descriptor) {
+        if (descriptor.endsWith("w")) { score = parseInt(descriptor, 10) || 1; type = "w"; }
+        else if (descriptor.endsWith("x")) { score = parseFloat(descriptor) || 1; type = "x"; }
+      }
+      if (score > bestScore[type]) { bestScore[type] = score; bestUrl[type] = url; }
     });
-    return bestUrl;
+    return bestUrl.w || bestUrl.x || bestUrl.bare;
   }
 
   // --- Full scan orchestration ---

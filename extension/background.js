@@ -6,7 +6,10 @@
 // EXT-9: shared constants (FULLSIZE_SOURCES, LINKS_CAP) — single source.
 // sieve.js: parseSieve/applySieveRules — used by handleStartScan (the scan
 // moved from the popup into the SW so it survives popup close, ERR-4).
-importScripts("shared.js", "sieve.js");
+// sieve_updater.js: online sieve update (R-E-8) — a CLASSIC script on purpose;
+// a classic worker refuses dynamic import() of a module, which is why the
+// update flow used to be dead code.
+importScripts("shared.js", "sieve.js", "sieve_updater.js");
 
 const API_BASE = "http://127.0.0.1:19876";
 const SIEVE_VERSION = "2026.07.15"; // Bump when shipping new sieve.json
@@ -21,11 +24,19 @@ async function loadSieveRules(force = false) {
     }
     const resp = await fetch(chrome.runtime.getURL("sieve.json"));
     const data = await resp.json();
+    // R-E-13: a bundle bump used to OVERWRITE storage, silently dropping every
+    // `_`-prefixed user rule and every `off: 1` written by an online merge —
+    // disabled/removed rules came back to life. Merge with the same semantics
+    // the updater promises ("user modifications are never dropped").
+    const updater = self.WMPSieveUpdater;
+    const merged = updater
+      ? updater.mergeSieve(updater.parseStoredSieve(stored.sieveRules), data)
+      : data;
     await chrome.storage.local.set({
-      sieveRules: JSON.stringify(data),
+      sieveRules: JSON.stringify(merged),
       sieveVersion: SIEVE_VERSION,
     });
-    console.info(`Loaded ${Object.keys(data).length} sieve rules into storage (v${SIEVE_VERSION})`);
+    console.info(`Loaded ${Object.keys(merged).length} sieve rules into storage (v${SIEVE_VERSION})`);
   } catch (e) {
     console.error("Failed to load sieve rules:", e);
   }
@@ -42,27 +53,30 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 loadSieveRules();
 
 // --- C-1: online sieve update (port of Mod's updateSieve) ---
-// sieve_updater.js is an ES module (importScripts cannot load it), so its
-// pure logic is mirrored via dynamic import when the worker supports it;
-// the weekly alarm and merge semantics live there.
-let _sieveUpdater = null;
-async function getSieveUpdater() {
-  if (!_sieveUpdater) {
-    try {
-      _sieveUpdater = await import(chrome.runtime.getURL("sieve_updater.js"));
-    } catch (e) {
-      console.warn("Sieve updater module unavailable:", e.message);
-      return null;
-    }
-  }
-  return _sieveUpdater;
-}
+// R-E-8: sieve_updater.js is a classic script loaded with importScripts above
+// (a classic MV3 worker refuses import()), so its API is the global object.
+// The null guard keeps the whole worker alive if that script ever fails to load.
+const SIEVE_UPDATER = self.WMPSieveUpdater || null;
+const SIEVE_ALARM_NAME = (SIEVE_UPDATER && SIEVE_UPDATER.SIEVE_UPDATE_ALARM)
+  || "sieve-update-weekly";
 
-async function runSieveUpdate() {
-  const updater = await getSieveUpdater();
-  if (!updater) return null;
-  const stored = (await chrome.storage.local.get("sieveRepository")) || {};
-  const result = await updater.updateSieve(stored.sieveRepository);
+/**
+ * Run an online sieve update.
+ * @param {boolean} force — skip the R-E-12 throttle (user pressed the button)
+ */
+async function runSieveUpdate(force = false) {
+  const updater = SIEVE_UPDATER;
+  if (!updater) {
+    console.warn("Sieve updater unavailable");
+    return null;
+  }
+  const stored = (await chrome.storage.local.get(["sieveRepository", "sieveUpdateAttempt"])) || {};
+  // R-E-12: now that the updater actually runs, the cold-start probe is a real
+  // network request on every worker start — throttle the automatic path.
+  if (!force && !updater.shouldProbeLastUpdate(stored.sieveUpdateAttempt)) {
+    return { status: "skipped", message: "Sieve check already performed recently" };
+  }
+  const result = await updater.updateSieve(stored.sieveRepository, { version: SIEVE_VERSION });
   console.info("Sieve update:", result.status, "—", result.message);
   if (result.status === "updated") {
     // New rules in storage — refresh the in-memory regex cache.
@@ -72,17 +86,21 @@ async function runSieveUpdate() {
 }
 
 // Weekly auto-update (MV3 alarms survive worker suspension)
-chrome.alarms.create("sieve-update-weekly", { periodInMinutes: 7 * 24 * 60 });
+// R-E-5: create it only when missing — re-creating on every cold start reset
+// the 7-day period, so the alarm could never fire.
+if (SIEVE_UPDATER) {
+  Promise.resolve(SIEVE_UPDATER.ensureWeeklyAlarm(chrome.alarms)).catch(() => {});
+}
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "sieve-update-weekly") runSieveUpdate();
+  if (alarm.name === SIEVE_ALARM_NAME) runSieveUpdate();
 });
 
-// Check once shortly after every service-worker cold start (cheap: 304 or
-// early-exit when the module is unavailable — no network storm). Note: MV3
-// may suspend the SW before the timer fires; that is acceptable — the weekly
-// alarm below is the authoritative update trigger, and the popup's
+// Check once shortly after every service-worker cold start (throttled to one
+// attempt per COLD_START_MIN_INTERVAL_MS and cheap on the happy path: 304).
+// Note: MV3 may suspend the SW before the timer fires; that is acceptable —
+// the weekly alarm above is the authoritative update trigger, and the popup's
 // "Update sieve now" button covers on-demand checks.
-setTimeout(runSieveUpdate, 15000);
+setTimeout(() => runSieveUpdate(false), 15000);
 
 // --- Linked page discovery (CORS bypass via service worker) ---
 
@@ -97,6 +115,9 @@ async function loadSieveResPatterns() {
     cachedSieveRes = {};
     for (const [name, rule] of Object.entries(data)) {
       if (!rule || typeof rule !== "object") continue;
+      // R-E-9: respect `off: 1` (8 rules in the bundled sieve, plus the
+      // ghosts mergeSieve writes) — mirror of parseSieve's skip.
+      if (rule.off) continue;
       // Require link + (res OR url) — url alone can be a redirect/transform
       if (!rule.link || (!rule.res && !rule.url)) continue;
       try {
@@ -405,6 +426,65 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // to chrome.storage.local (scanProgress), the result to scanResult; the popup
 // listens to storage.onChanged and re-renders live, and re-opens restore the
 // last result for the current tab instead of forcing a re-scan.
+/**
+ * R-E-6: the ONE thumbnail→fullsize upgrade pipeline for scanned media.
+ * handleStartScan (popup scan) and commandScanAndProcess (keyboard commands)
+ * both call it; the command path used to run applyResizeUpgrade alone, so
+ * string sieve rules silently never applied there.
+ *
+ * R-E-2: a rule whose `to` expands to several extensions (#jpg png#) yields
+ * one media item per variant instead of only the first URL.
+ *
+ * @param {Array} media — scanned media items
+ * @param {string} pageUrl — page the items came from (sieve `link` filter)
+ * @returns {Promise<Array>} — new list (items are not mutated in place)
+ */
+async function upgradeMediaList(media, pageUrl) {
+  let rules = null;
+  try {
+    const stored = await chrome.storage.local.get("sieveRules");
+    if (stored.sieveRules && typeof parseSieve === "function") {
+      rules = parseSieve(JSON.parse(stored.sieveRules));
+    }
+  } catch (e) {
+    // A bad stored rule set must not kill the scan — the native [Resize]
+    // fallback below still runs.
+    console.warn("Sieve rules unavailable:", e);
+  }
+
+  const out = [];
+  for (const item of media) {
+    if (!item || !item.url) continue;
+    if (item.source === "sieve-res" || item.source === "sieve-to") {
+      out.push(item);
+      continue;
+    }
+
+    // JS rules need page DOM and throw under MV3 CSP (executeSieveJS catches
+    // that and returns null), so a JS rule never masks the fallback.
+    const variants = rules ? applySieveRulesAll(item.url, pageUrl || "", rules) : [];
+    if (variants.length > 0) {
+      for (const url of variants) {
+        out.push(Object.assign({}, item, {
+          original_url: item.url, url, transformed: true, source: "sieve-to",
+        }));
+      }
+      continue;
+    }
+
+    // ERR-7: native [Resize] port — strips CDN resize params
+    // (&width=500 / ?w= / ?h= / ?resize= …) to reach the original file.
+    const upgraded = applyResizeUpgrade(item.url);
+    if (upgraded) {
+      out.push(Object.assign({}, item, {
+        original_url: item.url, url: upgraded, transformed: true, source: "sieve-to",
+      }));
+    } else {
+      out.push(item);
+    }
+  }
+  return out;
+}
 
 async function handleStartScan(tabId) {
   // tabId is stored in EVERY progress state so stale entries can be matched
@@ -442,40 +522,9 @@ async function handleStartScan(tabId) {
       if (linked && linked.media) media = media.concat(linked.media);
     }
 
-    // Apply sieve transforms (string rules only — same as the popup did;
-    // JS rules need page DOM and stay skipped in MV3). ERR-7: the generic
-    // [Resize] rule is JS, so it never ran here — applyResizeUpgrade is the
-    // native port that strips CDN resize params (colorsuper.com case).
-    try {
-      const stored = await chrome.storage.local.get("sieveRules");
-      if (stored.sieveRules && typeof parseSieve === "function") {
-        const rules = parseSieve(JSON.parse(stored.sieveRules));
-        for (const item of media) {
-          if (item.source === "sieve-res" || item.source === "sieve-to") continue;
-          const transformed = applySieveRules(item.url, pageUrl, rules);
-          if (transformed && transformed !== item.url) {
-            item.original_url = item.url;
-            item.url = transformed;
-            item.transformed = true;
-            item.source = "sieve-to";
-          } else {
-            // ERR-7: fall back to the native [Resize] port — strips
-            // &width=500 / ?w= / ?h= / ?resize= … to reach the original
-            // file (Shopify & other CDNs). Applies to any image URL, so
-            // page thumbnails (img/srcset/meta sources) upgrade too.
-            const upgraded = applyResizeUpgrade(item.url);
-            if (upgraded) {
-              item.original_url = item.url;
-              item.url = upgraded;
-              item.transformed = true;
-              item.source = "sieve-to";
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Sieve transform failed:", e);
-    }
+    // R-E-6: string sieve rules + the native [Resize] port, shared with the
+    // keyboard command path below.
+    media = await upgradeMediaList(media, pageUrl);
 
     // ERR-7: several &width= variants (1100/1000/2048 …) collapse to the
     // same stripped URL — dedup by final URL. Keep the variant with the
@@ -811,20 +860,9 @@ async function commandScanAndProcess(action) {
     }
   }
 
-  // ERR-7: same native [Resize] port as the popup scan — the keyboard
-  // command path had no sieve transforms at all, so CDN resize params
-  // (Shopify &width=500 …) were never stripped here either.
-  for (const item of media) {
-    if (item && item.source !== "sieve-to" && item.source !== "sieve-res") {
-      const upgraded = applyResizeUpgrade(item.url);
-      if (upgraded) {
-        item.original_url = item.url;
-        item.url = upgraded;
-        item.transformed = true;
-        item.source = "sieve-to";
-      }
-    }
-  }
+  // R-E-6: the keyboard path now runs the SAME pipeline as the popup scan
+  // (string sieve rules + the native [Resize] port) instead of only the latter.
+  media = await upgradeMediaList(media, response.url);
 
   const fullsize = media.filter(m => FULLSIZE_SOURCES.has(m.source));
   const items = fullsize.length > 0 ? fullsize : media;
@@ -895,7 +933,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   if (request.action === "updateSieve") {
-    runSieveUpdate().then((r) => sendResponse(r || { status: "error", message: "updater unavailable" }));
+    // The popup's button is an explicit user action — bypass the R-E-12 throttle.
+    runSieveUpdate(true).then((r) => sendResponse(r || { status: "error", message: "updater unavailable" }));
     return true;
   }
 });

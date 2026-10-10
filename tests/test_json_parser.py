@@ -153,5 +153,64 @@ class TestJsonListBranchFormatAllowlist(unittest.TestCase):
         self.assertNotIn("https://cdn.example.com/anim.gif", p.links)
 
 
+class TestRc1NestedMediaAndPagination(unittest.TestCase):
+    """R-C-1 / R-C-4 / R-C-8: nested payloads and nested pagination."""
+
+    FEED = "https://api.example.com/feed"
+    PIC = "https://cdn.example.com/pic.jpg"
+
+    def _parser(self, payload):
+        p = JSONWebpageParser(url=self.FEED, settings={}, external_session=MagicMock())
+        p._extract_media_from_json(payload)
+        return p
+
+    def _links(self, payload):
+        p = JSONWebpageParser(url=self.FEED, settings={}, external_session=MagicMock())
+        p._extract_links_from_json(payload)
+        return p.links
+
+    def test_media_under_media_shaped_keys_is_found(self):
+        for shape in ({"data": {"images": [self.PIC]}},
+                      {"media": {"url": self.PIC}},
+                      {"images": [{"src": self.PIC}]},
+                      {"metadata": {"url": self.PIC}},
+                      {"data": {"items": [{"images": [{"url": self.PIC}]}]}}):
+            with self.subTest(shape=shape):
+                media = self._parser(shape).media_files
+                self.assertEqual([u for _, u, _ in media], [self.PIC])
+
+    def test_no_duplicate_media_for_dict_with_url(self):
+        media = self._parser({"images": [{"url": self.PIC, "width": 1200}]}).media_files
+        self.assertEqual([u for _, u, _ in media], [self.PIC])
+
+    def test_existing_attrs_are_preserved(self):
+        media = self._parser({"images": [{"url": self.PIC, "width": 1200}]}).media_files
+        self.assertEqual(media[0][2].get("width"), 1200)
+
+    def test_asset_key_is_a_media_key(self):
+        # R-C-8: "asset" only exists in K.JSON_MEDIA_KEY_PATTERNS.
+        self.assertIn("asset", K.JSON_MEDIA_KEY_PATTERNS)
+        self.assertEqual([u for _, u, _ in self._parser({"asset": self.PIC}).media_files],
+                         [self.PIC])
+
+    def test_nested_pagination_is_followed(self):
+        for shape in ({"next": self.FEED + "?page=2"},
+                      {"data": {"next": self.FEED + "?page=2"}},
+                      {"meta": {"pagination": {"next": self.FEED + "?page=2"}}}):
+            with self.subTest(shape=shape):
+                self.assertIn(self.FEED + "?page=2", self._links(shape))
+
+    def test_generic_url_keys_do_not_become_crawl_links(self):
+        # K.JSON_LINK_KEY_PATTERNS must not be used wholesale for crawling.
+        self.assertEqual(self._links({"data": {"url": "https://example.com/other"}}), set())
+        self.assertEqual(self._links({"item": {"href": "https://example.com/x"}}), set())
+
+    def test_scan_is_bounded_on_pathological_payload(self):
+        deep = {"next": self.FEED + "?page=2"}
+        for _ in range(60):
+            deep = {"a": deep}
+        self._links(deep)  # must not raise RecursionError
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,14 @@ from src.parser.utils import (
     is_banner_or_ad, is_format_allowed, is_same_domain
 )
 from src.parser.site_pattern_manager import SitePatternManager
-from src import constants as K 
+from src import constants as K
+
+# R-C-2: value-aware hidden-style detection (see _is_element_visible).
+_OPACITY_ZERO_RE = re.compile(r"(?:^|;)\s*opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)")
+_ZERO_SIZE_RE = re.compile(
+    r"(?:^|;)\s*(?:width|height|max-width|max-height)\s*:\s*0(?:\.0+)?\s*"
+    r"(?:px|%|em|rem|pt)?\s*(?:;|$)"
+) 
 
 import aiohttp 
 import chardet
@@ -1138,8 +1145,13 @@ class WebpageParser:
             
             # Check inline styles
             style = str(tag.get("style", "")).lower()
-            if style and any(kw in style for kw in hidden_keywords):
-                return False
+            if style:
+                if any(kw in style for kw in hidden_keywords):
+                    return False
+                # R-C-2: zero-valued properties must be parsed, not substring-matched
+                # — "opacity: 0.9" and "height: 0.5em" are NOT hidden.
+                if _OPACITY_ZERO_RE.search(style) or _ZERO_SIZE_RE.search(style):
+                    return False
                 
         return True
 

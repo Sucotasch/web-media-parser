@@ -253,7 +253,11 @@ class TaskQueueManager(QObject):
             "active_task_id": self._active_id,
             "tasks": [t.to_dict() for t in self._queue],
         }
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # R-P-1: a bare filename ("task_queue.json") has no directory part;
+        # os.makedirs("") raised FileNotFoundError and the queue was never saved.
+        dir_path = os.path.dirname(filepath)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         # Write to a temp file and atomically replace — a crash mid-write can
         # no longer leave a corrupt queue file that erases the whole queue.
         tmp = filepath + ".tmp"

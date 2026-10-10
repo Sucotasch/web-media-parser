@@ -1029,7 +1029,7 @@ class ParserManager(QObject):
                     logger.warning(f"Failed to download file: {url} - {err_msg}")
                     
                     # 1. Feedback Loop: If we expected media but got HTML, feed it back to WebpageParser (limit 1 attempt)
-                    if "webpage/script content" in err_msg.lower():
+                    if result.get("failure_kind") == K.FAILURE_CONTENT_PAGE:
                         attrs = media_item.get("attrs", {})
                         if not attrs.get("interstitial_retry"):
                             logger.info(f"Targeting photo-host landing page for discovery: {url} (Retrying as webpage)")
@@ -1047,11 +1047,13 @@ class ParserManager(QObject):
                         else:
                             logger.warning(f"Interstitial recovery failed to find binary media for: {url}")
                     
-                    # 2. Domain Health: Only penalize health for genuine network/server errors
-                    is_content_skip = any(skip_reason in err_msg.lower() for skip_reason in [
-                        "file too small", "already exists", "invalid extension", "unsupported", 
-                        "webpage/script content", "trash media"
-                    ])
+                    # 2. Domain Health: Only penalize health for genuine network/server errors.
+                    # R-C-5/R-C-6: decided by the downloader's machine-readable
+                    # failure kind — the old substring list both punished local
+                    # faults (disk, size, user abort) and listed messages that no
+                    # code path ever produced. Fail-open: an untyped failure is
+                    # never a domain fault.
+                    is_content_skip = result.get("failure_kind") not in K.FAILURE_PENALISING
                     
                     if not is_content_skip:
                         domain_state["failures"] += 1
@@ -1168,7 +1170,17 @@ class ParserManager(QObject):
         sanitized_name = re.sub(r'\s+', '_', sanitized_name) 
         sanitized_name = re.sub(r'__+', '_', sanitized_name).strip('_')
         name_part, ext_part = os.path.splitext(sanitized_name)
-        if len(ext_part) > 7: ext_part = ext_part[:7] 
+        # R-P-2: a query/tracking tail survived sanitising inside the extension
+        # ("photo.jpeg?w=100" -> ".jpeg_w"), so files were written with an
+        # unusable extension. Recover the real one from the known lists instead.
+        known_extensions = sorted(K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS,
+                                  key=len, reverse=True)
+        ext_lower = ext_part.lower()
+        known_match = next((e for e in known_extensions if ext_lower.startswith(e)), None)
+        if known_match:
+            ext_part = ext_part[:len(known_match)]
+        elif len(ext_part) > 7:
+            ext_part = ext_part[:7] 
         
         # K.MAX_FILENAME_LENGTH from constants.py is for the name_part only
         if len(name_part) > K.MAX_FILENAME_LENGTH: name_part = name_part[:K.MAX_FILENAME_LENGTH]

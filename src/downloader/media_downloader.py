@@ -31,6 +31,18 @@ _filename_lock = threading.Lock()
 _reserved_paths: set = set()
 
 
+def _http_failure_kind(code) -> str:
+    """R-C-5/R-C-6: map an HTTP status onto a machine-readable failure kind.
+
+    A dead link (4xx) is not a host-health fault; a 5xx or 429 is.
+    """
+    if code == 429:
+        return K.FAILURE_HTTP_429
+    if isinstance(code, int) and code >= 500:
+        return K.FAILURE_HTTP_5XX
+    return K.FAILURE_HTTP_4XX
+
+
 def create_shared_downloader_session(settings: dict) -> requests.Session:
     """Create a single shared download session for all MediaDownloader instances.
 
@@ -403,7 +415,9 @@ class MediaDownloader:
                 head_encoding = (response_head.headers.get("Content-Encoding") or "").strip().lower()
                 content_type = response_head.headers.get("Content-Type", "").lower()
                 if any(t in content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
-                    return {"success": False, "error": f"Webpage/script content (Content-Type: {content_type})"}
+                    return {"success": False,
+                            "error": f"Webpage/script content (Content-Type: {content_type})",
+                            "failure_kind": K.FAILURE_CONTENT_PAGE}
                 
                 min_img_size_kb = self.settings.get(K.SETTING_MIN_IMG_SIZE, K.DEFAULT_MIN_IMAGE_SIZE_KB)
                 min_vid_size_kb = self.settings.get(K.SETTING_MIN_VID_SIZE, K.DEFAULT_MIN_VIDEO_SIZE_KB)
@@ -458,20 +472,27 @@ class MediaDownloader:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 response_get.close()
                 if not self._should_escalate(code):
-                    return {"success": False, "error": f"HTTP error: {code}"}
+                    return {"success": False, "error": f"HTTP error: {code}",
+                            "failure_kind": _http_failure_kind(code)}
                 if not self._try_escalate_get(per_req_hdrs, timeout_to_use):
-                    return {"success": False, "error": f"HTTP error: {code}"}
+                    return {"success": False, "error": f"HTTP error: {code}",
+                            "failure_kind": _http_failure_kind(code)}
                 response_get = self._escalated_response
 
-            # Some servers reject HEAD (405/403). When HEAD never succeeded,
-            # validate the GET response too so an HTML error/login page is
-            # never saved as media.
-            if response_head is None:
-                get_content_type = (response_get.headers.get("Content-Type") or "").lower()
-                if any(t in get_content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
-                    response_get.close()
-                    self._close_escalation_session()
-                    return {"success": False, "error": f"Webpage/script content (Content-Type: {get_content_type})"}
+            # R-C-3: the GET body is the only thing we write to disk, so its
+            # Content-Type must be validated unconditionally. The old guard was
+            # `if response_head is None`, which silently disabled this check
+            # whenever HEAD returned a response with a 4xx status (a 403/405 HEAD
+            # still leaves a non-None object behind) — an HTML error/login page
+            # was then saved under a media extension. A HEAD that answers 200
+            # with a wrong or missing Content-Type left the same hole.
+            get_content_type = (response_get.headers.get("Content-Type") or "").lower()
+            if any(t in get_content_type for t in ["text/html", "application/javascript", "text/javascript", "text/css", "application/json"]):
+                response_get.close()
+                self._close_escalation_session()
+                return {"success": False,
+                        "error": f"Webpage/script content (Content-Type: {get_content_type})",
+                        "failure_kind": K.FAILURE_CONTENT_PAGE}
 
             if content_length == 0:
                 try:
@@ -554,14 +575,18 @@ class MediaDownloader:
 
         except http_engine.HTTP_ERROR_EXCEPTIONS as e:
             status = getattr(e, "response", None)
-            return {"success": False, "error": f"HTTP error: {getattr(status, 'status_code', 'Unknown')}"}
+            code = getattr(status, "status_code", None)
+            return {"success": False, "error": f"HTTP error: {code if code else 'Unknown'}",
+                    "failure_kind": _http_failure_kind(code)}
         except http_engine.NETWORK_ERROR_EXCEPTIONS as e:
             self._cleanup_partial()
-            return {"success": False, "error": f"Network error: {e}"}
+            return {"success": False, "error": f"Network error: {e}",
+                    "failure_kind": K.FAILURE_NETWORK}
         except Exception as e:
             self._cleanup_partial()
             logger.error(f"Generic download error for {self.url}: {str(e)}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            # Unknown faults keep today's conservatism: they did count as host faults.
+            return {"success": False, "error": str(e), "failure_kind": K.FAILURE_UNEXPECTED}
 
     def _download_with_threads(self, total_size, custom_timeout=None):
         temp_files, threads = [], []
@@ -595,7 +620,8 @@ class MediaDownloader:
                         os.remove(temp_file)
                     except OSError:
                         pass
-            return {"success": False, "error": f"Chunk failure(s): {progress_dict['errors']}"}
+            return {"success": False, "error": f"Chunk failure(s): {progress_dict['errors']}",
+                    "failure_kind": K.FAILURE_NETWORK}
         try:
             with open(self.filepath, "wb") as outfile:
                 for temp_file in temp_files:
@@ -642,6 +668,16 @@ class MediaDownloader:
             response = self.session.get(self.url, headers=headers, stream=True, timeout=timeout_val)
             try:
                 response.raise_for_status()
+                # R-C-3: the multi-threaded path assembles ranged GETs and returns
+                # before the single-threaded GET guard runs — validate the chunk
+                # type here too. On mismatch the whole MT attempt fails, the
+                # downloader falls back to single-threaded, and the guard there
+                # rejects the body instead of writing an error page.
+                chunk_ct = (response.headers.get("Content-Type") or "").lower()
+                if any(t in chunk_ct for t in ("text/html", "application/javascript",
+                                               "text/javascript", "text/css",
+                                               "application/json")):
+                    raise IOError(f"Webpage/script content (Content-Type: {chunk_ct})")
                 write_buffer_chunk = bytearray()
                 downloaded_this_chunk = 0 # For this specific chunk part
                 with open(filename, "wb") as f:

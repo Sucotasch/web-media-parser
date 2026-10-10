@@ -142,11 +142,9 @@ class JSONWebpageParser:
             True if the key is likely to contain media
         """
         key_lower = key.lower()
-        media_key_patterns = [
-            "url", "src", "source", "media", "image", "img", "photo", "picture",
-            "thumbnail", "thumb", "icon", "avatar", "video", "file", "path",
-            "href", "link", "content", "data", "original", "high_res", "hd",
-        ]
+        # R-C-8: single source of truth (constants) — the local copy had drifted
+        # and silently missed keys the shared list already knew (e.g. "asset").
+        media_key_patterns = K.JSON_MEDIA_KEY_PATTERNS
         
         return any(pattern in key_lower for pattern in media_key_patterns)
 
@@ -158,6 +156,12 @@ class JSONWebpageParser:
             value: Value to process
             path: JSON path for context
         """
+        # R-C-1: a dict under a media-ish key ({"data": {...}}, {"media": {...}},
+        # {"metadata": {...}}) is not a URL container itself. It used to be
+        # dropped silently — descend instead so nested media is still found.
+        if isinstance(value, dict):
+            self._extract_media_from_json(value, path)
+            return
         if isinstance(value, str):
             # Check if the string is a URL
             if self._looks_like_url(value):
@@ -200,6 +204,11 @@ class JSONWebpageParser:
                                 self.media_files.append((media_type, abs_url, attrs))
                         else:
                             self.links.add(abs_url)
+                else:
+                    # R-C-1: list items that are neither a URL string nor a dict
+                    # with "url" ({"images": [{"src": …}]}) were dropped silently;
+                    # descend into them instead (strings are ignored downstream).
+                    self._extract_media_from_json(item, path)
 
     def _extract_links_from_json(self, data: Any, path: str = "") -> None:
         """
@@ -209,19 +218,39 @@ class JSONWebpageParser:
             data: JSON data to process
             path: Current JSON path for debugging
         """
-        if isinstance(data, dict):
-            # Look for pagination or next page links
-            for key in ["next", "next_page", "nextPage", "pagination", "paging", "links"]:
-                if key in data and isinstance(data[key], str) and self._looks_like_url(data[key]):
-                    abs_url = urljoin(self.url, data[key])
-                    self.links.add(abs_url)
-                    logger.debug(f"Found next page link: {abs_url}")
-                elif key in data and isinstance(data[key], dict) and "url" in data[key]:
-                    next_url = data[key]["url"]
-                    if isinstance(next_url, str) and self._looks_like_url(next_url):
-                        abs_url = urljoin(self.url, next_url)
-                        self.links.add(abs_url)
-                        logger.debug(f"Found next page link: {abs_url}")
+        # R-C-4: pagination lives under data/meta on most APIs, so the whole
+        # payload is searched instead of only the top level. Iterative (no
+        # RecursionError on deep payloads) and bounded by a node cap.
+        # Only pagination-specific keys are honoured: K.JSON_LINK_KEY_PATTERNS also
+        # contains generic url/href/link entries which would turn every URL in the
+        # payload into a crawl link (crawl explosion, out-of-domain fetches).
+        stack = [(data, 0)]
+        visited = 0
+        while stack:
+            node, depth = stack.pop()
+            visited += 1
+            if visited > K.JSON_LINK_SCAN_MAX_NODES or depth > K.JSON_LINK_SCAN_MAX_DEPTH:
+                logger.debug(f"Pagination scan stopped early ({visited} nodes, depth {depth})")
+                break
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in K.JSON_PAGINATION_KEY_PATTERNS:
+                        if isinstance(value, str) and self._looks_like_url(value):
+                            abs_url = urljoin(self.url, value)
+                            self.links.add(abs_url)
+                            logger.debug(f"Found next page link: {abs_url}")
+                        elif isinstance(value, dict) and "url" in value:
+                            next_url = value["url"]
+                            if isinstance(next_url, str) and self._looks_like_url(next_url):
+                                abs_url = urljoin(self.url, next_url)
+                                self.links.add(abs_url)
+                                logger.debug(f"Found next page link: {abs_url}")
+                    # Always descend: {"meta": {"pagination": {"next": …}}}
+                    # has the pagination key one level above the actual link.
+                    stack.append((value, depth + 1))
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append((item, depth + 1))
 
     def _looks_like_url(self, text: str) -> bool:
         """

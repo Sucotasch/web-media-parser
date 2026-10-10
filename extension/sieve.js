@@ -18,6 +18,11 @@ function parseSieve(data) {
   const rules = [];
   for (const [name, rule] of Object.entries(data)) {
     if (!rule || typeof rule !== "object") continue;
+    // R-E-9: `off: 1` is how the sieve (and mergeSieve's ghosts, and the
+    // desktop app via site_pattern_manager) disables a rule. Skipping it here
+    // keeps one rule set valid for every consumer; the bundled sieve ships 8
+    // of them, and they used to keep transforming URLs in the extension.
+    if (rule.off) continue;
     const img = rule.img || "";
     const to = rule.to || "";
     const link = rule.link || "";
@@ -71,12 +76,35 @@ function countJsRules(data) {
  * Apply sieve rules to a media URL.
  * Returns the transformed URL or null if no rule matched.
  *
+ * Thin wrapper over applySieveRulesAll (R-E-2): one rule set, one contract —
+ * keeping a second variant-selecting implementation here is what let the two
+ * drift apart in the first place.
+ *
  * @param {string} url — the media URL to transform
  * @param {string} pageUrl — the current page URL
  * @param {Array} rules — parsed sieve rules
  * @returns {string|null} — transformed URL or null
  */
 function applySieveRules(url, pageUrl, rules) {
+  const variants = applySieveRulesAll(url, pageUrl, rules);
+  return variants.length > 0 ? variants[0] : null;
+}
+
+/**
+ * Apply sieve rules and return EVERY URL variant produced by the first
+ * matching rule (R-E-2).
+ *
+ * Imagus `to` patterns can expand to several extensions ("#jpg png#", up to
+ * 133 rules in the bundled sieve); the old single-result form silently kept
+ * only the first variant, and the callers' newline split could never see the
+ * rest because nothing generated a newline.
+ *
+ * @param {string} url — the media URL to transform
+ * @param {string} pageUrl — the current page URL
+ * @param {Array} rules — parsed sieve rules
+ * @returns {string[]} — variant URLs (empty when no rule matched)
+ */
+function applySieveRulesAll(url, pageUrl, rules) {
   for (const rule of rules) {
     // Check page URL filter
     if (rule.linkRegex && !rule.linkRegex.test(pageUrl)) continue;
@@ -86,39 +114,53 @@ function applySieveRules(url, pageUrl, rules) {
     if (!match) continue;
 
     if (rule.isJS) {
-      // Execute JS expression in page context
+      // Execute JS expression in page context (MV3 CSP: returns null)
       const result = executeSieveJS(rule.toPattern, url, match, pageUrl);
-      if (result && result !== url) return result;
-    } else {
-      // Simple regex substitution
-      const result = applySubstitution(url, match, rule.toPattern);
-      if (result && result !== url) return result;
+      if (result && result !== url) return [result];
+      continue; // a JS rule that cannot run must not mask later rules
     }
+
+    // Simple regex substitution — only the FIRST matching rule applies, so
+    // its variants are the complete result for this URL.
+    const variants = applySubstitutionAll(url, match, rule.toPattern)
+      .filter((v) => v && v !== url);
+    if (variants.length > 0) return variants;
   }
-  return null;
+  return [];
 }
 
 /**
  * Apply a simple regex substitution pattern.
  * Handles $1, $2, $3... and #ext# expansion.
+ *
+ * @returns {string} — the first variant (kept for existing callers/tests)
  */
 function applySubstitution(url, match, pattern) {
+  return applySubstitutionAll(url, match, pattern)[0];
+}
+
+/**
+ * Full expansion of a substitution pattern: $1, $2, … plus one URL per
+ * "#ext1 ext2#" alternative.
+ *
+ * @returns {string[]} — one entry for a plain pattern, N for an #ext# list
+ */
+function applySubstitutionAll(url, match, pattern) {
   // Expand $1, $2, etc.
   let result = pattern.replace(/\$(\d+)/g, (_, num) => {
     return match[parseInt(num)] || "";
   });
 
-  // Handle #ext# expansion: "#jpg png#" → try each extension
+  // Handle #ext# expansion: "#jpg png#" → one URL per extension
   const extMatch = result.match(/#([^#]+)#/);
   if (extMatch) {
-    const exts = extMatch[1].trim().split(/\s+/);
+    const exts = extMatch[1].trim().split(/\s+/).filter(Boolean);
     if (exts.length > 0) {
-      result = result.replace(extMatch[0], exts[0]);
-      // Return first variant (full variant expansion would need the caller to handle)
+      return exts.map((ext) => result.replace(extMatch[0], ext));
     }
   }
 
-  return result;
+  return [result];
 }
 
 /**
@@ -163,28 +205,7 @@ function executeSieveJS(jsCode, url, match, pageUrl) {
   }
 }
 
-/**
- * Scan a page for media and apply sieve transformations.
- * @param {Array} mediaList — scanned media from content_script
- * @param {string} pageUrl — current page URL
- * @param {Array} rules — parsed sieve rules
- * @returns {Array} — transformed media list
- */
-function transformMedia(mediaList, pageUrl, rules) {
-  const transformed = [];
-
-  for (const item of mediaList) {
-    const result = applySieveRules(item.url, pageUrl, rules);
-    if (result) {
-      // Handle newline-separated variants
-      const variants = result.split("\n").filter((v) => v.trim());
-      for (const variant of variants) {
-        transformed.push({ ...item, url: variant.trim(), original: item.url, transformed: true });
-      }
-    } else {
-      transformed.push(item);
-    }
-  }
-
-  return transformed;
-}
+// R-E-11/R-E-2: `transformMedia` (a newline-splitting copy of the upgrade
+// pipeline that guarded on `typeof … === "function"` and was never called)
+// is gone — background.js's upgradeMediaList() is the single pipeline, and
+// applySieveRulesAll() is the single variant contract it builds on.

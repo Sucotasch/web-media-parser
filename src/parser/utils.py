@@ -584,9 +584,14 @@ def is_banner_or_ad(url, attrs):
                 ):
                     return True
 
-                # Banner-like aspect ratios
-                if (width_val >= 3 * height_val) or (
-                    height_val >= 5 * width_val and width_val < 300
+                # R-C-7: banner-like aspect ratios, but only for physically small
+                # creatives. Without the area gate a 3:1 panorama (3000x1000) or a
+                # 4:1 wallpaper was dropped as an ad, while the canonical 970x250
+                # billboard was missed by the old 3:1 test.
+                area = width_val * height_val
+                if area <= K.BANNER_MAX_AREA and (
+                    2 * width_val >= 7 * height_val          # >= 3.5:1 (integer math)
+                    or (3 * width_val <= height_val and width_val <= 200)  # skyscrapers
                 ):
                     return True
         except (ValueError, TypeError):

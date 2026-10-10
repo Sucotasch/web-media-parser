@@ -359,3 +359,181 @@ def test_downloader_filters_by_content_type():
     # Verify the result
     assert result["success"] is False
     assert "Webpage/script content" in result["error"]
+
+
+# R-C-3: an error/login page must never be written under a media extension.
+
+_H_TML = (b"<!DOCTYPE html><html><head><title>403 Forbidden</title></head>"
+          b"<body><h1>Access denied</h1></body></html>")
+_JPEG = b"\xff\xd8\xff\xe0" + b"J" * 1000
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code=200, headers=None, body=b""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} error", response=self)
+
+    def iter_content(self, chunk_size=8192):
+        yield self._body
+
+    def close(self):
+        pass
+
+
+class _HeadRefusingSession:
+    """HEAD answers `head_status`; GET streams `body` as `get_ct`. Range-aware."""
+
+    def __init__(self, head_status, head_ct, body, get_ct, accept_ranges=False,
+                 get_status=200):
+        self.head_status, self.head_ct = head_status, head_ct
+        self.body, self.get_ct = body, get_ct
+        self.accept_ranges = accept_ranges
+        self.get_status = get_status
+
+    def head(self, url, **kwargs):
+        headers = {"Content-Type": self.head_ct, "Content-Length": str(len(self.body))}
+        if self.accept_ranges:
+            headers["Accept-Ranges"] = "bytes"
+        return _FakeHttpResponse(self.head_status, headers)
+
+    def get(self, url, headers=None, **kwargs):
+        rng = (headers or {}).get("Range")
+        if rng:
+            start, end = (int(x) for x in rng.replace("bytes=", "").split("-"))
+            return _FakeHttpResponse(206, {"Content-Type": self.get_ct,
+                                           "Content-Length": str(end - start + 1)},
+                                     self.body[start:end + 1])
+        return _FakeHttpResponse(self.get_status, {"Content-Type": self.get_ct,
+                                                   "Content-Length": str(len(self.body))},
+                                 self.body)
+
+    def close(self):
+        pass
+
+
+def _images_on_disk(tmp_path):
+    return [f for f in sorted(os.listdir(tmp_path)) if not f.endswith(".partial")]
+
+
+def _run_download(tmp_path, session, settings=None, name="photo.jpg"):
+    downloader = MediaDownloader(
+        url="https://cdn.example.com/photo.jpg",
+        filepath=str(tmp_path / name),
+        settings=dict(ZERO_MIN_SIZE, **(settings or {})),
+        media_type="image",
+    )
+    downloader.session = session
+    return downloader.download()
+
+
+def test_head_403_reads_get_content_type_and_refuses_html(tmp_path):
+    """A 403 HEAD still leaves a response object; the GET body is what matters."""
+    session = _HeadRefusingSession(403, "text/html", _H_TML, "text/html")
+    result = _run_download(tmp_path, session)
+    assert result["success"] is False
+    assert "Webpage/script content" in result["error"]
+    assert _images_on_disk(tmp_path) == []
+
+
+def test_head_405_refuses_json_body(tmp_path):
+    session = _HeadRefusingSession(405, "text/html", b'{"error":"forbidden"}',
+                                   "application/json")
+    result = _run_download(tmp_path, session)
+    assert result["success"] is False
+    assert "Webpage/script content" in result["error"]
+    assert _images_on_disk(tmp_path) == []
+
+
+def test_lying_head_still_refuses_html(tmp_path):
+    """HEAD says image/jpeg, GET returns an HTML page that is big enough to pass."""
+    body = b"<!DOCTYPE html><html><body>" + b"x" * 60000 + b"</body></html>"
+    session = _HeadRefusingSession(200, "image/jpeg", body, "text/html")
+    result = _run_download(tmp_path, session)
+    assert result["success"] is False
+    assert "Webpage/script content" in result["error"]
+    assert _images_on_disk(tmp_path) == []
+
+
+def test_head_refusing_host_still_downloads_real_image(tmp_path):
+    """No functional loss: hosts that reject HEAD keep working."""
+    session = _HeadRefusingSession(403, "text/html", _JPEG, "image/jpeg")
+    result = _run_download(tmp_path, session)
+    assert result["success"] is True, result
+    files = _images_on_disk(tmp_path)
+    assert files and open(tmp_path / files[0], "rb").read() == _JPEG
+
+
+# R-C-5/R-C-6: failure kinds — only these may quarantine a host.
+
+def test_failure_kind_http_4xx_is_not_penalising(tmp_path):
+    from src import constants as K
+    body = b"not found"
+    session = _HeadRefusingSession(404, "text/html", body, "text/html", get_status=404)
+    result = _run_download(tmp_path, session)
+    assert result["success"] is False
+    assert result["failure_kind"] == K.FAILURE_HTTP_4XX
+    assert result["failure_kind"] not in K.FAILURE_PENALISING
+
+
+def test_failure_kind_http_5xx_is_penalising(tmp_path):
+    from src import constants as K
+    session = _HeadRefusingSession(503, "image/jpeg", b"err", "image/jpeg", get_status=503)
+    result = _run_download(tmp_path, session)
+    assert result["failure_kind"] == K.FAILURE_HTTP_5XX
+    assert result["failure_kind"] in K.FAILURE_PENALISING
+
+
+def test_failure_kind_429_is_penalising(tmp_path):
+    from src import constants as K
+    session = _HeadRefusingSession(429, "image/jpeg", b"slow down", "image/jpeg", get_status=429)
+    result = _run_download(tmp_path, session)
+    assert result["failure_kind"] == K.FAILURE_HTTP_429
+    assert result["failure_kind"] in K.FAILURE_PENALISING
+
+
+def test_failure_kind_content_page_is_not_penalising(tmp_path):
+    from src import constants as K
+    session = _HeadRefusingSession(200, "image/jpeg", _H_TML, "text/html")
+    result = _run_download(tmp_path, session)
+    assert result["failure_kind"] == K.FAILURE_CONTENT_PAGE
+    assert result["failure_kind"] not in K.FAILURE_PENALISING
+
+
+def test_failure_kind_network_is_penalising(tmp_path):
+    from src import constants as K
+    session = MagicMock()
+    session.head.side_effect = requests.exceptions.ConnectionError("boom")
+    session.get.side_effect = requests.exceptions.ConnectionError("boom")
+    result = _run_download(tmp_path, session)
+    assert result["failure_kind"] == K.FAILURE_NETWORK
+    assert result["failure_kind"] in K.FAILURE_PENALISING
+
+
+def test_content_filters_carry_no_kind(tmp_path):
+    """Fail-open: local/content-side failures are forgiven by absence of a kind."""
+    from src import constants as K
+    session = _HeadRefusingSession(200, "image/jpeg", _JPEG, "image/jpeg")
+    result = _run_download(tmp_path, session, {K.SETTING_MIN_IMG_SIZE: 10 ** 6})
+    assert result["success"] is False
+    assert "failure_kind" not in result
+    assert result.get("failure_kind") not in K.FAILURE_PENALISING
+
+
+def test_multi_thread_path_rejects_html_chunks(tmp_path):
+    """The MT path returns before the single-threaded GET guard — it must
+    validate its own chunks instead of assembling an error page."""
+    from src import constants as K
+    body = b"<!DOCTYPE html><html><body>" + b"y" * 2_500_000 + b"</body></html>"
+    session = _HeadRefusingSession(200, "image/jpeg", body, "text/html",
+                                   accept_ranges=True)
+    result = _run_download(tmp_path, session, {K.SETTING_THREADS_PER_FILE: 2},
+                           name="big.jpg")
+    assert result["success"] is False
+    assert "Webpage/script content" in result["error"]
+    files = _images_on_disk(tmp_path)
+    assert files == [] or b"<html" not in open(tmp_path / files[0], "rb").read()[:400]

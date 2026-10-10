@@ -11,7 +11,11 @@
 // URL is the anchor's target, not the <img> src, so it is a full-size
 // candidate. ERR-1: without it the popup's "fullsize" filter hid these
 // real full-size URLs while discovery probed the network for them.
-const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link"]);
+// "linked-img" = an <img src> found while probing a linked page (fullsize
+// discovery fallback, background.js) — the URL points straight at an image
+// file, so it belongs in the same bucket. R-E-4: without it the popup's
+// default "fullsize" source filter hid everything discovery found.
+const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img"]);
 
 // Cap on how many linked pages the popup/background probe for fullsize
 // discovery. Discovery is bounded work; media lookups are not capped.
