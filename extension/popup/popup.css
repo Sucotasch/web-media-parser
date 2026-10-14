@@ -4,7 +4,8 @@ body { width: 480px; height: 560px; display: flex; flex-direction: column; font-
 h1 { font-size: 14px; font-weight: 600; }
 .status { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
 .status.online { background: #2e7d32; color: #fff; }
-.status.offline { background: #c62828; color: #fff; }
+.status.offline { background: #c62828; color: #fff; cursor: pointer; }
+.status.offline:hover { background: #b71c1c; }
 .status.saving { background: #0277bd; color: #fff; }
 #scan-section { padding: 12px 14px; }
 button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }

@@ -75,8 +75,23 @@ async function checkConnection() {
   } catch (e) {}
   statusDiv.textContent = "Disconnected";
   statusDiv.className = "status offline";
-  statusDiv.title = "Desktop app not running — scanning works, sending items needs the app";
+  statusDiv.title = "Desktop app not running — click to view setup guide & download";
   return false;
+}
+
+// Clicking Disconnected opens the GitHub project setup guide in a new tab
+statusDiv.addEventListener("click", () => {
+  if (statusDiv.classList.contains("offline")) {
+    chrome.tabs.create({ url: "https://github.com/Sucotasch/web-media-parser#readme" });
+  }
+});
+
+function formatAppError(err) {
+  if (!err) return "Unknown error";
+  if (/not reachable|failed to fetch/i.test(err)) {
+    return 'Desktop app is not running. Start Web Media Parser or click "Disconnected" above.';
+  }
+  return err;
 }
 
 // --- Domain helpers ---
@@ -577,7 +592,7 @@ downloadBtn.addEventListener("click", async () => {
       await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
     } else if (resp && resp.error) {
-      showError(resp.error);
+      showError(formatAppError(resp.error));
       await chrome.action.setBadgeText({ text: "!" });
       await chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
@@ -621,7 +636,7 @@ downloadBtn.addEventListener("click", async () => {
   const resp = await chrome.runtime.sendMessage({ action: "download", urls: selected, one_shot: true, context });
 
   if (resp && resp.error) {
-    showError(resp.error);
+    showError(formatAppError(resp.error));
   } else if (resp && resp.ok) {
     downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
@@ -674,8 +689,10 @@ async function updateSieveInfo() {
       infoEl.textContent = jsCount > 0
         ? `Sieve: ${count} rules (${jsCount} JS — skipped in popup)`
         : `Sieve: ${count} rules loaded`;
+      infoEl.title = "Imagus Sieve rules: automatically upgrades thumbnail previews to original full-size images";
     } else {
       infoEl.textContent = "Sieve: no rules loaded";
+      infoEl.title = "No sieve rules loaded. Click 'Update now' or 'Load sieve rules…'";
     }
   } catch (e) {
     infoEl.textContent = "Sieve: error reading rules";
