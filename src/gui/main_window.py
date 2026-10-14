@@ -1297,7 +1297,12 @@ class MainWindow(QMainWindow):
 
         # GUI-5: stop the extension server gracefully instead of hard-killing the
         # daemon thread (the graceful stop() code was otherwise dead).
-        if self._server_thread and self._server_thread.isRunning():
+        is_server_alive = (
+            self._server_thread.is_alive()
+            if hasattr(self._server_thread, "is_alive")
+            else self._server_thread.isRunning()
+        ) if self._server_thread else False
+        if is_server_alive:
             try:
                 loop = getattr(self, "_server_loop", None)
                 if loop is not None and not loop.is_closed():

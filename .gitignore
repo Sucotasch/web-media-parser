@@ -181,6 +181,7 @@ backups/
 downloads/
 *.exe
 settings.json
+task_queue.json
 site_patterns.json
 test_patterns.html
 # Release archives (PKG-7: a stray `git add .` must not commit a 100+MB zip)
