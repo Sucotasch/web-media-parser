@@ -1,0 +1,59 @@
+launching cft 137.0.7151.119 with the SCRATCH profile
+  profile: d:\Arx\Software Downloads\_Images_EDIT-pack\web-media-parser\.ext-dev-loop\r-e-gate\profile4
+  (a separate window and a separate profile - your own browser sessions are not used;)
+  pid 18212, port 9830, stderr -> d:\Arx\Software Downloads\_Images_EDIT-pack\web-media-parser\.ext-dev-loop\r-e-gate\profile4\browser-stderr.log
+extension: "Web Media Parser", SW 5BB28C2760A5EED8294A95D831DCDE6C
+  browser pid 18212
+  downloads redirected to d:\Arx\Software Downloads\_Images_EDIT-pack\web-media-parser\.ext-dev-loop\downloads (the human's download folder is not used)
+  headless self-check: screen [800,600] outer [1100,820] -> HEADLESS confirmed (screen is Chromium's synthesised 800x600 default; no window exists)
+state: {"userscriptAPI":false,"userScriptsError":"Cannot read properties of undefined (reading 'getScripts')","version":"1.3.0","id":"lbeemfggjopnleljccmcfdhjcfpgkklo"}
+extension pages: chrome-extension://lbeemfggjopnleljccmcfdhjcfpgkklo/ (popup/popup.html)
+  userScripts not declared in the manifest - the grant gate does not apply;
+        content scripts (if any) come from manifest content_scripts, not userScripts.
+  extension page (driver): chrome-extension://lbeemfggjopnleljccmcfdhjcfpgkklo/popup/popup.html
+
+script: 10 step(s) from .ext-dev-loop/r_e_gate_steps.json
+
+[step 1/10] settle: the install-time/cold-start loadSieveRules() must finish before the merge test (it otherwise writes the bundle over the test value)  (sw)
+  result: "{\"version\":\"2026.07.15\",\"rules\":823}"
+  worker console (4 line(s)):
+    [info] Loaded 823 sieve rules into storage (v2026.07.15)
+    [info] Loaded 823 sieve rules into storage (v2026.07.15)
+    [info] Loaded 363 sieve res patterns
+    [info] Sieve rules already loaded (version 2026.07.15)
+
+[step 2/10] R-E-8: classic script loaded via importScripts in a REAL MV3 worker (dynamic import() would leave this undefined)  (sw)
+  result: "{\"updater\":\"object\",\"updateSieve\":\"function\",\"upgradeMediaList\":\"function\",\"applySieveRulesAll\":\"function\",\"parseSieve\":\"function\"}"
+
+[step 3/10] R-E-8/R-E-1: stubbed fetch -> merge -> STRING in storage -> JSON.parse; user rule + off flag survive  (sw)
+  result: "{\"status\":\"updated\",\"rulesType\":\"string\",\"keys\":3,\"version\":\"2026.07.15\",\"attempt\":\"number\",\"keptUser\":true,\"keptOff\":true,\"hasFresh\":true}"
+  worker console (1 line(s)):
+    [info] Loaded 0 sieve res patterns
+
+[step 4/10] R-E-8 (2nd read): the merged set must still be there after the worker settles — no startup overwrite  (sw)
+  result: "{\"version\":\"2026.07.15\",\"keptUser\":true,\"hasFresh\":true,\"keptOff\":true}"
+    (1 replayed line(s) suppressed - Runtime.enable replays the buffer per session)
+
+[step 5/10] R-E-5: the weekly alarm exists exactly once with a 7-day period  (sw)
+  result: "{\"name\":\"sieve-update-weekly\",\"exists\":true,\"period\":10080}"
+
+[step 6/10] R-E-8 plumbing: background.runSieveUpdate() really calls the updater and reports the result  (sw)
+  result: "{\"status\":\"up-to-date\",\"message\":\"Sieve is up to date (HTTP 304)\"}"
+  worker console (1 line(s)):
+    [info] Sieve update: up-to-date — Sieve is up to date (HTTP 304)
+
+[step 7/10] R-E-12: the automatic (non-forced) probe is throttled right after an attempt  (sw)
+  result: "{\"status\":\"skipped\"}"
+
+[step 8/10] R-E-9: a rule with off:1 never reaches the res-pattern cache  (sw)
+  result: "[\"On\"]"
+  worker console (2 line(s)):
+    [info] Loaded 1 sieve res patterns
+    [info] Loaded 1 sieve res patterns
+
+[step 9/10] R-E-4: discovery fallback items count as fullsize in the live worker  (sw)
+  result: "{\"linked\":true,\"size\":5}"
+
+[step 10/10] R-E-6: upgradeMediaList is reachable and upgrades a list in the live worker (string sieve rule)  (sw)
+  result: "[[\"/f/9.jpg\",\"sieve-to\"],[\"/f/9.webp\",\"sieve-to\"],[\"https://cdn/plain.jpg?a=1&\",\"sieve-to\"]]"
+browser stopped (Browser.close + PID tree) [after --script]

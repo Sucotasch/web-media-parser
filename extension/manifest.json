@@ -31,6 +31,12 @@
   "background": {
     "service_worker": "background.js"
   },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "web-media-parser@sucotasch",
+      "strict_min_version": "109.0"
+    }
+  },
   "commands": {
     "save-chrome": {
       "suggested_key": {

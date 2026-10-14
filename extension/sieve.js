@@ -173,36 +173,11 @@ function applySubstitutionAll(url, match, pattern) {
  * @param {string} pageUrl — current page URL
  * @returns {string|null} — transformed URL or null
  */
-function executeSieveJS(jsCode, url, match, pageUrl) {
-  try {
-    // Build Imagus-compatible context
-    const context = {
-      node: document.querySelector("img[src='" + url + "']") || document.querySelector("[data-src='" + url + "']"),
-      URL: pageUrl,
-    };
-
-    // Build $[0], $[1], $[2]... references
-    const $ = match.slice();
-
-    // Build the function body
-    const fnBody = `
-      "use strict";
-      const $ = ${JSON.stringify(match.slice())};
-      const document = window.document;
-      const URL = window.URL;
-      ${jsCode}
-    `;
-
-    // Execute in page context via script injection
-    const result = new Function(fnBody)();
-    if (typeof result === "string" && result.startsWith("http")) {
-      return result;
-    }
-    return null;
-  } catch (e) {
-    // JS execution failed — rule is not compatible
-    return null;
-  }
+function executeSieveJS(_jsCode, _url, _match, _pageUrl) {
+  // MV3 CSP strictly forbids eval() and new Function(). Sieve rules that require
+  // arbitrary JS execution are handled in the desktop app (via Deno engine);
+  // in the browser extension they return null so static fallbacks apply.
+  return null;
 }
 
 // R-E-11/R-E-2: `transformMedia` (a newline-splitting copy of the upgrade

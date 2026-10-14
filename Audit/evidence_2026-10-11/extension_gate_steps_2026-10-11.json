@@ -1,0 +1,52 @@
+[
+  {
+    "note": "settle: the install-time/cold-start loadSieveRules() must finish before the merge test (it otherwise writes the bundle over the test value)",
+    "target": "sw",
+    "eval": "(async () => { await loadSieveRules(); await chrome.storage.local.set({ sieveUpdateAttempt: Date.now() }); await new Promise((r) => setTimeout(r, 1500)); const st = await chrome.storage.local.get([\"sieveVersion\", \"sieveRules\"]); let n = 0; try { n = Object.keys(JSON.parse(st.sieveRules)).length; } catch (e) {} return JSON.stringify({ version: st.sieveVersion, rules: n }); })()"
+  },
+  {
+    "note": "R-E-8: classic script loaded via importScripts in a REAL MV3 worker (dynamic import() would leave this undefined)",
+    "target": "sw",
+    "eval": "JSON.stringify({ updater: typeof self.WMPSieveUpdater, updateSieve: typeof self.WMPSieveUpdater.updateSieve, upgradeMediaList: typeof upgradeMediaList, applySieveRulesAll: typeof applySieveRulesAll, parseSieve: typeof parseSieve })"
+  },
+  {
+    "note": "R-E-8/R-E-1: stubbed fetch -> merge -> STRING in storage -> JSON.parse; user rule + off flag survive",
+    "target": "sw",
+    "eval": "(async () => { const storage = chrome.storage.local; await storage.set({ sieveRules: JSON.stringify({ _userRule: { link: \"u\", img: \"z\" }, Keep: { link: \"old\", img: \"x\", off: 1 } }) }); const realFetch = self.fetch; self.fetch = async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ Fresh: { link: \"f\", img: \"y\" }, Keep: { link: \"new\", img: \"x\" } }) }); let res; try { res = await self.WMPSieveUpdater.updateSieve(\"https://raw.githubusercontent.com/u/r/m/update.txt\", { version: \"2026.07.15\" }); } finally { self.fetch = realFetch; } const st = await storage.get([\"sieveRules\", \"sieveVersion\", \"sieveUpdateAttempt\"]); let parsed = null; try { parsed = JSON.parse(st.sieveRules); } catch (e) { parsed = null; } return JSON.stringify({ status: res && res.status, rulesType: typeof st.sieveRules, keys: parsed ? Object.keys(parsed).length : -1, version: st.sieveVersion, attempt: typeof st.sieveUpdateAttempt, keptUser: !!(parsed && parsed._userRule), keptOff: !!(parsed && parsed.Keep && parsed.Keep.off), hasFresh: !!(parsed && parsed.Fresh) }); })()"
+  },
+  {
+    "note": "R-E-8 (2nd read): the merged set must still be there after the worker settles — no startup overwrite",
+    "target": "sw",
+    "eval": "(async () => { await new Promise((r) => setTimeout(r, 2000)); const st = await chrome.storage.local.get([\"sieveRules\", \"sieveVersion\"]); let parsed = {}; try { parsed = JSON.parse(st.sieveRules); } catch (e) {} return JSON.stringify({ version: st.sieveVersion, keptUser: !!parsed._userRule, hasFresh: !!parsed.Fresh, keptOff: !!(parsed.Keep && parsed.Keep.off) }); })()"
+  },
+  {
+    "note": "R-E-5: the weekly alarm exists exactly once with a 7-day period",
+    "target": "sw",
+    "eval": "(async () => { await self.WMPSieveUpdater.ensureWeeklyAlarm(chrome.alarms); const a = await chrome.alarms.get(self.WMPSieveUpdater.SIEVE_UPDATE_ALARM); return JSON.stringify({ name: self.WMPSieveUpdater.SIEVE_UPDATE_ALARM, exists: !!a, period: a && a.periodInMinutes }); })()"
+  },
+  {
+    "note": "R-E-8 plumbing: background.runSieveUpdate() really calls the updater and reports the result",
+    "target": "sw",
+    "eval": "(async () => { const realFetch = self.fetch; self.fetch = async () => ({ status: 304, ok: false, text: async () => \"\" }); let res; try { res = await runSieveUpdate(true); } finally { self.fetch = realFetch; } return JSON.stringify({ status: res && res.status, message: res && res.message }); })()"
+  },
+  {
+    "note": "R-E-12: the automatic (non-forced) probe is throttled right after an attempt",
+    "target": "sw",
+    "eval": "(async () => { const res = await runSieveUpdate(false); return JSON.stringify({ status: res && res.status }); })()"
+  },
+  {
+    "note": "R-E-9: a rule with off:1 never reaches the res-pattern cache",
+    "target": "sw",
+    "eval": "(async () => { await chrome.storage.local.set({ sieveRules: JSON.stringify({ Off: { link: \"x\", res: \"a\", off: 1 }, On: { link: \"y\", res: \"b\" } }) }); await loadSieveResPatterns(); return JSON.stringify(Object.keys(cachedSieveRes)); })()"
+  },
+  {
+    "note": "R-E-4: discovery fallback items count as fullsize in the live worker",
+    "target": "sw",
+    "eval": "JSON.stringify({ linked: FULLSIZE_SOURCES.has(\"linked-img\"), size: FULLSIZE_SOURCES.size })"
+  },
+  {
+    "note": "R-E-6: upgradeMediaList is reachable and upgrades a list in the live worker (string sieve rule)",
+    "target": "sw",
+    "eval": "(async () => { await chrome.storage.local.set({ sieveRules: JSON.stringify({ V: { img: \"/t/(\\\\d+)\\\\.jpg\", to: \"/f/$1.#jpg webp#\" } }) }); const out = await upgradeMediaList([{ url: \"https://cdn/t/9.jpg\", source: \"img\" }, { url: \"https://cdn/plain.jpg?a=1&width=500\", source: \"img\" }], \"https://page/\"); return JSON.stringify(out.map((m) => [m.url, m.source])); })()"
+  }
+]

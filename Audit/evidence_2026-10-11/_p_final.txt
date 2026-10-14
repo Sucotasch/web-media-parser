@@ -1,0 +1,89 @@
+### R-C-7 banner policy comparison (True = dropped as ad/banner)
+size               kind    now (3:1, no area gate      A: 3:1 + area<=1M B: 3.5:1 + area + tall  C: 4:1 + area + tall3
+728x90             ad                   OK  True               OK  True               OK  True               OK  True 
+970x90             ad                   OK  True               OK  True               OK  True               OK  True 
+468x60             ad                   OK  True               OK  True               OK  True               OK  True 
+234x60             ad                   OK  True               OK  True               OK  True               BAD False
+320x50             ad                   OK  True               OK  True               OK  True               OK  True 
+970x250            ad                   OK  True               OK  True               OK  True               BAD False
+160x600            ad                   BAD False              BAD False              OK  True               OK  True 
+120x600            ad                   OK  True               BAD False              OK  True               OK  True 
+300x250            ad                   BAD False              BAD False              BAD False              BAD False
+336x280            ad                   BAD False              BAD False              BAD False              BAD False
+1200x800           legit                OK  False              OK  False              OK  False              OK  False
+3000x1000          legit                BAD True               OK  False              OK  False              OK  False
+1920x640           legit                BAD True               OK  False              OK  False              OK  False
+4096x1024          legit                BAD True               OK  False              OK  False              OK  False
+8000x2000          legit                BAD True               OK  False              OK  False              OK  False
+1500x500           legit                BAD True               BAD True               OK  False              OK  False
+600x200            legit                BAD True               BAD True               OK  False              OK  False
+1400x400           legit                BAD True               BAD True               BAD True               OK  False
+1920x1080          legit                OK  False              OK  False              OK  False              OK  False
+400x900            legit                OK  False              OK  False              OK  False              OK  False
+600x900            legit                OK  False              OK  False              OK  False              OK  False
+2560x1440          legit                OK  False              OK  False              OK  False              OK  False
+1000x250 crop      legit                BAD True               BAD True               BAD True               BAD True 
+
+wrong decisions: now (3:1, no area gate)=11/23, A: 3:1 + area<=1M=8/23, B: 3.5:1 + area + tall3=4/23, C: 4:1 + area + tall3=5/23
+
+standard ad sizes caught per policy:
+  now (3:1, no area gate)      7/10  missed: ['160x600', '300x250', '336x280']
+  A: 3:1 + area<=1M            6/10  missed: ['160x600', '120x600', '300x250', '336x280']
+  B: 3.5:1 + area + tall3      8/10  missed: ['300x250', '336x280']
+  C: 4:1 + area + tall3        6/10  missed: ['234x60', '970x250', '300x250', '336x280']
+legit sizes wrongly dropped per policy:
+  now (3:1, no area gate)      8/13  lost: ['3000x1000', '1920x640', '4096x1024', '8000x2000', '1500x500', '600x200', '1400x400', '1000x250 crop']
+  A: 3:1 + area<=1M            4/13  lost: ['1500x500', '600x200', '1400x400', '1000x250 crop']
+  B: 3.5:1 + area + tall3      2/13  lost: ['1400x400', '1000x250 crop']
+  C: 4:1 + area + tall3        1/13  lost: ['1000x250 crop']
+
+### R-C-5/6: failure returns in media_downloader.py = 21
+  line  579  kind-present=False  error='Not enough parts for multi-thread based on min chunk size'
+  line  598  kind-present=False  error='f-string'
+  line  374  kind-present=False  error='Filtered as trash media (GIF/ICO/SVG)'
+  line  383  kind-present=False  error='Non-media file based on URL extension'
+  line  557  kind-present=False  error='f-string'
+  line  560  kind-present=False  error='f-string'
+  line  564  kind-present=False  error='Call'
+  line  613  kind-present=False  error='Combined file size mismatch'
+  line  622  kind-present=False  error='f-string'
+  line  324  kind-present=False  error='Download manually aborted'
+  line  406  kind-present=False  error='f-string'
+  line  474  kind-present=False  error='f-string'
+  line  415  kind-present=False  error='f-string'
+  line  461  kind-present=False  error='f-string'
+  line  463  kind-present=False  error='f-string'
+  line  490  kind-present=False  error='f-string'
+  line  543  kind-present=False  error='f-string'
+  line  504  kind-present=False  error='Download manually aborted'
+  line  438  kind-present=False  error='f-string'
+  line  528  kind-present=False  error='f-string'
+  line  517  kind-present=False  error='f-string'
+all returns tagged: False
+
+proposed kinds: {'network': 'penalize', 'http_5xx': 'penalize', 'http_429': 'penalize', 'http_4xx': 'forgive (dead link, not a host fault)', 'content_skip': 'forgive', 'size': 'forgive', 'local_io': 'forgive (disk)', 'aborted': 'forgive (user pressed Stop)'}
+
+error                                                    now penalises?  desired
+Non-media file based on URL extension                              True  forgive  MISMATCH
+Size mismatch: expected 1, got 2                                   True  forgive  MISMATCH
+HTTP error: 404                                                    True  forgive  MISMATCH
+HTTP error: 403                                                    True  forgive  MISMATCH
+HTTP error: 410                                                    True  forgive  MISMATCH
+HTTP error: 500                                                    True  penalize  ok
+HTTP error: 429                                                    True  penalize  ok
+Network error: boom                                                True  penalize  ok
+Disk write error: x                                                True  forgive  MISMATCH
+Could not create directory: x                                      True  forgive  MISMATCH
+Download manually aborted                                          True  forgive  MISMATCH
+Chunk failure(s): []                                               True  forgive  MISMATCH
+Combined file size mismatch                                        True  forgive  MISMATCH
+Combining/verifying error: x                                       True  forgive  MISMATCH
+Not enough parts for multi-thread based on min chunk siz           True  forgive  MISMATCH
+Webpage/script content (Content-Type: text/html)                  False  forgive  ok
+File too small (1KB < 40KB)                                       False  forgive  ok
+Filtered as trash media (GIF/ICO/SVG)                             False  forgive  ok
+
+### MT chunk check cost (2 threads, 2.5 MB legit JPEG)
+  now    :     8.5 ms  success=True
+  patched:     8.4 ms  success=True
+  delta  :    -0.1 ms  (header lookup per chunk)

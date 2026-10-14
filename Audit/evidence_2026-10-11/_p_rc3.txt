@@ -1,0 +1,111 @@
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 405 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 405 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 405 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: x. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+HEAD request failed for https://cdn.example.com/photo.jpg: 403 Client Error. Will attempt GET.
+Chunk C:\Users\sucot\AppData\Local\Temp\rc3r_i_z40qn9\photo.jpg.32a0.part0 failed: OSError - Webpage/script content (Content-Type: text/html)
+Chunk C:\Users\sucot\AppData\Local\Temp\rc3r_i_z40qn9\photo.jpg.32a0.part1 failed: OSError - Webpage/script content (Content-Type: text/html)
+Multi-threaded download failed for C:\Users\sucot\AppData\Local\Temp\rc3r_i_z40qn9\photo.jpg, falling back to single-threaded.
+Chunk C:\Users\sucot\AppData\Local\Temp\rc3r_wenreu0f\photo.jpg.32a0.part0 failed: OSError - Webpage/script content (Content-Type: text/html)
+Chunk C:\Users\sucot\AppData\Local\Temp\rc3r_wenreu0f\photo.jpg.32a0.part1 failed: OSError - Webpage/script content (Content-Type: text/html)
+Multi-threaded download failed for C:\Users\sucot\AppData\Local\Temp\rc3r_wenreu0f\photo.jpg, falling back to single-threaded.
+patched modules built; classes differ: True True
+
+case                                             BEFORE                         A(minimal)                     B(always)
+--------------------------------------------------------------------------------------------------------------------------------------------
+HEAD 403 -> GET text/html                        OK  - html=True                ERR Webpage/script content (C  ERR Webpage/script content (Content-Type: text/html) html=False
+HEAD 405 -> GET text/html                        OK  - html=True                ERR Webpage/script content (C  ERR Webpage/script content (Content-Type: text/html) html=False
+HEAD connection error -> GET text/html           ERR Webpage/script content (C  ERR Webpage/script content (C  ERR Webpage/script content (Content-Type: text/html) html=False
+HEAD 200 text/html                               ERR Webpage/script content (C  ERR Webpage/script content (C  ERR Webpage/script content (Content-Type: text/html) html=False
+HEAD 403 -> GET image/jpeg (HEAD refused)        OK  - html=False               OK  - html=False               OK  - html=False
+HEAD connection error -> GET image/jpeg          OK  - html=False               OK  - html=False               OK  - html=False
+HEAD 200 image/jpeg                              OK  - html=False               OK  - html=False               OK  - html=False
+HEAD 403 -> GET application/json                 OK  - html=False               ERR Webpage/script content (C  ERR Webpage/script content (Content-Type: application/json) html=False
+HEAD 200 image/jpeg but GET text/html (HEAD lies) ERR File too small (0.10KB <   ERR File too small (0.10KB <   ERR File too small (0.10KB < 40KB) html=False
+HEAD 200 without Content-Type, GET text/html     ERR Size mismatch: expected 1  ERR Size mismatch: expected 1  ERR Webpage/script content (Content-Type: text/html) html=False
+HEAD 200 image/jpeg, GET octet-stream (legit)    OK  - html=False               OK  - html=False               OK  - html=False
+HEAD 200 image/jpeg, GET no Content-Type         OK  - html=False               OK  - html=False               OK  - html=False
+
+DIFFERENCES vs the current code:
+  HEAD 403 -> GET text/html
+    now     : {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+    variant A: {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+    variant B: {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+  HEAD 405 -> GET text/html
+    now     : {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+    variant A: {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+    variant B: {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+  HEAD 403 -> GET application/json
+    now     : {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': False}
+    variant A: {'success': False, 'error': 'Webpage/script content (Content-Type: application/json)', 'files': [], 'html_on_disk': False}
+    variant B: {'success': False, 'error': 'Webpage/script content (Content-Type: application/json)', 'files': [], 'html_on_disk': False}
+  HEAD 200 without Content-Type, GET text/html
+    now     : {'success': False, 'error': 'Size mismatch: expected 120000, got 104', 'files': [], 'html_on_disk': False}
+    variant A: {'success': False, 'error': 'Size mismatch: expected 120000, got 104', 'files': [], 'html_on_disk': False}
+    variant B: {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+
+ASSERTIONS (post-patch semantics):
+  PASS  HEAD 403 + HTML GET is rejected
+  PASS  no HTML file left on disk
+  PASS  HEAD 403 + JPEG GET still downloads (no functional loss)
+  PASS  HEAD without response + JPEG GET still downloads
+  PASS  healthy path unchanged (HEAD 200 + JPEG)
+  PASS  HEAD 403 + JSON GET rejected
+
+ASSERTIONS (variant B):
+  PASS  VariantB rejects HTML when HEAD lied
+  PASS  VariantB rejects HTML when HEAD had no Content-Type
+  PASS  VariantB still accepts octet-stream (legit CDN label)
+  PASS  VariantB accepts a GET without Content-Type
+  PASS  VariantB accepts JPEG behind a HEAD-refusing host
+
+RESULT: ALL EXPECTATIONS MET
+
+==============================================================================
+RESIDUAL GAPS: lying HEAD and the multi-threaded path
+==============================================================================
+
+1) HEAD says image/jpeg (60041 B), GET says text/html
+   now  -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   A    -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   B    -> {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+
+2) HEAD 200 without Content-Type, GET text/html
+   now  -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   A    -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   B    -> {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+
+3) MT path: HEAD image/jpeg, ranged GETs return text/html (2500041 B, threads=2)
+   now  -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   A    -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   B    -> {'success': True, 'error': None, 'files': ['photo.jpg'], 'html_on_disk': True}
+   C    -> {'success': False, 'error': 'Webpage/script content (Content-Type: text/html)', 'files': [], 'html_on_disk': False}
+
+4) control: MT path with a real JPEG (2500004 B, threads=2)
+   now  -> success=True error=None
+   A    -> success=True error=None
+   B    -> success=True error=None
+   C    -> success=True error=None
+
+EXPECTED: C rejects the HTML in cases 1-3 and keeps case 4 working
+   A: html still saved, MT html saved, legit MT ok
+   B: html rejected, MT html saved, legit MT ok
+   C: html rejected, MT html rejected, legit MT ok

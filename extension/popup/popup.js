@@ -8,7 +8,7 @@ let activeDomainFilter = "";
 let activeSourceFilter = "";
 let concurrentLimit = 2;
 
-// FULLSIZE_SOURCES / LINKS_CAP come from shared.js (EXT-9).
+// FULLSIZE_SOURCES / DISCOVER_QUARANTINE_MS come from shared.js (EXT-9).
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
@@ -17,7 +17,8 @@ const selectAllCheckbox = document.getElementById("select-all");
 const oneShotCheckbox = document.getElementById("one-shot");
 const mediaList = document.getElementById("media-list");
 const countSpan = document.getElementById("count");
-const selectedCountSpan = document.getElementById("selected-count");
+// #selected-count / #chrome-count are NOT cached: their spans are rewritten by
+// innerHTML elsewhere, so they are re-queried where they are used.
 const statusDiv = document.getElementById("status");
 const pageInfoDiv = document.getElementById("page-info");
 const resultsDiv = document.getElementById("results");
@@ -30,13 +31,29 @@ const chromeCountSpan = document.getElementById("chrome-count");
 const deepParseWarning = document.getElementById("deep-parse-warning");
 const concurrentLimitInput = document.getElementById("concurrent-limit");
 
+// Errors.txt #3 (popup closed and re-opened): the two module filter variables were only
+// ever assigned by the select `change` listeners, the scan handler and applyScanResult's
+// "no fullsize sources" fallback. A REOPENED popup renders through restoreScanState →
+// applyScanResult, so it filtered by the initial "" (all sources) while the <select> still
+// showed its HTML default ("fullsize"): the list and the Save count covered every image
+// (measured: 141 before the popup closed, 429 after re-opening) until the user toggled the
+// filter, whose change handler finally copied the visible value. The DOM select is what
+// the user sees — start from it, and `change` keeps the pair in sync afterwards.
+activeDomainFilter = domainFilter.value;
+activeSourceFilter = sourceFilter.value;
+
 function updateOneShotMode() {
   const isDeepParse = !oneShotCheckbox.checked;
   deepParseWarning.classList.toggle("hidden", !isDeepParse);
   chromeDownloadBtn.disabled = isDeepParse || getVisibleCheckboxes().length === 0;
-  downloadBtn.textContent = isDeepParse ? "Parse Page" : "Download";
+  // The "Download N" counter lived in a <span> that `textContent = "Parse Page"`
+  // DELETED, and the reference to it kept pointing at the detached node: one
+  // toggle of "Page only" and the button showed a bare "Download" for the rest
+  // of the popup's life (measured). Rebuild the span and re-count instead.
+  downloadBtn.innerHTML = isDeepParse ? "Parse Page" : 'Send to App <span id="selected-count">0</span>';
   downloadBtn.disabled = false;
   concurrentLimitInput.disabled = isDeepParse;
+  updateCount();
 }
 
 oneShotCheckbox.addEventListener("change", updateOneShotMode);
@@ -51,11 +68,14 @@ async function checkConnection() {
       if (resp.files_downloaded > 0) parts.push(`D: ${resp.files_downloaded}`);
       statusDiv.textContent = parts.join(" | ");
       statusDiv.className = "status online";
+      // "Q: 2 | D: 5" is the product's own shorthand - spell it out on hover.
+      statusDiv.title = "Desktop app connected — Q: queued tasks, D: files downloaded";
       return true;
     }
   } catch (e) {}
   statusDiv.textContent = "Disconnected";
   statusDiv.className = "status offline";
+  statusDiv.title = "Desktop app not running — scanning works, sending items needs the app";
   return false;
 }
 
@@ -139,9 +159,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const p = changes.scanProgress.newValue;
     if (!p) return;
     if (p.status === "scanning") {
-      // The x/y counter counts LINKED PAGES probed for fullsize discovery,
-      // capped at LINKS_CAP=50 — not media found. Surface the found count
-      // too so the numbers mean something (Errors.txt #2).
+      // The x/y counter counts LINKED PAGES probed for fullsize discovery — no content
+      // cap, only the 45s page budget and the postponed-tier sub-budget end it. It is not
+      // "media found"; surface that count too so the numbers mean something (Errors.txt #2).
       scanBtn.textContent = p.phase === "links" && p.total > 0
         ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
         : "Scanning...";
@@ -174,6 +194,8 @@ function applyScanResult(result) {
   mediaItems.length = 0;
   mediaItems.push(...result.media);
   pageInfoDiv.textContent = result.title || result.pageUrl || "";
+  // The line is ellipsized at 480px; keep the full value reachable.
+  pageInfoDiv.title = [result.title, result.pageUrl].filter(Boolean).join("\n");
   pageInfoDiv.classList.remove("hidden");
   populateDomainFilter();
   // Fallback to "all" if no fullsize sources found
@@ -189,23 +211,50 @@ function applyScanResult(result) {
   setTimeout(() => { scanBtn.textContent = "Scan This Page"; }, 2500);
 }
 
+// Errors.txt #2: a download must not resize the Save button. Its width is exactly what the
+// actions row reacts to (two labels + two buttons on a 480px popup, slack ≈ 0): re-writing
+// the label to "Saving 12/141 (3 ok)..." grew the button, the row wrapped to a second line,
+// the buttons landed at the LEFT edge (measured: left 230 -> 14) and space-between threw
+// "Parallel:" to the right edge (94 -> 371) — i.e. "the two left controls vanish and the
+// buttons take their place". The row is now pinned in CSS, and this button's label is
+// CONSTANT: state travels by colour (data-state + popup.css) and by the status line.
+function setSaveState(state, statusText) {
+  if (state === "idle") {
+    chromeDownloadBtn.removeAttribute("data-state");
+    checkConnection(); // put "Q: … | D: …" / "Disconnected" back
+    return;
+  }
+  chromeDownloadBtn.dataset.state = state;
+  if (state === "saving") {
+    statusDiv.className = "status saving";
+  } else if (state === "done") {
+    statusDiv.className = "status online";
+  }
+  if (statusText) {
+    statusDiv.textContent = statusText;
+    statusDiv.title = statusText;
+  }
+}
+
 function updateDownloadProgressUI(d) {
   if (!d || d.total === 0) return;
   if (d.status === "done") {
     const failed = (d.failed || 0);
-    chromeDownloadBtn.innerHTML = `✓ Saved ${d.saved}${failed ? ` (${failed} failed)` : ""}`;
+    setSaveState("done", `\u2713 Saved ${d.saved} of ${d.total}${failed ? ` (${failed} failed)` : ""}`);
     chromeDownloadBtn.disabled = false;
+    downloadBtn.disabled = false;
     try {
       chrome.action.setBadgeText({ text: `${d.saved}` });
       chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
     } catch (e) {}
     setTimeout(() => {
-      chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
+      setSaveState("idle");
       updateCount();
     }, 3000);
   } else if (d.status === "active") {
-    chromeDownloadBtn.innerHTML = `Saving ${d.started}/${d.total} (${d.saved} ok)...`;
+    setSaveState("saving", `Saving ${d.started}/${d.total}\u2026 (${d.saved} saved)`);
     chromeDownloadBtn.disabled = true;
+    downloadBtn.disabled = true;
   }
 }
 
@@ -288,6 +337,11 @@ function renderMediaList() {
   });
 
   if (filtered.length === 0) {
+    // "No media found on this page" was shown for a filter that hides everything
+    // too - the page does have media, the FILTER is the reason. Say which one.
+    emptyDiv.querySelector("p").textContent = mediaItems.length === 0
+      ? "No media found on this page."
+      : "No items match the filters — pick another source or domain above.";
     resultsDiv.classList.add("hidden");
     emptyDiv.classList.remove("hidden");
     return;
@@ -301,30 +355,43 @@ function renderMediaList() {
     const div = document.createElement("div");
     div.className = "media-item";
 
-    // Checkbox
+    // Checkbox — named for screen readers; the row's own text is the URL.
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.checked = true;
     checkbox.dataset.index = globalIndex;
+    checkbox.setAttribute("aria-label", `Select ${item.url}`);
     checkbox.addEventListener("change", updateCount);
 
-    // Thumbnail or placeholder
-    const thumb = document.createElement("div");
-    thumb.className = "thumb placeholder";
-    thumb.textContent = item.type === "video" ? "\u25B6" : "\uD83D\uDCF7";
+    // Preview: a real <button> that opens the item in a new tab. It used to be
+    // an image/div with `cursor: pointer` and no handler - a click that did
+    // nothing - and, being neither focusable nor a control, unreachable by
+    // keyboard.
+    const thumb = document.createElement("button");
+    thumb.type = "button";
+    thumb.className = "thumb";
+    thumb.title = "Open in a new tab";
+    thumb.setAttribute("aria-label", `Open ${item.url} in a new tab`);
+    thumb.addEventListener("click", () => { chrome.tabs.create({ url: item.url }); });
+
+    const glyph = document.createElement("span");
+    glyph.className = "thumb-glyph";
+    glyph.textContent = item.type === "video" ? "\u25B6" : "\uD83D\uDCF7";
+    thumb.appendChild(glyph);
 
     // Lazy-load thumbnail for images
     if (item.type === "image" && item.url) {
       const img = new Image();
       img.src = item.url;
-      img.className = "thumb";
+      img.className = "thumb-img";
+      img.alt = "";
       img.style.display = "none";
       img.onload = () => {
-        thumb.style.display = "none";
+        glyph.style.display = "none";
         img.style.display = "block";
       };
       img.onerror = () => {};
-      div.appendChild(img);
+      thumb.appendChild(img);
     }
     div.appendChild(thumb);
 
@@ -393,13 +460,27 @@ function updateCount() {
     return true;
   }).length;
 
-  selectedCountSpan.textContent = checkedCount;
-  // Re-query chromeCountSpan in case innerHTML was replaced
+  // Both counters are re-queried: their spans live inside button labels that
+  // other code rewrites via innerHTML, so the cached references go stale.
+  const sc = document.getElementById("selected-count");
+  if (sc) sc.textContent = checkedCount;
   const cc = document.getElementById("chrome-count");
   if (cc) cc.textContent = checkedCount;
-  countSpan.textContent = `${checkedCount} / ${total}`;
-  downloadBtn.disabled = checkedCount === 0;
-  chromeDownloadBtn.disabled = !oneShotCheckbox.checked || checkedCount === 0;
+  countSpan.textContent = `${checkedCount} / ${total} selected`;
+  countSpan.title = `${checkedCount} of the ${total} listed items selected`;
+  const noneSelected = checkedCount === 0;
+  // A disabled control without a reason reads as a broken one: keep the button
+  // in place and say what is missing on hover.
+  downloadBtn.disabled = noneSelected;
+  downloadBtn.title = noneSelected
+    ? "Select at least one item first"
+    : "Send the selected items to the desktop app queue";
+  chromeDownloadBtn.disabled = !oneShotCheckbox.checked || noneSelected;
+  chromeDownloadBtn.title = !oneShotCheckbox.checked
+    ? "Available only with Page only ticked"
+    : noneSelected
+      ? "Select at least one item first"
+      : "Save the selected files with Chrome's own downloader";
   selectAllCheckbox.checked = checkedCount === total && total > 0;
 }
 
@@ -435,7 +516,8 @@ chromeDownloadBtn.addEventListener("click", async () => {
   if (selected.length === 0) return;
 
   chromeDownloadBtn.disabled = true;
-  chromeDownloadBtn.innerHTML = `Saving <span>${selected.length}</span>...`;
+  downloadBtn.disabled = true;
+  setSaveState("saving", `Saving ${selected.length} file(s)\u2026`);
 
   // Send to background for download. Live per-file progress arrives via
   // storage.onChanged (downloadProgress) — the popup is not blocked until
@@ -446,20 +528,29 @@ chromeDownloadBtn.addEventListener("click", async () => {
     const resp = await chrome.runtime.sendMessage({ action: "chromeDownload", items: selected, concurrentLimit });
     const saved = resp && resp.saved ? resp.saved : 0;
     if (saved > 0) {
-      chromeDownloadBtn.innerHTML = `\u2713 Saved ${saved}`;
+      setSaveState("done", `\u2713 Saved ${saved}`);
       try {
         await chrome.action.setBadgeText({ text: `${saved}` });
         await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
       } catch (e) {}
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 5000 });
       setTimeout(() => {
-        chromeDownloadBtn.innerHTML = `Save (Chrome) <span id="chrome-count">0</span>`;
+        setSaveState("idle");
         chromeDownloadBtn.disabled = false;
+        downloadBtn.disabled = false;
         updateCount();
       }, 3000);
+    } else {
+      setSaveState("idle");
+      chromeDownloadBtn.disabled = false;
+      downloadBtn.disabled = false;
+      updateCount();
     }
   } catch (e) {
     showError(`Download failed: ${e.message}`);
+    setSaveState("idle");
+    chromeDownloadBtn.disabled = false;
+    downloadBtn.disabled = false;
     updateCount();
   }
 });
@@ -492,8 +583,9 @@ downloadBtn.addEventListener("click", async () => {
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
     }
     setTimeout(() => {
-      downloadBtn.innerHTML = "Download";
+      downloadBtn.innerHTML = !oneShotCheckbox.checked ? "Parse Page" : 'Send to App <span id="selected-count">0</span>';
       downloadBtn.disabled = false;
+      updateCount();
     }, 1500);
     await checkConnection();
     return;
@@ -533,7 +625,7 @@ downloadBtn.addEventListener("click", async () => {
   } else if (resp && resp.ok) {
     downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
-      downloadBtn.textContent = "Download";
+      downloadBtn.innerHTML = 'Send to App <span id="selected-count">0</span>';
       downloadBtn.disabled = false;
       updateCount();
     }, 1500);
@@ -590,7 +682,13 @@ async function updateSieveInfo() {
   }
 }
 
-document.getElementById("sieve-file").addEventListener("change", async (e) => {
+// The file dialog is opened by a focusable button, not by a click handler on
+// static text: #sieve-btn and #sieve-update-btn were <span>s, so the keyboard
+// could not reach either of these actions at all.
+const sieveFileInput = document.getElementById("sieve-file");
+document.getElementById("sieve-btn").addEventListener("click", () => sieveFileInput.click());
+
+sieveFileInput.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
 
@@ -627,6 +725,6 @@ document.getElementById("sieve-update-btn").addEventListener("click", async () =
   } catch (e) {
     infoEl.textContent = `Update error: ${e.message}`;
   }
-  btn.textContent = "Update sieve now";
+  btn.textContent = "Update now";
   setTimeout(updateSieveInfo, 1500);
 });

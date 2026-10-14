@@ -77,7 +77,13 @@ function fakeDoc(imgs = [], anchors = [], sources = []) {
   };
 }
 
-const anchor = (href) => ({ getAttribute: () => href });
+// An anchor stub with no media of its own: page_link() in content_script.js now
+// asks an anchor whether it PRESENTS media (img child / background image), so the
+// stub has to answer querySelector and a style lookup like a real element.
+const anchor = (href) => ({
+  getAttribute: (name) => (name === "style" ? null : href),
+  querySelector: () => null,
+});
 
 // --- R-E-7 (NEW-1): a data: placeholder is not media ----------------------
 

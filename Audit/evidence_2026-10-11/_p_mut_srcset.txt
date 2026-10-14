@@ -1,0 +1,14 @@
+ok: $10 before $1
+ok: string rule transforms
+FAIL: off:1 rule is skipped (R-E-9)
+  expected: null
+  actual:   "https://evil/42.jpg"
+ok: off:0 rule still applies
+FAIL: #ext# expands to every variant
+  expected: ["https://cdn.example/jpg","https://cdn.example/png"]
+  actual:   ["jpg"]
+ok: bare first candidate must not hide 600w/1.5x
+ok: largest w wins
+ok: largest x wins
+ok: bare only
+2 failure(s) (mutation srcset)

@@ -3,13 +3,18 @@
  * Loads sieve rules into storage and communicates with desktop app.
  */
 
-// EXT-9: shared constants (FULLSIZE_SOURCES, LINKS_CAP) — single source.
+// EXT-9: shared constants (FULLSIZE_SOURCES, DISCOVER_QUARANTINE_MS) — single source.
 // sieve.js: parseSieve/applySieveRules — used by handleStartScan (the scan
 // moved from the popup into the SW so it survives popup close, ERR-4).
 // sieve_updater.js: online sieve update (R-E-8) — a CLASSIC script on purpose;
 // a classic worker refuses dynamic import() of a module, which is why the
 // update flow used to be dead code.
-importScripts("shared.js", "sieve.js", "sieve_updater.js");
+// Firefox has no service-worker background: it runs these same files as plain
+// background scripts (manifest "background.scripts"), loaded in order into ONE
+// shared global, and there `importScripts` does not exist. Guarded, not removed:
+// Chrome keeps loading them here, Firefox via the manifest. Either way the three
+// files are evaluated before this one, so the globals below stay identical.
+if (typeof importScripts === "function") importScripts("shared.js", "sieve.js", "sieve_updater.js");
 
 const API_BASE = "http://127.0.0.1:19876";
 const SIEVE_VERSION = "2026.07.15"; // Bump when shipping new sieve.json
@@ -244,11 +249,74 @@ function applyResizeUpgrade(url) {
   }
 }
 
+/**
+ * Errors.txt (e-hentai.gallery): what a probed page's <img> dump means.
+ *
+ * A DETAIL page (the classic "thumbnail links to a bigger version") presents
+ * ONE image — that is the full-size URL, source "linked-img" (a FULLSIZE
+ * source since R-E-4). A GRID/index page presents many: its images are the
+ * page's own thumbnails, so calling them full size is a lie the popup then
+ * shows in its "Full size" view (measured: e-hentai's front page / /popular /
+ * tag pages contributed 285 thumbnails with source linked-img). They are kept
+ * — the URL is real media — but demoted to "page-img", which is NOT in
+ * FULLSIZE_SOURCES, so they land in the popup's "Thumbnails" bucket instead.
+ *
+ * @param {number} count — candidate image count on the probed page
+ * @returns {"linked-img"|"page-img"}
+ */
+function classifyPageImages(count) {
+  return count === 1 ? "linked-img" : "page-img";
+}
+
+// Discovery step 2: cross-scan cache of probe results. A broken, empty or unavailable
+// cache must never break a scan, so every storage call is guarded and caching degrades to
+// "probe the network" (the pre-step-2 behaviour).
+async function loadDiscoverCache() {
+  try {
+    const st = await chrome.storage.session.get(DISCOVER_CACHE_KEY);
+    const raw = st && st[DISCOVER_CACHE_KEY];
+    if (!raw || typeof raw !== "object") return {};
+    const now = Date.now();
+    const fresh = {};
+    for (const [url, entry] of Object.entries(raw)) {
+      if (entry && Array.isArray(entry.items) && now - entry.ts < DISCOVER_CACHE_TTL_MS) fresh[url] = entry;
+    }
+    return fresh;
+  } catch (e) {
+    return {};
+  }
+}
+
+async function saveDiscoverCache(cache) {
+  try {
+    const newest = Object.entries(cache)
+      .sort((a, b) => b[1].ts - a[1].ts)
+      .slice(0, DISCOVER_CACHE_MAX);
+    await chrome.storage.session.set({ [DISCOVER_CACHE_KEY]: Object.fromEntries(newest) });
+  } catch (e) {
+    // quota reached or session storage unavailable: an optimisation is never a requirement
+  }
+}
+
 async function discoverFullsize(links, pageUrl, onProgress) {
   const discovered = [];
   const seen = new Set();
 
-  async function processLink(linkUrl) {
+  // Host state for THIS scan. Keyed by origin (scheme+host+port), not by hostname:
+  // `new URL(...).hostname` drops the port, so a hanging `host:8080` would demote a healthy
+  // `host:443` — real sites do advertise ports (mirror CDNs).
+  const originOf = (u) => { try { return new URL(u).origin; } catch (e) { return "?"; } };
+  const failedOrigins = new Set(); // demoted to the postponed tier
+  const backoffUntil = new Map();  // origin -> earliest timestamp for its next probe
+  const strikes = new Map();       // origin -> consecutive host failures (exponential backoff)
+
+  // Both tiers honour DISCOVER_PER_ORIGIN; the global DISCOVER_CONCURRENCY stays the cap.
+  const inChunk = (chunk, origin) => chunk.filter((p) => p.origin === origin).length;
+  const eligible = (p, chunk, now) => !failedOrigins.has(p.origin)
+    && (backoffUntil.get(p.origin) || 0) <= now
+    && inChunk(chunk, p.origin) < DISCOVER_PER_ORIGIN;
+
+  async function processLink(linkUrl, report) {
     try {
       // Try to apply sieve url pattern (string transforms + optional POST data)
       let fetchOptions = {
@@ -297,7 +365,18 @@ async function discoverFullsize(links, pageUrl, onProgress) {
       }
 
       const resp = await fetch(linkUrl, fetchOptions);
-      if (!resp.ok) return [];
+      if (!resp.ok) {
+        // A host-level failure (throttled / broken origin) postpones the origin's other
+        // links. A 404 or a page without media says nothing about the origin and must not
+        // demote it — e-hentai alone is full of media-less pages (forums, ?act=expunge,
+        // tag lists) served by hosts that also hold good detail pages.
+        if (resp.status === 429 || resp.status >= 500) {
+          report.hostFailed = true;
+          if (resp.status === 429) report.throttled = true;
+        }
+        return [];
+      }
+      report.cacheable = true; // a 200 is knowledge worth reusing; failures are not
       const ct = resp.headers.get("content-type") || "";
       if (ct.includes("image/") || ct.includes("video/")) {
         return [{ url: linkUrl, type: ct.includes("video/") ? "video" : "image", pageUrl, source: "link-direct" }];
@@ -306,6 +385,7 @@ async function discoverFullsize(links, pageUrl, onProgress) {
 
       const html = await resp.text();
       const results = [];
+      let ruleMatched = false;
 
       // 1. Try sieve res patterns
       for (const [name, { linkRegex, resPattern }] of Object.entries(cachedSieveRes)) {
@@ -324,6 +404,7 @@ async function discoverFullsize(links, pageUrl, onProgress) {
                 seen.add(imgUrl);
                 results.push({ url: imgUrl, type: "image", pageUrl, source: "sieve-res" });
                 foundAny = true;
+                ruleMatched = true;
               }
             }
           }
@@ -331,8 +412,14 @@ async function discoverFullsize(links, pageUrl, onProgress) {
         if (foundAny) break;
       }
 
+      // A rule matched: the site's own knowledge picked the image. The <img>
+      // dump below is a blind regex over the whole document and would only add
+      // noise (page furniture, thumbnails) next to it.
+      if (ruleMatched) return results;
+
       // 2. Fallback: scan <img> src from HTML
       const SRC_RE = /<img[^>]+src=["']([^"']+)["']/gi;
+      const candidates = [];
       let m;
       while ((m = SRC_RE.exec(html)) !== null) {
         let url = m[1];
@@ -340,11 +427,17 @@ async function discoverFullsize(links, pageUrl, onProgress) {
         if (url.startsWith("http") && !seen.has(url) && url !== linkUrl
             && /\.(jpe?g|webp|avif|heic|bmp|tiff?)$/i.test(url)) {
           seen.add(url);
-          results.push({ url, type: "image", pageUrl, source: "linked-img" });
+          candidates.push(url);
         }
+      }
+      const source = classifyPageImages(candidates.length);
+      for (const url of candidates) {
+        results.push({ url, type: "image", pageUrl, source });
       }
       return results;
     } catch (e) {
+      // Network error / AbortSignal.timeout: the origin did not answer in time.
+      report.hostFailed = true;
       return [];
     }
   }
@@ -352,19 +445,99 @@ async function discoverFullsize(links, pageUrl, onProgress) {
   // B-4: shared page-level deadline (mirrors desktop FULLSIZE_DISCOVER_TIME_BUDGET).
   // A page full of dead hosts must not stall the popup for minutes.
   const deadline = Date.now() + 45000;
-  // Process links in chunks of DISCOVER_CONCURRENCY
-  for (let i = 0; i < links.length; i += DISCOVER_CONCURRENCY) {
+  // Inside a fixed deadline the ORDER decides the result set, so links are worked in ONE
+  // pass with a host-tier queue: a link whose origin has not failed yet is probed first,
+  // and an origin that fails is POSTPONED (not blocked — a slow host keeps its second
+  // chance) to the tail, which is drained last under DISCOVER_QUARANTINE_MS. Measured on
+  // 60 hanging + 120 live links: 0/120 results in 48s before this, 120/120 in 8.7s after,
+  // with the scan over at 16.8s instead of held to the full 45s.
+  const quarantineDeadline = Date.now() + DISCOVER_QUARANTINE_MS;
+  const cache = await loadDiscoverCache();
+  let cacheDirty = false;
+  const queue = [];
+  let scanned = 0;
+
+  // Cache pass first: a cached link is free — no fetch, no politeness slot.
+  for (const url of links) {
+    const hit = cache[url];
+    if (hit) {
+      for (const item of hit.items) {
+        if (!seen.has(item.url)) {
+          seen.add(item.url);
+          discovered.push(item);
+        }
+      }
+      scanned += 1;
+      continue;
+    }
+    queue.push({ url, origin: originOf(url) });
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  while (queue.length > 0) {
     if (Date.now() >= deadline) {
       console.info("discoverFullsize: 45s budget exhausted; remaining links skipped");
       break;
     }
-    const chunk = links.slice(i, i + DISCOVER_CONCURRENCY);
-    const results = await Promise.all(chunk.map(processLink));
-    for (const r of results) discovered.push(...r);
-    if (onProgress) {
-      onProgress(Math.min(i + chunk.length, links.length), links.length, discovered.length);
+    const now = Date.now();
+    const chunk = [];
+    for (let i = 0; i < queue.length && chunk.length < DISCOVER_CONCURRENCY; i++) {
+      if (!eligible(queue[i], chunk, now)) continue;
+      chunk.push(queue.splice(i, 1)[0]);
+      i--;
     }
+    if (chunk.length === 0) {
+      // Nothing responsive is left. Either the postponed tier (origins that failed) gets its
+      // bounded slice, or every remaining link is on an origin we owe a pause — waiting out
+      // the shortest backoff is the point of the backoff, so wait instead of hammering.
+      if (Date.now() < quarantineDeadline) {
+        for (let i = 0; i < queue.length && chunk.length < DISCOVER_CONCURRENCY; i++) {
+          if (!failedOrigins.has(queue[i].origin)) continue;
+          if (!eligible(queue[i], chunk, now)) continue;
+          chunk.push(queue.splice(i, 1)[0]);
+          i--;
+        }
+      }
+      if (chunk.length === 0) {
+        const pending = [...backoffUntil.values()].filter((t) => t > Date.now());
+        if (pending.length > 0) {
+          const wait = Math.min(Math.min(...pending) - Date.now(), deadline - Date.now());
+          if (wait > 0) {
+            await sleep(wait);
+            continue;
+          }
+        }
+        console.info(`discoverFullsize: ${queue.length} link(s) left unprobed (postponed origins, budget)`);
+        break;
+      }
+    }
+    const reports = chunk.map(() => ({}));
+    const results = await Promise.all(chunk.map((p, i) => processLink(p.url, reports[i])));
+    for (let i = 0; i < chunk.length; i++) {
+      const origin = chunk[i].origin;
+      if (reports[i].hostFailed) {
+        failedOrigins.add(origin);
+        const n = (strikes.get(origin) || 0) + 1;
+        strikes.set(origin, n);
+        backoffUntil.set(origin, Date.now() + Math.min(DISCOVER_BACKOFF_MS * Math.pow(2, n - 1), DISCOVER_BACKOFF_MAX_MS));
+        console.info(`discoverFullsize: ${origin} postponed (${reports[i].throttled ? "throttled" : "failed"})`);
+      } else {
+        strikes.delete(origin);
+      }
+      if (reports[i].cacheable) {
+        cache[chunk[i].url] = { ts: Date.now(), items: results[i] };
+        cacheDirty = true;
+      }
+      // Push unconditionally: processLink's own scan already dedupes against `seen` (it
+      // adds every candidate it accepts before returning it), so filtering here drops
+      // every result that page produced.
+      for (const r of results[i]) discovered.push(r);
+    }
+    scanned += chunk.length;
+    if (onProgress) onProgress(scanned, links.length, discovered.length);
   }
+
+  if (cacheDirty) await saveDiscoverCache(cache);
 
   return { media: discovered };
 }
@@ -508,10 +681,10 @@ async function handleStartScan(tabId) {
 
     if (response.links && response.links.length > 0) {
       progress.phase = "links";
-      progress.total = Math.min(response.links.length, LINKS_CAP);
+      progress.total = response.links.length;
       try { await chrome.storage.local.set({ scanProgress: progress }); } catch (e) {}
       const linked = await discoverFullsize(
-        response.links.slice(0, LINKS_CAP), pageUrl,
+        response.links, pageUrl,
         (scanned, total, found) => {
           progress.scanned = scanned;
           progress.total = total;
@@ -854,7 +1027,7 @@ async function commandScanAndProcess(action) {
   let media = response.media;
   if (response.links && response.links.length > 0) {
     await setBadge("...", "#FFA000");
-    const linked = await discoverFullsize(response.links.slice(0, LINKS_CAP), response.url);
+    const linked = await discoverFullsize(response.links, response.url);
     if (linked && linked.media) {
       media = media.concat(linked.media);
     }

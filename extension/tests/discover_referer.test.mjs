@@ -12,15 +12,19 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(join(here, "..", "background.js"), "utf8");
 
-// Extract `async function processLink(linkUrl) { ... }` by brace counting
+// Extract `async function processLink(linkUrl, report) { ... }` by brace counting
 // (its body contains nested braces, so the simple non-greedy regex used for
-// applyUrlTransform cannot be reused).
-const startMarker = "async function processLink(linkUrl) {";
-const start = src.indexOf(startMarker);
-if (start < 0) {
+// applyUrlTransform cannot be reused). The parameter list is matched loosely:
+// the per-scan reporting object was added to the signature (host-failure
+// classification + cache admission), and this test is about the FETCH, not
+// about how many arguments the function grew.
+const startMarker = /async function processLink\([^)]*\) \{/;
+const marker = startMarker.exec(src);
+if (!marker) {
   console.error("FAIL: processLink not found in background.js");
   process.exit(1);
 }
+const start = marker.index;
 let depth = 0;
 let end = start;
 for (let i = start; i < src.length; i++) {
@@ -46,10 +50,17 @@ function makeProcessLink(fetchStub) {
   function applyUrlTransform() { return null; }
   const seen = new Set();
   const pageUrl = "https://pr.reactor.cc/post/6064303";
-  return new Function(
+  const report = {};
+  const processLink = new Function(
     "cachedSieveRes", "applyUrlTransform", "seen", "pageUrl", "fetch",
     `return (${src.slice(start, end)})`
   )(cachedSieveRes, applyUrlTransform, seen, pageUrl, fetchStub);
+  // processLink(linkUrl, report): the caller owns the per-scan report object
+  // (discoverFullsize passes a fresh {} per probe), so the test does too.
+  return {
+    report,
+    processLink: (url) => processLink(url, report),
+  };
 }
 
 let failures = 0;
@@ -69,7 +80,7 @@ const PAGE_URL = "https://pr.reactor.cc/post/6064303";
 // 1. Referer header must be sent on the fetch
 {
   let capturedHeaders = null;
-  const processLink = makeProcessLink(async (url, opts) => {
+  const { processLink } = makeProcessLink(async (url, opts) => {
     capturedHeaders = opts.headers;
     return { ok: true, headers: { get: () => "image/jpeg" } };
   });
@@ -80,7 +91,7 @@ const PAGE_URL = "https://pr.reactor.cc/post/6064303";
 
 // 2. An image/jpeg response yields a link-direct fullsize item
 {
-  const processLink = makeProcessLink(async () => ({
+  const { processLink } = makeProcessLink(async () => ({
     ok: true,
     headers: { get: () => "image/jpeg" },
   }));
@@ -91,7 +102,7 @@ const PAGE_URL = "https://pr.reactor.cc/post/6064303";
 
 // 3. Non-ok responses still return nothing (no regression)
 {
-  const processLink = makeProcessLink(async () => ({ ok: false }));
+  const { processLink } = makeProcessLink(async () => ({ ok: false }));
   const items = await processLink(THUMB);
   check("non-ok -> empty", items.length, 0);
 }

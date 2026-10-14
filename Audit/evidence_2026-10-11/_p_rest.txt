@@ -1,0 +1,74 @@
+json_parser patch built (adds K.JSON_PAGINATION_KEY_PATTERNS usage)
+
+shape                              now  patched  detail
+------------------------------------------------------------------------------
+control flat                         1        1  ['https://cdn.example.com/pic.jpg']
+control dict+url                     1        1  ['https://cdn.example.com/pic.jpg']
+data wrapper                         0        1  ['https://cdn.example.com/pic.jpg']
+media wrapper                        0        1  ['https://cdn.example.com/pic.jpg']
+dict with src                        0        1  ['https://cdn.example.com/pic.jpg']
+metadata (substring 'data')          0        1  ['https://cdn.example.com/pic.jpg']
+realistic API                        0        1  ['https://cdn.example.com/pic.jpg']
+wp-style gallery                     0        1  ['https://cdn.example.com/pic.jpg']
+asset key                            0        1  ['https://cdn.example.com/pic.jpg']
+assets list                          0        1  ['https://cdn.example.com/pic.jpg']
+
+attrs preserved for list-of-dict-with-url: [{'width': 1200, 'source': 'json-images', 'path': 'images'}]
+
+pagination shape                              now  patched
+------------------------------------------------------------------------------
+control top-level                               1        1  ['https://api.example.com/feed?page=2']
+nested in data                                  0        1  ['https://api.example.com/feed?page=2']
+nested meta.pagination                          0        1  ['https://api.example.com/feed?page=2']
+links.url form                                  1        1  ['https://api.example.com/feed?page=2']
+generic url key (must NOT become a link)        0        0  []
+href key (must NOT become a link)               0        0  []
+
+fair payload: 0.7 MB, wrapped: 0.7 MB, 4000 items
+  _extract_media_from_json     fair: now= 181.8 ms  patched= 188.6 ms (overhead x1.04)  wrapped(patched)= 181.2 ms  media 4000->4000/4000  links 0->0/0
+  _extract_links_from_json     fair: now=   0.0 ms  patched=  20.9 ms (overhead x29876.86)  wrapped(patched)=  20.8 ms  media 0->0/0  links 0->1/1
+
+R-C-2 visibility: proposed keyword list = ['display: none', 'display:none', 'visibility: hidden', 'visibility:hidden', 'left: -999', 'top: -999']
+
+style                              expected    now    new  verdict
+opacity: 0.9                          False   True  False  ok
+width: 0.5px                          False   True  False  ok
+height: 0.5em                         False   True  False  ok
+max-width: 0.5%                       False   True  False  ok
+font-size: 0.9em                      False  False  False  ok
+opacity: 0                             True   True   True  ok
+opacity:0                              True   True   True  ok
+width: 0                               True   True   True  ok
+width:0px                              True  False   True  ok
+height: 0                              True   True   True  ok
+height:0%                              True  False   True  ok
+display: none                          True   True   True  ok
+display:none                           True   True   True  ok
+visibility: hidden                     True   True   True  ok
+left: -9999px                          True   True   True  ok
+top: -9999px                           True   True   True  ok
+width: 100%                           False  False  False  ok
+opacity: 1                            False  False  False  ok
+color: #c00; width: 0.5em             False   True  False  ok
+width: 0.5em; height: 12px            False   True  False  ok
+border-width: 0.5px                   False   True  False  ok
+opacity: 0.05                         False   True  False  ok
+  new-rule mismatches: 0  (now-rule mismatches: 10)
+
+size                        desired    now    new  verdict
+1x1 tracker                    True   True   True  ok
+728x90 leaderboard             True   True   True  ok
+300x250 MPU                   False  False  False  ok
+970x250 billboard              True   True   True  ok
+160x600 skyscraper             True  False  False  MISMATCH
+1200x800 photo                False  False  False  ok
+3000x1000 panorama            False   True  False  ok
+1920x640 wallpaper            False   True  False  ok
+4096x1024 pano                False   True  False  ok
+8000x2000 pano                False   True  False  ok
+1920x1080 video               False  False  False  ok
+600x200 thumb                 False   True   True  MISMATCH
+4000x200 extreme               True   True   True  ok
+100x600 tall                   True   True   True  ok
+400x900 tall legit            False  False  False  ok
+  mismatches vs desired: 2; existing test cases preserved: True True True

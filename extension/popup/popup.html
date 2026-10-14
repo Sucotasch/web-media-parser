@@ -7,7 +7,7 @@
 <body>
   <div class="header">
     <h1>Web Media Parser</h1>
-    <div id="status" class="status offline">Disconnected</div>
+    <div id="status" class="status offline" aria-live="polite">Disconnected</div>
   </div>
 
   <div id="scan-section">
@@ -17,7 +17,7 @@
 
   <div id="results" class="hidden">
     <div class="results-header">
-      <span id="count">0 items</span>
+      <span id="count">0 / 0 selected</span>
       <div class="results-controls">
         <select id="domain-filter" class="domain-filter">
           <option value="">All domains</option>
@@ -35,18 +35,22 @@
 
     <div class="actions">
       <label><input type="checkbox" id="one-shot" checked> Page only</label>
-      <label class="concurrent-limit-label">
-        Max: <input type="number" id="concurrent-limit" min="1" max="10" value="2" style="width: 45px; margin-left: 8px;">
+      <label class="concurrent-limit-label" for="concurrent-limit"
+             title="How many files Chrome saves at the same time">Parallel:
+        <input type="number" id="concurrent-limit" class="concurrent-limit-input"
+               min="1" max="10" value="2" aria-label="Parallel Chrome downloads">
       </label>
       <div id="deep-parse-warning" class="deep-parse-warning hidden">
         Deep parse: page URL sent to desktop app for full discovery. Chrome Save unavailable.
       </div>
       <div class="actions-buttons">
-        <button id="chrome-download-btn" class="secondary" disabled>
-          Save (Chrome) <span id="chrome-count">0</span>
+        <button id="download-btn" class="primary" disabled
+                title="Send the selected items to the desktop app queue">
+          Send to App <span id="selected-count">0</span>
         </button>
-        <button id="download-btn" class="primary" disabled>
-          Download <span id="selected-count">0</span>
+        <button id="chrome-download-btn" class="save-green" disabled
+                title="Save the selected files with Chrome's own downloader">
+          Save (Chrome) <span id="chrome-count">0</span>
         </button>
       </div>
     </div>
@@ -57,12 +61,14 @@
   </div>
 
   <div class="footer">
-    <div id="sieve-info" class="sieve-info"></div>
-    <label class="sieve-upload">
-      <input type="file" id="sieve-file" accept=".json" style="display:none">
-      <span id="sieve-btn" class="sieve-link">Load sieve rules...</span>
-    </label>
-    <span id="sieve-update-btn" class="sieve-link">Update sieve now</span>
+    <div id="sieve-info" class="sieve-info" aria-live="polite"></div>
+    <div class="sieve-actions">
+      <input type="file" id="sieve-file" accept=".json" hidden>
+      <button type="button" id="sieve-btn" class="link-btn"
+              title="Load sieve rules from a JSON file on this computer">Load sieve rules…</button>
+      <button type="button" id="sieve-update-btn" class="link-btn"
+              title="Fetch the latest sieve rules online">Update now</button>
+    </div>
   </div>
 
   <div id="error" class="hidden error"></div>

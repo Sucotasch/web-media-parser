@@ -13,7 +13,8 @@
     const media = [];
     const seen = new Set();
     const linkSet = new Set();
-    const links = [];
+    const links = [];      // anchors that PRESENT media - real discovery candidates
+    const linkRest = [];   // other page links, probed only with budget left over
 
     const JUNK_PATTERNS = [
       /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo[._-]|logo\./i,
@@ -53,14 +54,29 @@
       media.push({ url, type, pageUrl: baseUrl, ...attrs });
     }
 
-    function addLink(url) {
+    function addLink(url, presentsMedia = true) {
       url = toAbsolute(url);
       if (!url || linkSet.has(url)) return;
       if (url === baseUrl) return;
       // Filter out non-HTTP(S) schemes to prevent fetch errors in background
       if (!url.startsWith("http://") && !url.startsWith("https://")) return;
       linkSet.add(url);
-      links.push(url);
+      (presentsMedia ? links : linkRest).push(url);
+    }
+
+    // Errors.txt (e-hentai.gallery): every anchor on the page used to be collected as a
+    // discovery candidate, and discovery works the list in order — so site navigation
+    // (Front Page / Popular / toplist / tag search / pagination) took the front of the
+    // list, the 20 real thumbnail links sat behind it, and those navigation pages (grids
+    // of thumbnails) fed the background's <img> dump instead of the gallery. An anchor
+    // only counts as a discovery candidate when it PRESENTS media (an <img>/<picture>/
+    // <video> child, or a CSS background image — e-hentai's gallery cells are
+    // background-image divs, which the <img> branch above cannot see).
+    function presentsMedia(a) {
+      if (a.querySelector("img, picture, video, canvas")) return true;
+      const style = a.getAttribute("style") || "";
+      if (/background(?:-image)?\s*:[^;]*url\(/i.test(style)) return true;
+      return !!a.querySelector('[style*="url("]');
     }
 
     // <img> — direct images
@@ -113,7 +129,7 @@
       if (/\.(jpe?g|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i.test(fullHref)) {
         addMedia(fullHref, "image", { source: "a-link" });
       } else {
-        addLink(fullHref);
+        addLink(fullHref, presentsMedia(a));
       }
     });
 
@@ -147,7 +163,9 @@
       if (content) addMedia(content, "image", { source: "meta" });
     });
 
-    return { media, links };
+    // Media-bearing links first: discovery works the list in order, so a link that shows
+    // a thumbnail must not sit behind a "Watched"/"Faq" link.
+    return { media, links: links.concat(linkRest) };
   }
 
   // R-E-7 (NEW-2): split a srcset into { url, descriptor } candidates. A
