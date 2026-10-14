@@ -1,6 +1,10 @@
 # Web Media Parser
 
 <p align="center">
+  <a href="README.md">🇷🇺 <b>Русский</b></a> | <a href="README_EN.md">🇬🇧 <b>English</b></a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Python-3.8%2B%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white" alt="PySide6">
   <img src="https://img.shields.io/badge/Extension-Chrome%20MV3-4285F4?logo=googlechrome&logoColor=white" alt="Chrome MV3">
@@ -373,7 +377,7 @@ main.py
 - Полностью решены проблемы закрытия файловых дескрипторов при многопоточной загрузке (MT-download chunk bug), изоляции настроек сессий, Content-Type гейтов для предотвращения сохранения HTML-страниц ошибок как картинок, а также нормализации имен файлов.
 - Реализован паритет правил Imagus Sieve между браузерным расширением и десктопом, внедрена сегментная фильтрация URL и строгая классификация мусорных баннеров.
 - Расширение полностью очищено от устаревшего `new Function` и невалидных ключей манифеста, подготовлен официальный пакет для размещения в Chrome Web Store (см. [`docs/CHROME_WEB_STORE.md`](docs/CHROME_WEB_STORE.md) и [`PRIVACY_POLICY.md`](PRIVACY_POLICY.md)).
-- Тестовое покрытие: **319 пройденных тестов** в Python (`pytest`) и **9 тестовых наборов** для браузерного расширения (`Node.js`).
+- Тестовое покрытие: **319 пройденных тестов** в Python (`pytest`) и **12 тестовых наборов** для браузерного расширения (`Node.js`).
 
 ---
 
