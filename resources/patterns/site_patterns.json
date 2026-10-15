@@ -1,0 +1,1068 @@
+{
+  "version": "1.0_distribution",
+  "patterns": [
+    {
+      "site": "xhamster",
+      "domains": [
+        "xhamster.com",
+        "m.xhamster.com",
+        "xhamster.desi"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://([\\w\\w]*\\.)?xhamster([^<]*)\\.(?:com|desi)/photos/gallery/.*?(\\d+)$",
+        "^https?://[\\w\\w.]*xhamster([^<]*)\\.(?:com|desi)/users/([a-zA-Z0-9_-]+)/(photos|videos)(/\\d+)?",
+        "^https?://.*xhamster([^<]*)\\.(?:com|desi)/(movies|videos)/(.*$)"
+      ],
+      "use_mobile": true,
+      "mobile_url_pattern": "https://m.xhamster$1.",
+      "selectors": {
+        "photo_container": "div.picture_view > div.pictures_block > div.items > div.item-container > a.item",
+        "images": ".clearfix > div > a.slided, div#photo-slider > div#photo_slider > a",
+        "video": "div.player-container > a",
+        "next_page": "a.prev-next-list-link--next"
+      },
+      "delay_between_requests": 500,
+      "file_types": [
+        "jpg",
+        "mp4"
+      ]
+    },
+    {
+      "site": "imgur",
+      "domains": [
+        "imgur.com",
+        "i.imgur.com",
+        "m.imgur.com",
+        "filmot.com",
+        "filmot.org"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.|m\\.)?imgur\\.com/gallery/(?:(?:[a-zA-Z0-9]*/)?.*-)?([a-zA-Z0-9]+)$",
+        "^https?://(?:www\\.|m\\.)?imgur\\.com/(?:a|t)/(?:(?:[a-zA-Z0-9]*/)?.*-)?([a-zA-Z0-9]+).*$",
+        "^https?://([a-zA-Z0-9\\-]{3,})\\.imgur\\.com/all.*$",
+        "^https?://(?:i\\.)?imgur\\.com/([a-zA-Z0-9]{5,})$",
+        "^(?:[im]\\.())?(?:imgur\\.com|filmot\\.(?:com|org))/+(?!gallery|s(?:tats|ignin|earch)|tools|topic|random|logout|account|inbox|about|contact|privacy|memegen|collab)(?:g/[^/]+/)?([^\\W_]{5}(?:[^\\W_]{2})?)[sbtmlh]?(?![,&])(?:[?/#].*)?$"
+      ],
+      "imagus_pattern": {
+        "img_regex": "^(?:[im]\\.([^.]+\\.)?)?(imgur\\.com|filmot\\.(?:com|org))/+([^\\W_]{5}(?:[^\\W_]{2})?)(?:[sbtmlh]|_[^.]+)?\\.(jpe?g|png|gifv?|mp4|webm).*"
+      },
+      "api": {
+        "enabled": true,
+        "base_url": "https://api.imgur.com/3/",
+        "album_endpoint": "album/%s",
+        "image_endpoint": "image/%s",
+        "headers": {
+          "Authorization": "Client-ID 546c25a59c58ad7"
+        }
+      },
+      "selectors": {
+        "album_images": "div.post-images img",
+        "single_image": "div.post-image img",
+        "next_button": "div.navControls a.navNext"
+      },
+      "file_types": [
+        "jpg",
+        "png",
+        "gif",
+        "mp4",
+        "webm"
+      ],
+      "prioritize_mp4_over_gif": true
+    },
+    {
+      "site": "twitter",
+      "domains": [
+        "twitter.com",
+        "x.com",
+        "pbs.twimg.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?(?:twitter|x)\\.com/([a-zA-Z0-9_]+)(?:/media|/with_replies|/photos)?(?:\\?.*)?$",
+        "^https?://(?:www\\.)?(?:twitter|x)\\.com/([a-zA-Z0-9_]+)/status/(\\d+)(?:\\?.*)?$",
+        "^https?://(?:www\\.)?(?:twitter|x)\\.com/search\\?q=([^&]+)(?:&.*)?$",
+        "^https?://(?:video|pbs)\\.twimg\\.com/(?:media|amplify_video|ext_tw_video|tweet_video)/([^/?]+).*$"
+      ],
+      "imagus_patterns": {
+        "pic": {
+          "regex": "^https?://pbs\\.twimg\\.com/media/([^/?]+).*",
+          "transform_patterns": [
+            {
+              "source": ":[a-z]+$",
+              "target": ""
+            },
+            {
+              "source": "(?:\\?format=|&name=)([a-z]+)$",
+              "target": ""
+            },
+            {
+              "source": "name=(?:small|medium|thumb)$",
+              "target": "name=large"
+            }
+          ]
+        },
+        "video": {
+          "regex": "^https?://(?:video|amp)\\.twimg\\.com/(?:amplify_video|ext_tw_video|tweet_video)/([^/?]+).*",
+          "variants": "variants",
+          "content_type": "content_type",
+          "bitrate": "bitrate",
+          "preferred_content_types": [
+            "video/mp4"
+          ]
+        }
+      },
+      "selectors": {
+        "tweet_container": "article[data-testid='tweet']",
+        "images": "div[data-testid='tweetPhoto'] img",
+        "videos": "div[data-testid='videoPlayer'] video",
+        "tweet_text": "div[data-testid='tweetText']"
+      },
+      "api": {
+        "enabled": true,
+        "headers": {
+          "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+        },
+        "video_variants": true,
+        "prefer_highest_bitrate": true
+      },
+      "download_original_images": true,
+      "image_url_suffix": ":orig"
+    },
+    {
+      "site": "redgifs",
+      "domains": [
+        "redgifs.com",
+        "gifdeliverynetwork.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?redgifs\\.com/watch/([a-zA-Z0-9_-]+).*$",
+        "^https?://(?:www\\.)?redgifs\\.com/users/([a-zA-Z0-9_.-]+).*$",
+        "^https?://(?:www\\.)?redgifs\\.com/search(?:/[a-zA-Z]+)?\\?.*?query=([a-zA-Z0-9-_+%]+).*$",
+        "^https?://(?:www\\.)?redgifs\\.com/gifs/([a-zA-Z0-9_.,-]+).*$"
+      ],
+      "api": {
+        "enabled": true,
+        "temporary_auth": "https://api.redgifs.com/v2/auth/temporary",
+        "media_endpoint": "https://api.redgifs.com/v2/gifs/%s",
+        "search_endpoint": "https://api.redgifs.com/v2/gifs/search",
+        "headers": {
+          "Accept": "application/json"
+        }
+      },
+      "delay_between_requests": 1000,
+      "prefer_hd_quality": true,
+      "selectors": {
+        "video": "video source[type='video/mp4']",
+        "gif": "div.player img"
+      }
+    },
+    {
+      "site": "instagram",
+      "domains": [
+        "instagram.com",
+        "www.instagram.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?instagram\\.com/(?:p|tv|reel)/([a-zA-Z0-9_-]+)/?$",
+        "^https?://(?:www\\.)?instagram\\.com/([a-zA-Z0-9._]+)/?$",
+        "^https?://(?:www\\.)?instagram\\.com/stories/([a-zA-Z0-9._]+)/?$",
+        "^https?://(?:www\\.)?instagram\\.com/explore/tags/([a-zA-Z0-9_]+)/?$"
+      ],
+      "imagus_patterns": {
+        "html": {
+          "link_regex": "^instagram\\.com/(?:[\\w.]+\\/)?(?:p|reel)/([\\w-]+).*"
+        },
+        "graphql": {
+          "query_patterns": [
+            "xdt_api__v1__media__shortcode__web_info"
+          ],
+          "video_path": "video_versions.0.url",
+          "image_path": "image_versions2.candidates.0.url",
+          "carousel_media_path": "carousel_media"
+        },
+        "headers": {
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      },
+      "selectors": {
+        "post_image": "article img[decoding='auto']",
+        "post_video": "article video",
+        "profile_posts": "a[href^='/p/']",
+        "stories_container": "section div[role='dialog'] div[role='button'] img"
+      },
+      "requires_session": true,
+      "session_cookie_name": "sessionid",
+      "javascript_rendering": true,
+      "look_in_json_data": true,
+      "json_patterns": [
+        "window\\._sharedData\\s*=\\s*(\\{.+?\\});",
+        "window\\.__additionalDataLoaded\\(.+?,(\\{.+?\\})\\);"
+      ],
+      "download_timestamps": true,
+      "timestamp_format": "yyyy-MM-dd_HH-mm-ss_"
+    },
+    {
+      "site": "deviantart",
+      "domains": [
+        "deviantart.com",
+        "sta.sh"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?deviantart\\.com/([a-zA-Z0-9-]+)/gallery/(?:\\d+)?/?([a-zA-Z0-9-]+)?$",
+        "^https?://(?:www\\.)?deviantart\\.com/([a-zA-Z0-9-]+)/art/([a-zA-Z0-9-]+)$",
+        "^https?://(?:www\\.)?deviantart\\.com/([a-zA-Z0-9-]+)/favourites/?$",
+        "^https?://sta\\.sh/([a-z0-9]+)(?:p[a-z0-9]+)?(?:[/#?].*)?$"
+      ],
+      "imagus_patterns": {
+        "art": {
+          "regex": "^deviantart\\.com/[a-zA-Z0-9-]+/art/[\\w-]+",
+          "fullimage_selector": "div.dev-view-deviation img.dev-content-full",
+          "download_selector": "a.dev-page-download"
+        },
+        "stash": {
+          "regex": "^sta\\.sh/([a-z0-9]+)(?:p[a-z0-9]+)?(?:[/#?].*)?$",
+          "fullsize_pattern": "https://sta.sh/$1/downloads/$2?token=$3"
+        },
+        "headers": {
+          "Accept": "image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+          "Referer": "https://www.deviantart.com/"
+        }
+      },
+      "requires_login": true,
+      "login": {
+        "enabled": false,
+        "username": "",
+        "password": ""
+      },
+      "selectors": {
+        "image": "div.dev-view-deviation img.dev-content-full",
+        "download_button": "a.dev-page-download",
+        "gallery_item": "a.torpedo-thumb-link"
+      },
+      "max_depth": 100,
+      "offset_parameter": "offset",
+      "offset_increment": 24,
+      "download_original_quality": true
+    },
+    {
+      "site": "vk",
+      "domains": [
+        "vk.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?vk\\.com/(?:photos|album|videos)-?(?:[a-zA-Z0-9_]+).*$",
+        "^https?://(?:www\\.)?vk\\.com/video([a-zA-Z0-9_-]+)_([0-9]+)$"
+      ],
+      "selectors": {
+        "photo_container": "div.photos_row a[onclick*='showPhoto']",
+        "video_container": "div.video_box"
+      },
+      "api": {
+        "enabled": true,
+        "photo_endpoint": "al_photos.php",
+        "video_endpoint": "al_video.php",
+        "parameters": {
+          "act": "show",
+          "al": "1"
+        }
+      },
+      "video_quality_detection": {
+        "enabled": true,
+        "quality_keys": [
+          "1080",
+          "720",
+          "480",
+          "240"
+        ],
+        "key_prefix": "url",
+        "extraction_method": "json_keys"
+      },
+      "extract_highest_resolution": true,
+      "resolution_selectors": [
+        "z_src",
+        "y_src",
+        "x_src",
+        "w_src"
+      ],
+      "delay_between_requests": 500
+    },
+    {
+      "site": "reddit",
+      "domains": [
+        "reddit.com",
+        "redd.it",
+        "i.redd.it",
+        "v.redd.it"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://[a-zA-Z0-9.]{0,4}reddit\\.com/(user|u)/([a-zA-Z0-9_\\-]{3,}).*$",
+        "^https?://[a-zA-Z0-9.]{0,4}reddit\\.com/.*comments/([a-zA-Z0-9]{1,8}).*$",
+        "^https?://[a-zA-Z0-9.]{0,4}reddit\\.com/gallery/([a-zA-Z0-9]+).*$",
+        "^https?://[a-zA-Z0-9.]{0,4}reddit\\.com/r/([a-zA-Z0-9_]+).*$"
+      ],
+      "imagus_patterns": {
+        "gallery": {
+          "link_regex": "^(reddit\\.com/)gallery/([\\da-z]+).*",
+          "api_url": "https://www.$1by_id/t3_$2.json"
+        },
+        "media": {
+          "transform_patterns": [
+            {
+              "source": "preview(\\.redd.it\\/[^?]+).*",
+              "target": "i$1"
+            }
+          ]
+        },
+        "video": {
+          "dash_playlist_endpoint": "/DASHPlaylist.mpd"
+        }
+      },
+      "json_api": {
+        "enabled": true,
+        "json_suffix": ".json",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 RipMe:github.com/RipMeApp/ripme:1.7.95"
+      },
+      "selectors": {
+        "reddit_video": "div[data-test-id='post-content'] video",
+        "embedded_media": "div.media-element"
+      },
+      "video_extraction": {
+        "dash_playlist": "/DASHPlaylist.mpd",
+        "select_highest_quality": true
+      },
+      "delay_between_requests": 2000,
+      "handle_galleries": true,
+      "reddituploads_extension": "jpg",
+      "handle_video_links": true,
+      "check_self_text_for_links": true
+    },
+    {
+      "site": "artstation",
+      "domains": [
+        "artstation.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?artstation\\.com/([a-zA-Z0-9_-]+)$",
+        "^https?://(?:www\\.)?artstation\\.com/artwork/([a-zA-Z0-9]+)$",
+        "^https?://([a-zA-Z0-9_-]+)\\.artstation\\.com/?$"
+      ],
+      "json_api": {
+        "enabled": true,
+        "project_endpoint": "https://www.artstation.com/projects/%s.json",
+        "user_endpoint": "https://www.artstation.com/users/%s/projects.json",
+        "user_info_endpoint": "https://www.artstation.com/users/%s/quick.json"
+      },
+      "scrape_patterns": {
+        "project_id": "'/projects/(\\w+)\\.json'",
+        "user_id": "'/users/([\\w-]+)/quick\\.json'"
+      },
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Upgrade-Insecure-Requests": "1"
+      },
+      "project_paging": {
+        "items_per_page": 50,
+        "max_pages": 20
+      },
+      "create_subdirectories": true
+    },
+    {
+      "site": "pornhub",
+      "domains": [
+        "pornhub.com",
+        "www.pornhub.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?pornhub\\.com/album/([0-9]+).*$",
+        "^https?://(?:www\\.)?pornhub\\.com/view_video\\.php\\?viewkey=([a-zA-Z0-9]+)$"
+      ],
+      "selectors": {
+        "album_images": ".photoBlockBox li",
+        "image_page": ".photoAlbumListBlock > a",
+        "image": "#photoImageSection img",
+        "video": "video source",
+        "next_page": "li.page_next > a"
+      },
+      "video_extraction": {
+        "script_vars": true,
+        "extract_highest_quality": true,
+        "quality_map_key": "qualityItems"
+      },
+      "sanitize_url": true,
+      "delay_between_requests": 1000,
+      "file_types": [
+        "jpg",
+        "png",
+        "mp4"
+      ]
+    },
+    {
+      "site": "flickr",
+      "domains": [
+        "flickr.com",
+        "www.flickr.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://[wm.]*flickr\\.com/photos/([a-zA-Z0-9@_-]+)/sets/([0-9]+)/?.*$",
+        "^https?://[wm.]*flickr\\.com/photos/([a-zA-Z0-9@_-]+).*$",
+        "^https?://[wm.]*flickr\\.com/groups/([a-zA-Z0-9@_-]+).*$"
+      ],
+      "api": {
+        "enabled": true,
+        "api_key_pattern": "root.YUI_config.flickr.api.site_key = \"([a-zA-Z0-9]*)\"",
+        "fallback_api_key": "935649baf09b2cc50628e2b306e4da5d",
+        "photoset_endpoint": "https://api.flickr.com/services/rest?method=flickr.photosets.getPhotos&api_key=%s&photoset_id=%s&format=json&nojsoncallback=1",
+        "user_endpoint": "https://api.flickr.com/services/rest?method=flickr.people.getPhotos&api_key=%s&user_id=%s&format=json&nojsoncallback=1",
+        "image_size_endpoint": "https://www.flickr.com/services/rest/?method=flickr.photos.getSizes&api_key=%s&photo_id=%s&format=json&nojsoncallback=1"
+      },
+      "extract_largest_image": true,
+      "delay_between_requests": 500
+    },
+    {
+      "site": "rule34",
+      "domains": [
+        "rule34.xxx"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://rule34\\.xxx/index\\.php\\?page=post&s=list&tags=([\\S]+)"
+      ],
+      "use_api": true,
+      "api": {
+        "base_url": "https://rule34.xxx/index.php?page=dapi&s=post&q=index&limit=100&tags=%s",
+        "page_parameter": "&pid=%s"
+      },
+      "selectors": {
+        "image": "posts > post",
+        "image_url_attribute": "file_url"
+      },
+      "max_pages": 100,
+      "delay_between_requests": 1000
+    },
+    {
+      "site": "tumblr",
+      "domains": [
+        "tumblr.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://([a-zA-Z0-9\\-]+)\\.tumblr\\.com/?$",
+        "^https?://([a-zA-Z0-9\\-\\.]+)/tagged/([a-zA-Z0-9\\-%]+).*$",
+        "^https?://([a-zA-Z0-9\\-\\.]+)/post/([0-9]+).*$",
+        "https?://([a-z0-9_-]+).tumblr.com/likes",
+        "https://www.tumblr.com/liked/by/([a-z0-9_-]+)"
+      ],
+      "imagus_patterns": {
+        "media": {
+          "link_regex": "^((?:[a-z0-9_-]+\\.)?tumblr\\.com)(?:/(?:post|image))?/([0-9]{8,})[^?]*(?:\\?media=)?([a-z0-9]+)?.*",
+          "image_regex": "^(?:[^/:]+:)?//(?:\\d+\\.)?media\\.tumblr\\.com/[^/]+(?:_r\\d+)?/tumblr_(?:[\\w+]+_\\d+)_\\d+\\.(?>jpe?g|png|gif)$"
+        },
+        "photo_transform": [
+          {
+            "source": "_(\\d+)\\.(jpe?g|png|gif)$",
+            "target": "_1280.$2"
+          },
+          {
+            "source": "_(?:1280|2048)\\.(jpe?g|png|gif)$",
+            "target": "_raw.$1"
+          }
+        ],
+        "video_transform": [
+          {
+            "source": "/tumblr_([\\w+_]+)_frame1\\.(?:jpe?g|png|gif)$",
+            "target": "/tumblr_$1.mp4"
+          }
+        ]
+      },
+      "api": {
+        "enabled": true,
+        "base_url": "http://api.tumblr.com/v2/blog/",
+        "api_keys": [
+          "JFNLu3CbINQjRdUvZibXW9VpSEVYYtiPJ86o8YmvgLZIoKyuNX",
+          "FQrwZMCxVnzonv90rgNUJcAk4FpnoS0mYuSuGYqIpM2cFgp9L4",
+          "qpdkY6nMknksfvYAhf2xIHp0iNRLkMlcWShxqzXyFJRxIsZ1Zz"
+        ],
+        "liked_endpoint": "%s/likes?api_key=%s&offset=%s",
+        "posts_endpoint": "%s/posts/%s?api_key=%s&offset=%s",
+        "post_endpoint": "%s/posts?id=%s&api_key=%s"
+      },
+      "media_types": [
+        "photo",
+        "video",
+        "audio"
+      ],
+      "extract_largest_image": true,
+      "delay_between_requests": 1000,
+      "image_pattern": "([^\\s]+(\\.(?i)(?:jpg|png|gif|bmp))$)"
+    },
+    {
+      "site": "imagefap",
+      "domains": [
+        "imagefap.com",
+        "www.imagefap.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://.*imagefap\\.com/gallery\\.php\\?pgid=([a-f0-9]+).*$",
+        "^https?://.*imagefap\\.com/gallery\\.php\\?gid=([0-9]+).*$",
+        "^https?://.*imagefap\\.com/gallery/([a-f0-9]+).*$",
+        "^https?://.*imagefap\\.com/pictures/([a-f0-9]+).*$"
+      ],
+      "selectors": {
+        "gallery_images": "#gallery img",
+        "main_photo": "img#mainPhoto",
+        "thumb_parent": "ul.thumbs > li > a[framed^='%s']"
+      },
+      "rate_limits": {
+        "page_sleep_time": 4000,
+        "image_sleep_time": 4000,
+        "request_limit_hour": 1000
+      },
+      "cleanup_url": true,
+      "file_types": [
+        "jpg",
+        "png",
+        "gif"
+      ]
+    },
+    {
+      "site": "nsfw_xxx",
+      "domains": [
+        "nsfw.xxx"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "https://nsfw.xxx/user/([^/]+)/?$"
+      ],
+      "api": {
+        "enabled": true,
+        "page_endpoint": "https://nsfw.xxx/slide-page/%s?nsfw%%5B%%5D=0&types%%5B%%5D=image&types%%5B%%5D=video&types%%5B%%5D=gallery&slider=1&jsload=1&user=%s"
+      },
+      "extract_video_src": true,
+      "video_src_pattern": "src=\"([^\"]+)\"",
+      "delay_between_requests": 500
+    },
+    {
+      "site": "ehentai",
+      "domains": [
+        "e-hentai.org"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://e-hentai\\.org/g/([0-9]+)/([a-fA-F0-9]+)/?"
+      ],
+      "cookies": {
+        "nw": "1",
+        "tip": "1"
+      },
+      "selectors": {
+        "album_title": "#gn",
+        "thumbnails": "#gdt > a",
+        "image": ".sni > a > img, img#img"
+      },
+      "rate_limits": {
+        "page_sleep_time": 3000,
+        "image_sleep_time": 1500,
+        "ip_block_sleep_time": 60000
+      },
+      "next_page": ".ptt a",
+      "tag_blacklist_support": true
+    },
+    {
+      "site": "youporn",
+      "domains": [
+        "youporn.com",
+        "www.youporn.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?youporn\\.com/watch/([0-9]+)/.*$"
+      ],
+      "selectors": {
+        "video": "video",
+        "video_src": "source[type='video/mp4']"
+      },
+      "prefer_highest_quality": true,
+      "download_mp4_only": true,
+      "delay_between_requests": 1000
+    },
+    {
+      "site": "xvideos",
+      "domains": [
+        "xvideos.com",
+        "www.xvideos.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?xvideos\\.com/video([0-9]+)/.*$"
+      ],
+      "video_extraction": {
+        "script_pattern": "html5player\\.setVideoUrlHigh\\('([^']+)'\\)",
+        "low_quality_pattern": "html5player\\.setVideoUrlLow\\('([^']+)'\\)"
+      },
+      "download_highest_quality": true,
+      "delay_between_requests": 1000
+    },
+    {
+      "site": "motherless",
+      "domains": [
+        "motherless.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?motherless\\.com/(?:g|G)/([a-zA-Z0-9_\\-]+).*$",
+        "^https?://(?:www\\.)?motherless\\.com/(?:u|U)/([a-zA-Z0-9_\\-]+).*$",
+        "^https?://(?:www\\.)?motherless\\.com/term/videos/([a-zA-Z0-9_\\-]+).*$",
+        "^https?://(?:www\\.)?motherless\\.com/([A-Z0-9]+).*$"
+      ],
+      "selectors": {
+        "thumb_container": ".thumbcomp, .thumb-container",
+        "title": "h1",
+        "image": "#main-media img",
+        "video": "#main-media video source[type='video/mp4'], #__fileurl"
+      },
+      "next_page": ".pagination_link",
+      "video_url_pattern": "__fileurl = '(.*)'",
+      "delay_between_requests": 500
+    },
+    {
+      "site": "imagebam",
+      "domains": [
+        "imagebam.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?imagebam\\.com/(?:gallery)/([a-zA-Z0-9]+).*$",
+        "^https?://(?:www\\.)?imagebam\\.com/image/([a-zA-Z0-9]+).*$"
+      ],
+      "selectors": {
+        "gallery_links": ".dropdown-menu a[href*='/gallery']",
+        "thumb_links": ".thumb-toggle a.thumbnail",
+        "image": "img.image[id^='i']",
+        "image_container": "#image_wrapper"
+      },
+      "next_page": ".pagination li.active + li a",
+      "delay_between_requests": 1000
+    },
+    {
+      "site": "imgbox",
+      "domains": [
+        "imgbox.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://[wm.]*imgbox\\.com/g/([a-zA-Z0-9]+).*$"
+      ],
+      "selectors": {
+        "images": "div.boxed-content > a > img"
+      },
+      "image_transformations": {
+        "replace_patterns": [
+          {
+            "source": "thumbs",
+            "target": "images"
+          },
+          {
+            "source": "_b",
+            "target": "_o"
+          },
+          {
+            "source": "\\d-s",
+            "target": "i"
+          }
+        ]
+      },
+      "delay_between_requests": 200
+    },
+    {
+      "site": "imagevenue",
+      "domains": [
+        "imagevenue.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://.*imagevenue.com/galshow.php\\?gal=([a-zA-Z0-9\\-_]+).*$"
+      ],
+      "selectors": {
+        "image_links": "a[target=_blank]",
+        "images": "a > img"
+      },
+      "host_in_image_url": true,
+      "retry_count": 3,
+      "delay_between_requests": 300
+    },
+    {
+      "site": "teenplanet",
+      "domains": [
+        "teenplanet.org"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^.*teenplanet.org/galleries/([a-zA-Z0-9\\-]+).html$"
+      ],
+      "selectors": {
+        "images": "#galleryImages > a > img"
+      },
+      "image_transformations": {
+        "replace_patterns": [
+          {
+            "source": "/thumbs/",
+            "target": "/"
+          }
+        ]
+      },
+      "delay_between_requests": 200
+    },
+    {
+      "site": "pornpics",
+      "domains": [
+        "pornpics.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "https?://www.pornpics.com/galleries/([a-zA-Z0-9_-]*)/?$"
+      ],
+      "selectors": {
+        "image_links": "a.rel-link"
+      },
+      "delay_between_requests": 500
+    },
+    {
+      "site": "spankbang",
+      "domains": [
+        "spankbang.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://.*spankbang\\.com/(.*)/video/.*$"
+      ],
+      "selectors": {
+        "videos": ".video-js > source"
+      },
+      "single_file_mode": true,
+      "delay_between_requests": 1000
+    },
+    {
+      "site": "picstatio",
+      "domains": [
+        "picstatio.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "https?://www.picstatio.com/([a-zA-Z1-9_-]*)/?$"
+      ],
+      "selectors": {
+        "images": "img.img",
+        "next_page": "a.next_page"
+      },
+      "url_extraction": {
+        "image_name_index": 2,
+        "download_endpoint": "https://www.picstatio.com/wallpaper/%s/download",
+        "full_size_selector": "p.text-center > span > a"
+      },
+      "delay_between_requests": 500
+    },
+    {
+      "site": "pichunter",
+      "domains": [
+        "pichunter.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "https?://www.pichunter.com/(|tags|models|sites)/(\\S*)/?$",
+        "https?://www.pichunter.com/(tags|models|sites)/(\\S*)/photos/\\d+/?$",
+        "https?://www.pichunter.com/tags/all/(\\S*)/\\d+/?$",
+        "https?://www.pichunter.com/gallery/\\d+/(\\S*)/?$"
+      ],
+      "selectors": {
+        "gallery_images": "div.thumbtable > a.thumb > img",
+        "photoset_images": "div.flex-images > figure > a.item > img",
+        "next_page": "div.paperSpacings > ul > li.arrow"
+      },
+      "image_transformations": {
+        "replace_patterns": [
+          {
+            "source": "_i",
+            "target": "_o"
+          }
+        ]
+      },
+      "next_page_base_url": "http://www.pichunter.com",
+      "delay_between_requests": 500
+    },
+    {
+      "site": "hentai-foundry",
+      "domains": [
+        "hentai-foundry.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^.*hentai-foundry\\.com/(pictures|stories)/user/([a-zA-Z0-9\\-_]+).*$"
+      ],
+      "age_verification": {
+        "enabled": true,
+        "base_url": "https://www.hentai-foundry.com/?enterAgree=1&size=1500",
+        "csrf_token_selector": "input[name=YII_CSRF_TOKEN]",
+        "form_data": {
+          "rating_nudity": "3",
+          "rating_violence": "3",
+          "rating_profanity": "3",
+          "rating_racism": "3",
+          "rating_sex": "3",
+          "rating_spoilers": "3",
+          "rating_yaoi": "1",
+          "rating_yuri": "1",
+          "rating_teen": "1",
+          "rating_guro": "1",
+          "rating_furry": "1",
+          "rating_beast": "1",
+          "rating_male": "1",
+          "rating_female": "1",
+          "rating_futa": "1",
+          "rating_other": "1",
+          "rating_scat": "1",
+          "rating_incest": "1",
+          "rating_rape": "1",
+          "filter_media": "A",
+          "filter_order": "date_old",
+          "filter_type": "0"
+        },
+        "filter_url": "https://www.hentai-foundry.com/site/filters"
+      },
+      "selectors": {
+        "image_links": "div.thumb_square > a.thumbLink",
+        "pdf_links": "a.pdfLink",
+        "next_page": "li.next > a",
+        "images": "div.boxbody > img.center"
+      },
+      "domain_prefix": "https://www.hentai-foundry.com",
+      "image_regex": ".*/user/([a-zA-Z0-9\\-_]+)/(\\d+)/.*",
+      "delay_between_requests": 500
+    },
+    {
+      "site": "nsfwalbum",
+      "domains": [
+        "nsfwalbum.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "(?!https:\\/\\/nsfwalbum.com\\/album\\/)\\d+"
+      ],
+      "selectors": {
+        "images": ".album img"
+      },
+      "image_transformations": {
+        "imgspice": {
+          "source": "_t.jpg",
+          "target": ".jpg"
+        },
+        "imagetwist": {
+          "source": "/th/",
+          "target": "/i/"
+        },
+        "pixhost": [
+          {
+            "source": "https://t",
+            "target": "https://img"
+          },
+          {
+            "source": "/thumbs/",
+            "target": "/images/"
+          }
+        ],
+        "imx": {
+          "source": "/t/",
+          "target": "/i/"
+        }
+      },
+      "delay_between_requests": 200
+    },
+    {
+      "site": "photobucket",
+      "domains": [
+        "photobucket.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^https?://(?:www\\.)?photobucket\\.com/user/([a-zA-Z0-9-_]+)/library/([a-zA-Z0-9-_]+)$",
+        "^https?://(?:www\\.)?photobucket\\.com/user/([a-zA-Z0-9-_]+)/library/?$",
+        "^https?://(?:www\\.)?photobucket\\.com/gallery/user/([a-zA-Z0-9-_]+)/media/([a-zA-Z0-9-_]+)$"
+      ],
+      "api": {
+        "enabled": true,
+        "base_url": "https://photobucket.com/api/user/%s/album/%s/media",
+        "gallery_url": "https://photobucket.com/api/media/album/%s",
+        "items_per_page": 100
+      },
+      "subalbum_regex": "https?://(?:www\\.)?photobucket\\.com/user/([a-zA-Z0-9-_]+)/library/([a-zA-Z0-9-_]+)$",
+      "gallery_regex": "https?://(?:www\\.)?photobucket\\.com/gallery/user/([a-zA-Z0-9-_]+)/media/([a-zA-Z0-9-_]+)$",
+      "media_url_key": "containingUrl",
+      "delay_between_requests": 500
+    },
+    {
+      "site": "nudegals",
+      "domains": [
+        "nude-gals.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "^.*nude-gals\\.com/photoshoot\\.php\\?photoshoot_id=(\\d+)$",
+        "^.*nude-gals\\.com/video\\.php\\?video_id=(\\d+)$"
+      ],
+      "selectors": {
+        "images": "img.thumbnail",
+        "videos": "video source"
+      },
+      "image_transformations": {
+        "replace_patterns": [
+          {
+            "source": "thumbs/th_",
+            "target": ""
+          }
+        ]
+      },
+      "domain_prefix": "http://nude-gals.com/",
+      "encode_spaces": true,
+      "delay_between_requests": 500
+    },
+    {
+      "site": "nfsfw",
+      "domains": [
+        "nfsfw.com"
+      ],
+      "enabled": true,
+      "url_patterns": [
+        "https?://[wm.]*nfsfw.com/gallery/v/(.*)$"
+      ],
+      "selectors": {
+        "image_links": "td.giItemCell > div > a",
+        "subalbum_links": "td.IMG > a",
+        "images": ".gbBlock img",
+        "next_page": "a.next"
+      },
+      "domain_prefix": "http://nfsfw.com",
+      "queue_support": true,
+      "supports_subalbums": true,
+      "subalbum_pattern": "https?://[wm.]*nfsfw.com/gallery/v/[^/]+/(.+)$",
+      "delay_between_requests": 2000
+    }
+  ],
+  "google_images": {
+    "site": "google_images",
+    "domains": [
+      "google.com",
+      "gstatic.com",
+      "googleusercontent.com"
+    ],
+    "enabled": true,
+    "url_patterns": [
+      "^(?:https?://)?(?:www\\.)?google\\.\\S+/imgres\\?\\S*imgurl=([^&]+).*$",
+      "^(?:https?://)?(?:www\\.)?google\\.\\S+/search\\?\\S*tbm=isch.*$",
+      "^(?:https?://)?(?:www\\.)?encrypted-tbn\\d\\.gstatic\\.com/images.*$",
+      "^(?:https?://)?(?:www\\.)?images-partners-tbn\\.google\\.com/images\\?q=tbn:[^:]+:+(.+)$"
+    ],
+    "selectors": {
+      "image_button": "a[role='button']",
+      "image_div": "div[role='button']",
+      "image_docid": "div[data-docid]"
+    },
+    "image_extraction": {
+      "imgurl_param": "imgurl",
+      "original_param": "&",
+      "legacy_transform": {
+        "source": "^images-partners-tbn\\.google\\.com/images\\?q=tbn:[^:]+:+(.+)",
+        "target": "$1"
+      }
+    },
+    "headers": {
+      "Referer": "https://www.google.com/"
+    }
+  },
+  "yandex_images": {
+    "site": "yandex_images",
+    "domains": [
+      "yandex.ru",
+      "yandex.com",
+      "mds.yandex.net",
+      "clstorage.net"
+    ],
+    "enabled": true,
+    "url_patterns": [
+      "^(?:https?://)?(?:www\\.)?ya(?:ndex)?\\.\\w+/images/search\\?\\S+?img_url=([^&]+).*$",
+      "^(?:https?://)?(?:www\\.)?avatars\\.mds\\.yandex\\.net/i\\?id=[\\da-f]+-\\d+-images-thumbs&ref=rim&n=33&w=\\d{3}&h=[123]\\d\\d$"
+    ],
+    "image_extraction": {
+      "imgurl_param": "img_url",
+      "original_param": "&",
+      "thumb_transform": {
+        "source": "&h=[123]\\d\\d$",
+        "target": "&h=0"
+      },
+      "yandex_thumb_patterns": [
+        "avatars\\.mds\\.yandex\\S+n=13",
+        "yandex-images\\.clstorage\\.net\\/[^\"]+"
+      ]
+    },
+    "headers": {
+      "Referer": "https://yandex.ru/"
+    }
+  },
+  "global_settings": {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "timeout": 30,
+    "retry_count": 3,
+    "delay_between_requests": 200,
+    "honor_robots_txt": false,
+    "debug_mode": false,
+    "common_image_patterns": {
+      "thumbnail_transform": [
+        {
+          "source": "/(?:thumbs?|small|preview|thumbnails?)/",
+          "target": "/"
+        },
+        {
+          "source": "_(?:thumb|small|tiny|mini|preview)\\.",
+          "target": "."
+        },
+        {
+          "source": "_(?:\\d+x\\d+)\\.",
+          "target": "."
+        },
+        {
+          "source": "(image|photo|img|pic)_(?:thumb|small|preview)\\.",
+          "target": "$1."
+        },
+        {
+          "source": "(?:[-_])(?:t|th|thumbnail|s|small|m|medium|p|preview)\\.",
+          "target": "."
+        },
+        {
+          "source": "\\.md\\.jpg",
+          "target": ".jpg"
+        },
+        {
+          "source": "-(?:\\d+x\\d+)",
+          "target": ""
+        }
+      ],
+      "refer_headers": {
+        "Referer": "",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site"
+      }
+    }
+  }
+}

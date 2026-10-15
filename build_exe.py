@@ -19,6 +19,13 @@ import shutil
 import subprocess
 
 
+# E-01 (2026-10-15): every path below is relative, and the documented
+# invocation is `python build_exe.py`. Run from any other cwd and
+# `pip install -r requirements.txt` used to fail (or install nothing) before
+# PyInstaller was handed missing --add-data sources. Anchor to this file.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+
 def build_exe():
     print("Building portable WebMediaParser...")
 
@@ -32,10 +39,15 @@ def build_exe():
             print(f"Cleaning {d}/...")
             try:
                 shutil.rmtree(d)
-            except PermissionError:
-                print(f"  Warning: {d}/ in use, skipping")
             except Exception as e:
-                print(f"  Warning: {e}")
+                # E-01: continuing after a failed clean mixes old and new
+                # artifacts inside dist/ (PyInstaller runs with -y), so a
+                # locked dist/ must abort the build instead of warning.
+                raise SystemExit(
+                    f"Cannot clean {d}/ ({e}). Close the running "
+                    f"WebMediaParser.exe (or any tool holding files there) "
+                    f"and retry the build."
+                )
 
     # Build with --onedir (all files in one directory, no temp extraction)
     # Use the interpreter's own PyInstaller (not a PATH-dependent bare name).

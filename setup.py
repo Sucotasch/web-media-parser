@@ -37,6 +37,14 @@ setup(
         "certifi>=2024.0.0",
         "cryptography>=43.0.0",
     ],
+    extras_require={
+        # F-10 / E-09 (2026-10-15): the documented gates `python -m pytest`
+        # and `python -m ruff` had no declared home — a clean machine that
+        # followed the README could run neither. Runtime deps stay lean
+        # (deno.exe is bundled by build_exe.py, ruff/pytest are dev-only).
+        "test": ["pytest>=8.0"],
+        "lint": ["ruff>=0.11"],
+    },
     entry_points={
         "console_scripts": [
             "web_media_parser=main:main",

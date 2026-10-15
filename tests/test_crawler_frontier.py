@@ -400,3 +400,99 @@ class TestPageLimitSemantics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class TestZeroPriorityKeepsDedupSlot(unittest.TestCase):
+    """A-05: a URL dropped by the relationship gate must not burn its dedup slot.
+
+    `put()` marked the URL as seen BEFORE the zero-priority check, so a link
+    rejected once (cross-domain excavation while stay-in-domain is on) could
+    never be queued again — not even as a thumbnail transition (from_image),
+    which is explicitly exempt from the domain gate. The fullsize lookups of
+    those URLs were silently lost.
+    """
+
+    def setUp(self):
+        self.q = PriorityURLQueue(settings={K.SETTING_STAY_IN_DOMAIN: True})
+        self.q.reset_async_primitives()
+
+    def test_dropped_url_is_not_seen_and_can_return_as_a_media_lookup(self):
+        unrelated = "https://other-site.com/page"
+        source = "https://www.pictoa.com/albums/a-1.html"
+
+        async def go():
+            await self.q.put(unrelated, 1, source, {})
+            dropped = (len(self.q._queue), unrelated in self.q._seen)
+            await self.q.put(unrelated, 1, source, {"from_image": True})
+            return dropped, len(self.q._queue)
+
+        dropped, queued_after = run(go())
+        self.assertEqual(dropped, (0, False),
+                         "the relationship gate dropped the URL but still marked it seen")
+        self.assertEqual(queued_after, 1,
+                         "the media lookup was discarded as a duplicate")
+
+    def test_queued_url_is_still_deduplicated(self):
+        """Control: the fix must not lift dedup for URLs that really were queued."""
+        async def go():
+            await self.q.put("https://site.com/album/1.html", 1, "https://site.com/", {})
+            await self.q.put("https://site.com/album/1.html", 2, "https://site.com/", {})
+            return len(self.q._queue)
+
+        self.assertEqual(run(go()), 1)
+
+
+class TestSeenMemoryBound(unittest.TestCase):
+    """F-12: the dedup set is bounded, and the dead `_url_scores` dict is gone.
+
+    `_seen` records every URL the frontier has ever considered for the whole
+    task run; it had no ceiling, so a long crawl on a large host grew it
+    forever. `_url_scores` sat beside it as state that was never written or read.
+    """
+
+    def setUp(self):
+        self.q = PriorityURLQueue(settings={})
+        self.q.reset_async_primitives()
+
+    def test_dead_url_scores_state_is_gone(self):
+        self.assertFalse(hasattr(self.q, "_url_scores"),
+                         "the dead `_url_scores` dict is back in PriorityURLQueue")
+
+    def test_seen_set_stops_growing_at_the_cap(self):
+        cap = 3
+        with patch.object(K, "MAX_SEEN_URLS", cap):
+            async def go():
+                for i in range(cap + 5):
+                    await self.q.put(f"https://site.com/album/{i}.html", 1,
+                                     "https://site.com/", {})
+                return len(self.q._seen)
+
+            size = run(go())
+        self.assertEqual(size, cap, f"_seen grew past MAX_SEEN_URLS (size={size})")
+
+    def test_oldest_url_is_evicted_and_the_newest_kept(self):
+        with patch.object(K, "MAX_SEEN_URLS", 2):
+            async def go():
+                first = "https://site.com/album/1.html"
+                await self.q.put(first, 1, "https://site.com/", {})
+                await self.q.put("https://site.com/album/2.html", 1, "https://site.com/", {})
+                newest = "https://site.com/album/3.html"
+                await self.q.put(newest, 1, "https://site.com/", {})
+                return first in self.q._seen, newest in self.q._seen
+
+            first_kept, newest_kept = run(go())
+        self.assertFalse(first_kept, "the oldest URL must be evicted first")
+        self.assertTrue(newest_kept, "eviction must not drop the newest URL")
+
+    def test_evicted_url_can_be_queued_again(self):
+        """The cost of the bound is a possible re-queue — never a stuck URL."""
+        with patch.object(K, "MAX_SEEN_URLS", 1):
+            async def go():
+                first = "https://site.com/album/1.html"
+                await self.q.put(first, 1, "https://site.com/", {})
+                await self.q.put("https://site.com/album/2.html", 1, "https://site.com/", {})
+                before = len(self.q._queue)
+                await self.q.put(first, 1, "https://site.com/", {})
+                return before, len(self.q._queue)
+
+            before, after = run(go())
+        self.assertEqual(after, before + 1,
+                         "a URL evicted from the bounded dedup set must be queueable again")

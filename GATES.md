@@ -1,6 +1,10 @@
 # GATES.md — Fix & Feature Execution Ledger (2026-09-09)
 
-Baseline: `7bac98b`, 265 passed / 30 skipped. Each gate = one observable outcome.
+Baseline: `7bac98b` (2026-09-09) — 265 passed / 30 skipped at that commit; the same command on the 2026-10-15 tree is 345 passed / 30 skipped (E-06: the number was quoted without a date). Each gate = one observable outcome.
+> E-07 (2026-10-15): three pairs below were unrunnable as written (they named a file
+> that never contained the test, expected `1 passed` where the file has 3, and used a
+> ruff selection that misses `E401`). They are corrected in place; the tree at that
+> point in history is what the file list refers to.
 CHECK commands are run from the project root; EXPECT is matched against combined output.
 
 ---
@@ -16,16 +20,23 @@ CHECK commands are run from the project root; EXPECT is matched against combined
 - EXPECT: `passed` present, `failed` absent; new test name `test_extension_add_does_not_mutate_global_settings` appears.
 
 ### G-P1-3 · Referer sent from context source_url
-- CHECK: `python -m pytest tests/test_fullsize_discovery.py tests/test_parser_manager_filtering.py -q`
-- EXPECT: `passed` present, `failed` absent, `error` absent; new test name `test_referer_from_context_source_url` appears.
+- CHECK: `python -m pytest tests/test_fullsize_discovery.py tests/test_parser_manager_filtering.py tests/test_gateway_bypass.py -q`
+- EXPECT: `passed` present, `failed` absent, `error` absent. The referer test lives in
+  `tests/test_gateway_bypass.py::test_referer_from_context_source_url` (E-07: the old pair
+  named two files that never contained it, so the gate failed on green code).
 
 ### G-P1-4 · clear_task_sessions removes per-task session dirs
 - CHECK: `python -m pytest tests/test_app_paths.py -q`
-- EXPECT: `passed` present, `failed` absent; `1 passed` count line present.
+- EXPECT: `passed` present, `failed` absent; `3 passed` count line present
+  (E-07: the file grew to three tests; `1 passed` was never reachable again).
 
 ### G-P1-5 · Ruff real findings cleared
-- CHECK: `python -m ruff check src/ tests/ --select E722,E402,E741,E731 --output-format=concise`
-- EXPECT: `All checks passed` or zero lines with `E722|E402|E741|E731` besides intentional noqa.
+- CHECK: `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401 --output-format=concise`
+  (E-09: run it from an environment that has ruff — `pip install -e .[lint]`; the project
+  venv does not ship ruff)
+- EXPECT: exactly the three intentional `E402` lines in `src/parser/webpage_parser.py:35-37`
+  (imports that must follow the lxml patches) and nothing else: no `E722`, `E741`, `E731`,
+  no `E401`.
 
 ### G-P1-FULL · Phase 1 regression sweep
 - CHECK: `python -m pytest tests -q`

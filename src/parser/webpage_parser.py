@@ -5,6 +5,7 @@
 Webpage parser class for extracting media files and links from webpages
 """
 
+import codecs
 import re
 import json
 import asyncio
@@ -20,7 +21,8 @@ from urllib.parse import urlparse, urljoin
 from src.parser.utils import (
     is_image_url, is_media_url, get_domain,
     normalize_url, is_trash_media, format_proxy_url,
-    is_banner_or_ad, is_format_allowed, is_same_domain
+    is_banner_or_ad, is_format_allowed, is_same_domain,
+    guess_media_type,
 )
 from src.parser.site_pattern_manager import SitePatternManager
 from src import constants as K
@@ -35,6 +37,36 @@ _ZERO_SIZE_RE = re.compile(
 import aiohttp 
 import chardet
 from bs4 import BeautifulSoup
+
+# B-03: an in-page charset declaration (both the HTML5 short form and the legacy
+# http-equiv form end in `charset=<name>`). Bytes pattern: the declaration is
+# matched before the content is decoded.
+_DECLARED_CHARSET_RE = re.compile(
+    rb"<meta[^>]{0,512}?charset\s*=\s*[\"']?\s*([a-zA-Z0-9][a-zA-Z0-9_\-]{1,30})",
+    re.IGNORECASE,
+)
+
+# B-06: attributes that carry human-facing text or styling, never a media URL.
+_NON_URL_ATTRIBUTES = frozenset({
+    "alt", "title", "aria-label", "aria-labelledby", "class", "id", "name", "role",
+    "style", "label", "caption", "description", "text", "content",
+})
+
+
+def _resolve_codec_name(name) -> Optional[str]:
+    """Return Python's canonical codec name, or None when it is unknown.
+
+    Both a page's `<meta charset>` and chardet can name a codec Python does not
+    ship (chardet happily reports "MacRoman"); a name that is not validated here
+    reaches `bytes.decode()` and raises LookupError on every such page.
+    """
+    if not name:
+        return None
+    try:
+        text = name.decode("ascii", "ignore") if isinstance(name, bytes) else str(name)
+        return codecs.lookup(text.strip().strip("\"'").lower()).name
+    except (LookupError, ValueError):
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +139,7 @@ class WebpageParser:
         self._escalated_binary: bool = False  # Set when escalation returned binary media
         self._last_html: Optional[str] = None  # P4: raw HTML for the DOM gateway click
         self._js_gateway_html: Optional[str] = None  # P4: mutated DOM to parse instead of refetch
+        self._empty_body_warned: set = set()  # B-07: warn once per empty-body URL
 
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
@@ -279,6 +312,19 @@ class WebpageParser:
                 logger.error(msg, exc_info=True)
                 return None, K.PARSER_UNKNOWN_ERROR, msg, None
 
+        # B-07: an empty 2xx body is not a network failure. It used to fall into
+        # the sync fallback below (a second request for the same URL) and then
+        # report NETWORK_ERROR, which penalised the domain health for a server
+        # that simply had nothing to say. Report it as a clean empty parse, the
+        # same contract the binary-media guard uses.
+        if content_bytes == b"" and http_status and 200 <= http_status < 300 and not escalation_tried:
+            if self.url not in self._empty_body_warned:
+                if len(self._empty_body_warned) > 200:  # bounded: the log line is per URL
+                    self._empty_body_warned.clear()
+                self._empty_body_warned.add(self.url)
+                logger.warning(f"Empty HTTP {http_status} body for {self.url} — treating it as an empty page")
+            return "", K.PARSER_SUCCESS, f"Empty body (HTTP {http_status})", http_status
+
         # 2. Fallback to requests if aiohttp couldn't fetch bytes (TLS fingerprint / block)
         if not content_bytes and not escalation_tried:
             try:
@@ -325,12 +371,15 @@ class WebpageParser:
         decoded_content: Optional[str] = None
         try:
             decoded_content = content_bytes.decode(encoding, errors="replace")
-        except (UnicodeDecodeError, LookupError) as e:
+        except LookupError as e:
+            # B-03: `errors="replace"` never raises UnicodeDecodeError, so the
+            # only reachable failure here is an unknown codec name — catching the
+            # unreachable half (as the code did) hid that fact.
             msg = f"Failed to decode with {encoding} for {self.url}, falling back to utf-8: {str(e)}"
             logger.warning(msg)
             try:
                 decoded_content = content_bytes.decode("utf-8", errors="replace")
-            except (UnicodeDecodeError, LookupError) as e_utf8:
+            except LookupError as e_utf8:
                 msg_utf8 = f"UTF-8 fallback decoding also failed for {self.url}: {str(e_utf8)}"
                 logger.error(msg_utf8)
                 return None, K.PARSER_CONTENT_DECODE_ERROR, msg_utf8, http_status
@@ -405,11 +454,23 @@ class WebpageParser:
                 pass
 
     async def _detect_encoding(self, content_bytes: bytes) -> str:
+        # 1. Byte-order mark — authoritative.
         if content_bytes.startswith(b"\xef\xbb\xbf"): return "utf-8-sig"
         elif content_bytes.startswith(b"\xff\xfe") or content_bytes.startswith(b"\xfe\xff"): return "utf-16"
-        detected = chardet.detect(content_bytes[:2048]) 
+        # 2. B-03: an in-page declaration beats statistical detection. On a
+        # windows-1251 page whose Cyrillic starts after an ASCII <head>, chardet
+        # reported ascii/utf-8 for the first 2 KB and the body came back as
+        # mojibake — while the <meta charset> sat in the same window.
+        declared = _DECLARED_CHARSET_RE.search(content_bytes[:4096])
+        if declared:
+            codec = _resolve_codec_name(declared.group(1))
+            if codec:
+                return codec
+        # 3. Wider statistical window than the old 2 KB, and a validated name
+        # (chardet can return a codec Python does not know).
+        detected = chardet.detect(content_bytes[:16384])
         encoding = detected["encoding"] if detected["encoding"] else "utf-8"
-        return encoding
+        return _resolve_codec_name(encoding) or "utf-8"
         
     def _extract_js_redirect(self, content: str) -> Optional[str]:
         if not content: return None
@@ -483,6 +544,23 @@ class WebpageParser:
                 logger.debug("Pre-injected adult cookies for LiveJournal")
 
         return self._sync_session
+
+    def _close_sync_session(self) -> None:
+        """B-04: release the sync session on EVERY exit path.
+
+        `parse()` closes it after a successful parse (harvesting its cookies
+        first); the two early returns inside it — an error status and "no
+        content" — returned before that line, so each failed page left a live
+        session and its connection pool behind, one per failure, for the whole
+        task run.
+        """
+        if self._sync_session is None:
+            return
+        try:
+            self._sync_session.close()
+        except Exception as e:
+            logger.debug(f"Closing the sync session failed for {self.url}: {e}")
+        self._sync_session = None
 
     async def _execute_bypass(self, action: Dict[str, Any]) -> bool:
         """Universal utility to 'click' a gateway button, supporting GET/POST and Referer"""
@@ -717,7 +795,23 @@ class WebpageParser:
             srcset_val = element.get(srcset_attr_name, "")
             if srcset_val: candidates.extend(self._parse_srcset(srcset_val))
         for attr_name, value in element.attrs.items():
-            if isinstance(value, str) and re.search(r"\.(jpg|jpeg|png|webp|gif|avif|tiff|bmp)", value.lower()):
+            # B-06: this catch-all used to accept ANY attribute whose value
+            # merely contained an image extension — measured: <img
+            # alt="sunset.jpg"> became a fetchable "sunset.jpg" candidate.
+            # Text/metadata attributes are never URLs, and everything else must
+            # look like one (data-* attributes keep accepting bare relative
+            # paths, which is how lazy loaders write them).
+            if attr_name.lower() in _NON_URL_ATTRIBUTES:
+                continue
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            is_url_shaped = bool(re.match(r"^(?:https?:)?//|^[/.]", stripped)) or (
+                attr_name.lower().startswith("data-") and not re.search(r"\s", stripped)
+            )
+            if not is_url_shaped:
+                continue
+            if re.search(r"\.(jpg|jpeg|png|webp|gif|avif|tiff|bmp)", value.lower()):
                 score = 999999 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
                 candidates.append({"url": value, "width": 0, "score": score, "source": attr_name})
 
@@ -839,7 +933,16 @@ class WebpageParser:
                             self.media_files.append(("image", abs_url, attrs))
                             found += 1
         
+        # B-05: the <picture> pass above already collected every variant of its
+        # inner <img> (all srcset entries, not just the best one), so running
+        # the generic pass over those same elements queued each of them twice.
+        # Deliberately membership-based (containment in <picture>), not URL-based:
+        # two unrelated <img> elements may legitimately share a URL.
+        picture_imgs = {id(i) for picture in soup.find_all("picture")
+                        for i in picture.find_all("img")}
         for img in soup.find_all("img"):
+            if id(img) in picture_imgs:
+                continue
             # 1. Primary Visibility Check (Bot-Trap Defense)
             if not self._is_element_visible(img):
                 logger.debug(f"Skipping hidden img element (bot-trap defense) in {self.url}")
@@ -1426,9 +1529,11 @@ class WebpageParser:
             self._last_html = content if content else None
 
         if error_status: 
+            self._close_sync_session()  # B-04
             return {}, [], error_status, error_message, http_status_code, None
         
         if not content: 
+            self._close_sync_session()  # B-04
             return {}, [], K.PARSER_UNKNOWN_ERROR, "No content fetched and no specific error reported.", http_status_code, None
 
         try:
@@ -1517,12 +1622,7 @@ class WebpageParser:
 
             return self.links, self.media_files, K.PARSER_SUCCESS, "Successfully parsed.", http_status_code, cookies
         except Exception as e:
-            if self._sync_session:
-                try:
-                    self._sync_session.close()
-                except Exception:
-                    pass
-                self._sync_session = None
+            self._close_sync_session()  # B-04
             msg = f"Error during parsing HTML content of {self.url}: {str(e)}"
             logger.error(msg, exc_info=False)
             return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code, None
@@ -1606,7 +1706,7 @@ class WebpageParser:
                         if abs_url in preview_urls:
                             continue
                         attrs = {"source": f"lazy-data-{data_attr_pattern}"}
-                        media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
+                        media_type = guess_media_type(abs_url)  # D-11
                         if self._is_significant_media(media_type, abs_url, attrs):
                             self.media_files.append((media_type, abs_url, attrs))
         except Exception as e:
@@ -1653,7 +1753,7 @@ class WebpageParser:
         elif framework == "angular": src_val = elem.get("lazyLoad") or elem.get("lazyload") or elem.get("ng-src")
         if src_val and is_media_url(src_val):
             abs_url = urljoin(self.url, src_val)
-            media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
+            media_type = guess_media_type(abs_url)  # D-11
             if self._is_significant_media(media_type, abs_url, attrs):
                 self.media_files.append((media_type, abs_url, attrs))
 
@@ -1668,14 +1768,14 @@ class WebpageParser:
                         if isinstance(v_val, str) and is_media_url(v_val):
                             abs_url = urljoin(self.url, v_val)
                             attrs = {"source": f"data-json-{attr_name}-{k}"}
-                            media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
+                            media_type = guess_media_type(abs_url)  # D-11
                             if self._is_significant_media(media_type, abs_url, attrs):
                                 self.media_files.append((media_type, abs_url, attrs))
             except json.JSONDecodeError: pass 
         elif is_media_url(value): 
             abs_url = urljoin(self.url, value)
             attrs = {"source": f"data-direct-{attr_name}"}
-            media_type = "video" if any(ext in abs_url for ext in [".mp4",".webm"]) else "image"
+            media_type = guess_media_type(abs_url)  # D-11
             if self._is_significant_media(media_type, abs_url, attrs):
                 self.media_files.append((media_type, abs_url, attrs))
 

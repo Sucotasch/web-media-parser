@@ -15,6 +15,22 @@ SIEVE_PATH = os.path.join(
 )
 
 
+def require_sieve():
+    """E-03 (2026-10-15): fail loudly when the pinned sieve snapshot is missing.
+
+    `SitePatternManager` guards its sieve path with `os.path.exists(...)`, so a
+    moved/renamed snapshot used to surface as `TypeError: 'NoneType' object is
+    not subscriptable` deep inside a test (or as a silent `pytest.skip`)
+    instead of "prerequisite missing".
+    """
+    if not os.path.exists(SIEVE_PATH):
+        raise AssertionError(
+            f"Imagus sieve snapshot missing: {SIEVE_PATH} — the sieve-dependent "
+            f"tests cannot run (pin lives in tests/helpers.py SIEVE_PATH)."
+        )
+    return SIEVE_PATH
+
+
 class MockGUILogHandler:
     """Minimal log-handler stand-in (accepts any constructor args)."""
 

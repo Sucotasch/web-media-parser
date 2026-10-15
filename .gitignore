@@ -32,6 +32,9 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# F-11: the spec file is the build's source of truth (reviewed line
+# by line against build_exe.py) — keep it trackable, ignore only strays.
+!WebMediaParser.spec
 
 # Installer logs
 pip-log.txt
@@ -182,8 +185,12 @@ downloads/
 *.exe
 settings.json
 task_queue.json
-site_patterns.json
+# A-01: the BUNDLED pattern file must be trackable (a clean clone had zero
+# patterns and `assert pattern_count > 0` failed); stray dev copies stay ignored.
+!resources/patterns/site_patterns.json
 test_patterns.html
+# F-11: the documented extension gate is `node extension/tests/*.test.mjs`.
+node_modules/
 # Release archives (PKG-7: a stray `git add .` must not commit a 100+MB zip)
 WebMediaParser_v*.zip
 WebMediaParser_extension_v*.zip

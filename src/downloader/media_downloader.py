@@ -30,6 +30,49 @@ _filename_lock = threading.Lock()
 # target gets a distinct name instead of both writing the same temp file.
 _reserved_paths: set = set()
 
+# B-11: what a page shell actually starts with. The Content-Type checks trust the
+# server's header, so a photo host that serves its login/interstitial page as
+# `text/plain` (or with no Content-Type at all) used to leave that HTML on disk
+# under a media name with a `success` result.
+_PAGE_SNIFF_PREFIXES = (b"<!doctype", b"<html", b"<head", b"<body", b"{")
+
+
+def body_looks_like_page(prefix, content_type: str = "") -> bool:
+    """True when the leading bytes are an HTML/XML/JSON shell rather than media.
+
+    `<?xml` is a rejection signal only when the server did not declare an image
+    type: a user-enabled `image/svg+xml` legitimately starts with an XML prolog
+    (FIXPLAN_2026-10-15 §1.2/5).
+    """
+    head = bytes(prefix or b"").lstrip()[:64].lower()
+    if not head:
+        return False
+    if head.startswith(_PAGE_SNIFF_PREFIXES):
+        return True
+    return head.startswith(b"<?xml") and "image/" not in (content_type or "").lower()
+
+
+def _has_dotdot_segment(filepath) -> bool:
+    """B-08: True when any RAW path segment is `..`.
+
+    `os.path.normpath` cannot be used for this check: it resolves the segments
+    away, so `a/../b` looks clean (measured: a `..` destination written to the
+    tmp root, and the guard never fired). Both separators are treated as
+    separators because Windows paths reach here with either one.
+    """
+    parts = str(filepath).replace("/", os.sep).replace("\\", os.sep).split(os.sep)
+    return ".." in parts
+
+
+def _chunked_framing(response) -> bool:
+    """B-12/NF-8: does this response carry `Transfer-Encoding: chunked`?
+
+    A chunked body frames itself, so its end is verifiable (requests raises
+    ChunkedEncodingError on a truncated one); a close-delimited body has no such
+    signal.
+    """
+    return "chunked" in (response.headers.get("Transfer-Encoding") or "").lower()
+
 
 def _http_failure_kind(code) -> str:
     """R-C-5/R-C-6: map an HTTP status onto a machine-readable failure kind.
@@ -69,9 +112,17 @@ def create_shared_downloader_session(settings: dict) -> requests.Session:
                 "https": proxy_url
             }
             logger.info(f"Shared downloader session (curl_cffi) configured with proxy: {proxy_url}")
+        # B-09: the download session must follow the same TLS setting as the page
+        # fetch. Only the escalation GET used to read it, so with verify_tls off
+        # (the app default) pages loaded fine and every media download failed the
+        # certificate check. legacy_default=False keeps verification ON for
+        # installs that never touched the setting.
+        session.verify = http_engine.tls_verify(settings, legacy_default=False)
         logger.info(
-            "Shared downloader session created (curl_cffi impersonate=%s, 0 internal retries).",
+            "Shared downloader session created (curl_cffi impersonate=%s, verify=%s, "
+            "0 internal retries).",
             http_engine.impersonate_profile(settings),
+            session.verify,
         )
         return session
 
@@ -107,10 +158,19 @@ def create_shared_downloader_session(settings: dict) -> requests.Session:
             "https": proxy_url
         }
         logger.info(f"Shared downloader session configured with proxy: {proxy_url}")
+    # B-09: the download session follows the same TLS decision as the page fetch
+    # (see the curl_cffi branch). This used to sit inside the `if proxy_url:`
+    # block, so a session without a proxy fell through and was never returned.
+    session.verify = http_engine.tls_verify(settings, legacy_default=False)
     logger.info(
-        "Shared downloader session created with 0 internal retries (Immediate-Stop enabled)."
+        "Shared downloader session created with 0 internal retries "
+        "(Immediate-Stop enabled, verify=%s).", session.verify
     )
     return session
+
+
+class _ContentPageError(IOError):
+    """B-11: a ranged chunk turned out to be an HTML/JSON page instead of media."""
 
 
 class MediaDownloader:
@@ -146,6 +206,15 @@ class MediaDownloader:
             self.session = self._create_session()
             self._owns_session = True
         self.rate_limit = self.settings.get(K.SETTING_MAX_DOWNLOAD_SPEED, 0)  # 0 for unlimited
+        # A-07: hard cap on a single file, 0 = no limit. The settings dict ships
+        # 2 GiB (K.DEFAULT_SETTINGS_VALUES) so a fresh profile has a backstop;
+        # the code fallback stays 0 so a hand-built dict is never capped.
+        self.max_bytes = int(self.settings.get(K.SETTING_MAX_FILE_SIZE, K.DEFAULT_MAX_FILE_SIZE) or 0) * 1024
+        # B-12 strict mode (opt-in): a body with no Content-Length and no chunked
+        # framing has no integrity signal at all, so refuse it instead of keeping
+        # a possibly-truncated file.
+        self.strict_length = bool(self.settings.get(
+            K.SETTING_REQUIRE_VERIFIED_LENGTH, K.DEFAULT_REQUIRE_VERIFIED_LENGTH))
         # Use K.MAX_THREADS_PER_FILE_CAP as a hard upper limit
         self.threads_per_file = min(
             self.settings.get(K.SETTING_THREADS_PER_FILE, K.DEFAULT_THREADS_PER_FILE),
@@ -153,6 +222,8 @@ class MediaDownloader:
         )
 
     def _create_session(self):
+        # B-09: a downloader that builds its own session follows the TLS setting
+        # too (see create_shared_downloader_session).
         # P3: when http_engine=curl_cffi the local session impersonates a real
         # browser TLS fingerprint. urllib3 retry mounting is requests-only; the
         # app-level retry loop in download() covers retries for both engines
@@ -174,6 +245,8 @@ class MediaDownloader:
                 elif referrer_policy == "auto":
                     headers["Referer"] = self.source_url
             session.headers.update(headers)
+            # B-09: follow the TLS setting here too (own-session path).
+            session.verify = http_engine.tls_verify(self.settings, legacy_default=False)
             return session
 
         session = requests.Session()
@@ -209,6 +282,8 @@ class MediaDownloader:
             # If "none", no Referer header is added.
         
         session.headers.update(headers)
+        # B-09: follow the TLS setting here too (own-session path).
+        session.verify = http_engine.tls_verify(self.settings, legacy_default=False)
         return session
 
     def set_progress_callback(self, callback): self.progress_callback = callback
@@ -269,6 +344,17 @@ class MediaDownloader:
             except Exception:
                 pass
             self._escalation_session = None
+
+    def _max_size_error(self):
+        """A-07: the result for a download that crossed Max File Size.
+
+        Local policy, not a host fault: no `failure_kind`, so the domain-health
+        counters in ParserManager (FAILURE_PENALISING) stay untouched.
+        """
+        if not self.max_bytes:
+            return None
+        return {"success": False,
+                "error": f"File exceeds Max File Size ({self.max_bytes // 1024} KB)"}
 
     def _cleanup_partial(self):
         """Remove the current download's half-written .partial file (DL-5).
@@ -347,7 +433,16 @@ class MediaDownloader:
                 retries_left -= 1
                 attempt += 1
                 logger.info(f"Retrying download ({attempt}/{retries_left + attempt}) for {self.url}: {result.get('error')}")
-                time.sleep(0.5 * attempt)
+                # B-13: wait out the backoff in small steps while watching
+                # stop_event. A bare time.sleep(0.5 * attempt) ignored Stop for
+                # the whole pause (measured: Stop at 5.2 s still exited after
+                # 2.36 s), which is exactly the responsiveness Retry(total=0)
+                # exists to protect.
+                deadline = time.time() + 0.5 * attempt
+                while time.time() < deadline:
+                    if self.stop_event and self.stop_event.is_set():
+                        return {"success": False, "error": "Download manually aborted"}
+                    time.sleep(0.1)
         finally:
             # DL-2: release the reserved final name once the file exists on disk
             # (success) or the download is abandoned (failure). os.path.exists then
@@ -357,6 +452,12 @@ class MediaDownloader:
                 _reserved_paths.discard(reserved)
 
     def _ensure_unique_filepath_at_destination(self, current_filepath: str) -> str:
+        # B-08: never reserve a name above the destination tree. The subdirectory
+        # is built from the page URL and urlparse does not normalise dot segments,
+        # so a page path carrying '/../../..' reached the filesystem verbatim and
+        # wrote files next to (or above) the chosen download folder.
+        if _has_dotdot_segment(current_filepath):
+            raise ValueError(f"Path traversal rejected: {current_filepath}")
         with _filename_lock:
             # Release the previous reservation (if any) so a retry of the same
             # downloader re-reserves cleanly instead of leaking stale entries.
@@ -378,6 +479,12 @@ class MediaDownloader:
             return candidate
 
     def _do_download(self, custom_timeout=None):
+        # B-08: a rejected path is a local problem, not a host fault — refuse it
+        # before the unique-name reservation so it never reaches the generic
+        # handler (which would tag it FAILURE_UNEXPECTED and penalise the domain).
+        if _has_dotdot_segment(self.filepath):
+            logger.warning(f"Refusing path outside the download root: {self.filepath}")
+            return {"success": False, "error": f"Path traversal rejected: {self.filepath}"}
         try:
             self.filepath = self._ensure_unique_filepath_at_destination(self.filepath)
             
@@ -427,6 +534,12 @@ class MediaDownloader:
                     min_size_for_type = min_img_size_kb if self.media_type == "image" else min_vid_size_kb
                     if min_size_for_type > 0 and size_kb < min_size_for_type:
                         return {"success": False, "error": f"File too small ({size_kb:.2f}KB < {min_size_for_type}KB)"}
+                    # A-07: a declared body that is already over the cap is refused
+                    # before a single byte is written (and before the MT decision,
+                    # so an enormous file never spawns chunk threads).
+                    if self.max_bytes and content_length > self.max_bytes:
+                        response_head.close()
+                        return self._max_size_error()
             except http_engine.NETWORK_ERROR_EXCEPTIONS as e:
                 logger.warning(f"HEAD request failed for {self.url}: {str(e)}. Will attempt GET.")
 
@@ -454,6 +567,11 @@ class MediaDownloader:
                     logger.info(f"Attempting multi-threaded download for {self.filepath}")
                     result = self._download_with_threads(content_length, custom_timeout=timeout_to_use)
                     if result["success"]: return result
+                    # A-07 / B-11: a size cap or a non-media body is a verdict about
+                    # the file itself — falling back would download it all over
+                    # again only to reach the same conclusion.
+                    if result.get("size_limited") or result.get("failure_kind") == K.FAILURE_CONTENT_PAGE:
+                        return result
                     logger.warning(f"Multi-threaded download failed for {self.filepath}, falling back to single-threaded.")
                 except Exception as e:
                     logger.warning(f"Multi-threaded download for {self.filepath} raised {e}, falling back.", exc_info=True)
@@ -500,6 +618,13 @@ class MediaDownloader:
                 except (TypeError, ValueError):
                     content_length = 0
 
+            # A-07: the same cap on the GET's own length — the HEAD may have been
+            # refused (403/405), in which case only the GET declares the size.
+            if self.max_bytes and content_length > self.max_bytes:
+                response_get.close()
+                self._close_escalation_session()
+                return self._max_size_error()
+
             # Ensure the target directory exists only when we're about to download
             target_dir = os.path.dirname(self.filepath)
             if target_dir:
@@ -513,40 +638,70 @@ class MediaDownloader:
             write_buffer = bytearray()
             temp_path = f"{self.filepath}.{threading.get_ident():x}.partial"
             self._temp_path = temp_path  # DL-5: for cleanup on mid-stream failures
+            # A-07 / B-11 / B-12 / F-14: one abort point for the stream loop. The
+            # result is returned AFTER the file handle is closed: os.remove() on an
+            # open file is refused on Windows (the OSError was swallowed), so every
+            # Stop used to leave its own `.partial` behind for the next run to trip
+            # over. Keeping a single exit also means the size cap, the body sniff
+            # and a disk error cannot disagree about what was written.
+            abort_result = None
+            unverified_length = False
             try:
                 with open(temp_path, mode) as f:
                     start_time = time.time()
                     network_chunk_size = 8192  
                     downloaded_bytes = 0
+                    sniffed = False
                     for chunk in response_get.iter_content(chunk_size=network_chunk_size):
                         if self.stop_event and self.stop_event.is_set():
-                            try: os.remove(temp_path)
-                            except OSError: pass
-                            return {"success": False, "error": "Download manually aborted"}
+                            abort_result = {"success": False, "error": "Download manually aborted"}
+                            break
                         
                         if chunk:
                             write_buffer.extend(chunk)
                             downloaded_bytes += len(chunk)
+                            # A-07: nothing past the cap reaches the disk. The HEAD
+                            # and GET checks above only cover a declared length; this
+                            # one also stops a host that answers 200 with a length
+                            # and then streams without end.
+                            if self.max_bytes and downloaded_bytes > self.max_bytes:
+                                abort_result = self._max_size_error()
+                                break
+                            # B-11: sniff the leading bytes before the first write.
+                            # Re-checked on every chunk until the window is full, so a
+                            # 51-byte login page served as text/plain is caught too.
+                            if not sniffed and body_looks_like_page(write_buffer, get_content_type):
+                                abort_result = {"success": False,
+                                                "error": "Body is not media (sniffed page content)",
+                                                "failure_kind": K.FAILURE_CONTENT_PAGE}
+                                break
+                            if len(write_buffer) >= K.SNIFF_PREFIX_BYTES:
+                                sniffed = True
                             if self.progress_callback:
                                 prog = min(100, int((downloaded_bytes / content_length) * 100)) if content_length > 0 else -1
                                 self.progress_callback(prog)
                             if len(write_buffer) >= K.WRITE_BUFFER_SIZE:
                                 try: f.write(write_buffer); write_buffer.clear()
                                 except Exception as e:
-                                    try: os.remove(temp_path)
-                                    except OSError: pass
-                                    return {"success": False, "error": f"Disk write error: {e}"}
+                                    abort_result = {"success": False, "error": f"Disk write error: {e}"}
+                                    break
                             if self.rate_limit > 0:
                                 elapsed = time.time() - start_time
                                 expected_time = downloaded_bytes / (self.rate_limit * 1024)
                                 if elapsed < expected_time: time.sleep(expected_time - elapsed)
-                    if write_buffer:
+                    if write_buffer and abort_result is None:
                         try:
                             f.write(write_buffer)
                         except Exception as e:
-                            try: os.remove(temp_path)
-                            except OSError: pass
-                            return {"success": False, "error": f"Disk write error: {e}"}
+                            abort_result = {"success": False, "error": f"Disk write error: {e}"}
+
+                # The handle is closed here, so the temp file can really be removed.
+                if abort_result is not None:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return abort_result
 
                 # DL-3: Content-Length is the COMPRESSED size when the server
                 # answers with Content-Encoding (gzip/br/deflate); iter_content
@@ -554,20 +709,51 @@ class MediaDownloader:
                 # delete valid files. Skip the check for encoded responses.
                 # Runs AFTER the with-block closes so getsize sees flushed data.
                 encoding = (response_get.headers.get("Content-Encoding") or "").strip().lower()
-                if content_length > 0 and not encoding:
-                    actual_size = os.path.getsize(temp_path)
+                actual_size = os.path.getsize(temp_path)
+                if actual_size == 0:
+                    # B-12: an empty body is never a media file, known length or not.
+                    abort_result = {"success": False, "error": "Empty body (no data received)"}
+                elif content_length > 0 and not encoding:
                     if actual_size != content_length:
-                        try:
-                            os.remove(temp_path)
-                        except OSError:
-                            pass
-                        return {"success": False, "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
+                        abort_result = {"success": False,
+                                        "error": f"Size mismatch: expected {content_length}, got {actual_size}"}
+                elif content_length <= 0:
+                    # B-12 / NF-8: without Content-Length the only integrity signal is
+                    # the framing. A chunked body carries its own and requests raises
+                    # ChunkedEncodingError on a truncated one (bounded by the read
+                    # timeout); a close-delimited body simply ends when the socket
+                    # closes, so an early end is indistinguishable from a complete
+                    # one — reported as `unverified_length` rather than silently
+                    # trusted. Strict mode (opt-in setting) refuses it instead.
+                    if _chunked_framing(response_get):
+                        pass
+                    elif self.strict_length:
+                        abort_result = {"success": False,
+                                        "error": "No Content-Length and no chunked framing "
+                                                 "(require_verified_length)"}
+                    else:
+                        unverified_length = True
+
+                if abort_result is not None:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return abort_result
 
                 # Atomic rename from .partial to final path
                 os.replace(temp_path, self.filepath)
                 if self.progress_callback: self.progress_callback(100)
+                if unverified_length:
+                    logger.warning(
+                        "Downloaded without a verifiable length (no Content-Length): "
+                        f"{os.path.basename(self.filepath)}"
+                    )
                 logger.info(f"Download completed: {os.path.basename(self.filepath)}")
-                return {"success": True, "message": "File downloaded successfully"}
+                result = {"success": True, "message": "File downloaded successfully"}
+                if unverified_length:
+                    result["unverified_length"] = True
+                return result
             finally:
                 # Close an escalation curl session (if any) after the stream is
                 # consumed or the download aborted — never leak the session.
@@ -620,10 +806,25 @@ class MediaDownloader:
                         os.remove(temp_file)
                     except OSError:
                         pass
+            if progress_dict.get("size_exceeded"):
+                result = self._max_size_error() or {"success": False,
+                                                   "error": "File exceeds Max File Size"}
+                result["size_limited"] = True
+                return result
+            if progress_dict.get("content_page"):
+                return {"success": False, "error": "Webpage/script content in body",
+                        "failure_kind": K.FAILURE_CONTENT_PAGE}
             return {"success": False, "error": f"Chunk failure(s): {progress_dict['errors']}",
                     "failure_kind": K.FAILURE_NETWORK}
+        # B-10 / NF-3: assemble into '{filepath}.mt.partial' and rename. The old
+        # code wrote the final name directly, so an interrupted assembly left a
+        # truncated file under a plausible media name; the next run then saw that
+        # name as taken and picked 'name_1.jpg', preserving the truncated file
+        # forever (and breaking resume).
+        asm_path = f"{self.filepath}.mt.partial"
+        self._temp_path = asm_path  # DL-5 / NF-3: swept on Stop, removed on error
         try:
-            with open(self.filepath, "wb") as outfile:
+            with open(asm_path, "wb") as outfile:
                 for temp_file in temp_files:
                     if not os.path.exists(temp_file): raise IOError(f"Missing part: {temp_file}")
                     with open(temp_file, "rb") as infile: outfile.write(infile.read())
@@ -631,18 +832,19 @@ class MediaDownloader:
                         os.remove(temp_file)
                     except OSError:
                         pass  # Clean up successful part
-            if os.path.getsize(self.filepath) != total_size:
+            if os.path.getsize(asm_path) != total_size:
                 try:
-                    os.remove(self.filepath)
+                    os.remove(asm_path)
                 except OSError:
                     pass
                 return {"success": False, "error": "Combined file size mismatch"}
+            os.replace(asm_path, self.filepath)
             if self.progress_callback: self.progress_callback(100)
             return {"success": True, "message": "Multi-threaded download success"}
         except Exception as e:
-            if os.path.exists(self.filepath):
+            if os.path.exists(asm_path):
                 try:
-                    os.remove(self.filepath)
+                    os.remove(asm_path)
                 except OSError:
                     pass
             return {"success": False, "error": f"Combining/verifying error: {e}"}
@@ -680,6 +882,7 @@ class MediaDownloader:
                     raise IOError(f"Webpage/script content (Content-Type: {chunk_ct})")
                 write_buffer_chunk = bytearray()
                 downloaded_this_chunk = 0 # For this specific chunk part
+                sniffed = False
                 with open(filename, "wb") as f:
                     for chunk_data in response.iter_content(chunk_size=network_chunk_size_thread):
                         if not progress_dict["success"]: return # Check if another thread failed
@@ -691,6 +894,23 @@ class MediaDownloader:
                         if chunk_data:
                             write_buffer_chunk.extend(chunk_data)
                             downloaded_this_chunk += len(chunk_data)
+                            # A-07: same cap as the single-threaded loop. Chunk sizes
+                            # are bounded by the requested range, so this only fires
+                            # when a server ignores Range and streams more than asked.
+                            if self.max_bytes and downloaded_this_chunk > self.max_bytes:
+                                with progress_lock:
+                                    progress_dict["success"] = False
+                                    progress_dict["size_exceeded"] = True
+                                    progress_dict["errors"].append("File exceeds Max File Size")
+                                return
+                            # B-11: only the part that starts at offset 0 sees the real
+                            # beginning of the file — a ranged chunk of a valid image
+                            # legitimately starts mid-binary and must not be sniffed.
+                            if start == 0 and not sniffed:
+                                if body_looks_like_page(write_buffer_chunk, chunk_ct):
+                                    raise _ContentPageError("Body is not media (sniffed page content)")
+                                if len(write_buffer_chunk) >= K.SNIFF_PREFIX_BYTES:
+                                    sniffed = True
                             with progress_lock:
                                 progress_dict["total"] += len(chunk_data) # Update overall progress
                                 if self.progress_callback:
@@ -727,3 +947,5 @@ class MediaDownloader:
             with progress_lock:
                 progress_dict["success"] = False
                 progress_dict["errors"].append(error_msg)
+                if isinstance(e, _ContentPageError):
+                    progress_dict["content_page"] = True

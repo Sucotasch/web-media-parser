@@ -323,3 +323,119 @@ def test_webpage_parser_escalate_binary_flag(monkeypatch):
     monkeypatch.setattr(http_engine, "create_escalation_session", lambda s: fake_session)
     out = asyncio.run(p._try_escalate_fetch())
     assert out == (b"", 200, True)
+# --- B-14: one-shot warning flags under concurrency --------------------------
+
+def test_one_shot_warnings_are_emitted_once_under_concurrency(caplog, monkeypatch):
+    """B-14: 16 threads × 10 rounds produce exactly ONE warning per flag.
+
+    Companion to the deterministic lock tests below, which are the actual
+    detectors: this one stresses the same paths for the properties a stress test
+    can see — no deadlock, no exception, no duplicate line on this scheduler.
+    Measured: it stays green even without the lock (the GIL keeps the
+    check-then-set window too narrow to hit reliably), so it is deliberately not
+    presented as a race detector.
+    """
+    import logging
+    import sys
+    import threading
+
+    from src.parser import http_engine as he
+
+    with he._warn_lock:
+        he._missing_warned = False
+        he._unverified_warned = False
+    monkeypatch.setattr(he, "CURL_CFFI_AVAILABLE", False)
+
+    settings = {K.SETTING_HTTP_ENGINE: "curl_cffi", K.SETTING_VERIFY_TLS: False}
+    barrier = threading.Barrier(16)
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(10):
+                barrier.wait()
+                he.engine_uses_curl(settings)
+                he.tls_verify(settings)
+        except Exception as e:  # a lock bug would surface as a deadlock/error
+            errors.append(e)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.parser.http_engine"):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+    finally:
+        sys.setswitchinterval(interval)
+
+    assert not errors, f"workers raised: {errors}"
+    assert not any(t.is_alive() for t in threads), "a worker hung (deadlock?)"
+
+    fallback = [r for r in caplog.records if "curl_cffi is not installed" in r.getMessage()]
+    unverified = [r for r in caplog.records if "TLS verification is disabled" in r.getMessage()]
+    assert len(fallback) == 1, f"curl_cffi fallback warning logged {len(fallback)} times"
+    assert len(unverified) == 1, f"unverified-TLS warning logged {len(unverified)} times"
+def test_warning_decision_for_unverified_tls_is_made_under_the_lock(monkeypatch):
+    """B-14 (detector): the flag+warning pair must serialize on `_warn_lock`.
+
+    Deterministic, unlike a stress test: the test holds `_warn_lock` itself, so
+    a caller that does not take the lock logs immediately and is caught here,
+    while a caller that does take it cannot log until the lock is released.
+    """
+    import threading
+
+    from src.parser import http_engine as he
+
+    he._unverified_warned = False
+    logged = threading.Event()
+    real_warning = he.logger.warning
+
+    def spy(*args, **kwargs):
+        logged.set()
+        real_warning(*args, **kwargs)
+
+    monkeypatch.setattr(he.logger, "warning", spy)
+    settings = {K.SETTING_VERIFY_TLS: False}
+
+    with he._warn_lock:
+        t = threading.Thread(target=lambda: he.tls_verify(settings))
+        t.start()
+        assert not logged.wait(0.3), (
+            "tls_verify logged its one-shot warning while _warn_lock was held — "
+            "the one-shot decision is not protected"
+        )
+    t.join(timeout=5)
+    assert logged.is_set(), "tls_verify never logged after the lock was released"
+
+
+def test_warning_decision_for_missing_curl_is_made_under_the_lock(monkeypatch):
+    """B-14 (detector): the curl_cffi fallback warning is protected too."""
+    import threading
+
+    from src.parser import http_engine as he
+
+    with he._warn_lock:
+        he._missing_warned = False
+    monkeypatch.setattr(he, "CURL_CFFI_AVAILABLE", False)
+    logged = threading.Event()
+    real_warning = he.logger.warning
+
+    def spy(*args, **kwargs):
+        logged.set()
+        real_warning(*args, **kwargs)
+
+    monkeypatch.setattr(he.logger, "warning", spy)
+    settings = {K.SETTING_HTTP_ENGINE: "curl_cffi"}
+
+    with he._warn_lock:
+        t = threading.Thread(target=lambda: he.engine_uses_curl(settings))
+        t.start()
+        assert not logged.wait(0.3), (
+            "engine_uses_curl logged the fallback warning while _warn_lock was "
+            "held — the one-shot decision is not protected"
+        )
+    t.join(timeout=5)
+    assert logged.is_set(), "engine_uses_curl never logged after the lock was released"

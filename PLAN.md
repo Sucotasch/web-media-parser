@@ -6,7 +6,11 @@ Mod reference: `../Imagus-Mass-Download-Mod/` (MIT badge in README.md, owned by 
 **Discipline:** each item lists the concrete solution (grounded in real code, with line refs), files
 touched, and an acceptance gate (`CHECK` → `EXPECT`) that must pass before the item is done.
 No item starts before its gate is written here. New defects found during work are logged in §8
-immediately, never ignored. Baseline: `7bac98b`, 265 passed / 30 skipped.
+immediately, never ignored. Baseline: `7bac98b` (2026-09-09), 265 passed / 30 skipped at that commit; re-measured 2026-10-15: 345 passed / 30 skipped.
+
+The defect plan built on the 2026-10-15 audit is `Audit/FIXPLAN_2026-10-15.md`; its stages and gates
+live in `GATES.2026-10-15.md` (stages 0-3 met; current tree: 443 passed / 30 skipped, node suite and
+the ruff selection green). Stages 4-8 are the remaining work.
 
 ---
 

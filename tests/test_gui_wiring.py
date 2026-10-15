@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""C-01 / C-03 / C-06 / C-09 (2026-10-15): GUI wiring for failures and persistence.
+
+C-01 — a busy extension port was swallowed in a background thread, so the window
+       looked healthy while every extension request failed with "Desktop app not
+       reachable". Asserted here against two real servers (no Qt).
+C-03 — the sieve download read the last SAVED path while the user was looking at
+       the widget, so an unsaved selection was ignored or the previously saved
+       file was overwritten with the wrong content. Asserted against a real
+       SettingsDialog (offscreen Qt).
+C-06 — the replaced QThread must be handed to Qt before the reference is dropped
+       (a timed-out wait() otherwise leads to "QThread: Destroyed while thread is
+       still running").
+C-09 — task_queue.json is written when the queue changes, not only on a clean
+       window close.
+
+C-06/C-09 are wiring inside MainWindow; instantiating it in a test would bind
+port 19876, read and rewrite the real task_queue.json and start the 2 s stats
+timer, so the GUI half is pinned at source level while the manager-side half of
+C-09 (the signals the debounce listens to) is asserted at runtime.
+"""
+
+import asyncio
+import io
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src import constants as K
+from src.core.task_queue_manager import TaskQueueManager
+from src.server.http_server import ExtensionServer
+
+MAIN_WINDOW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "src", "gui", "main_window.py")
+
+
+def _free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class TestExtensionServerPortConflict(unittest.TestCase):
+    """C-01: the second instance must be able to say why the port is unavailable."""
+
+    def test_starting_on_a_busy_port_records_the_reason(self):
+        port = _free_port()
+
+        async def go():
+            first = ExtensionServer(port=port)
+            second = ExtensionServer(port=port)
+            await first.start()
+            try:
+                raised = None
+                try:
+                    await second.start()
+                except Exception as e:  # noqa: BLE001 - the point is that it raises
+                    raised = e
+                return first, second, raised
+            finally:
+                await first.stop()
+
+        first, second, raised = asyncio.run(go())
+
+        self.assertIsNone(first.start_error,
+                          "a successful start must not leave an error behind")
+        self.assertIsNotNone(raised,
+                             "starting on a busy port must not look like success")
+        self.assertTrue(second.start_error,
+                        "start_error must carry the reason for the GUI to display")
+        self.assertIn(str(port), second.start_error,
+                      "the recorded error should name the port that failed")
+
+    def test_start_error_is_reset_on_a_later_successful_start(self):
+        server = ExtensionServer(port=_free_port())
+        server.start_error = "stale failure from a previous start"
+
+        async def go():
+            await server.start()
+            error = server.start_error
+            await server.stop()
+            return error
+
+        self.assertIsNone(asyncio.run(go()))
+
+
+class TestSieveDownloadUsesTheVisiblePath(unittest.TestCase):
+    """C-03: `Download latest` must target the path shown in the dialog.
+
+    Runs a real SettingsDialog under Qt's offscreen platform; skips when Qt
+    cannot initialize (no plugin available).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"PySide6 unavailable: {e}")
+        try:
+            cls.app = QApplication.instance() or QApplication([])
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"Qt could not initialize: {e}")
+
+    def _dialog(self):
+        from src.gui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog()
+        self.addCleanup(dialog.deleteLater)
+        return dialog
+
+    def _tmpdir(self):
+        path = tempfile.mkdtemp(prefix="wmp_gui_")
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    def test_unsaved_path_from_the_widget_wins(self):
+        dialog = self._dialog()
+        seen = {}
+
+        class _FakePatternManager:
+            def __init__(self, enable_built_in=False, imagus_sieve_path=None, **kwargs):
+                seen["path"] = imagus_sieve_path
+
+            def download_imagus_from_url(self, url, timeout=None):
+                seen["url"] = url
+                return True, "ok"
+
+        widget_path = os.path.join(self._tmpdir(), "chosen.json")
+        stale_path = os.path.join(self._tmpdir(), "previously_saved.json")
+        dialog.imagus_sieve_edit.setText(widget_path)
+        dialog.sieve_repo_edit.setText("https://example.com/sieve.json")
+        dialog.settings[K.SETTING_IMAGUS_SIEVE_PATH] = stale_path
+
+        with patch("src.parser.site_pattern_manager.SitePatternManager", _FakePatternManager):
+            dialog._on_sieve_download()
+
+        self.assertEqual(seen.get("path"), widget_path,
+                         "the download used the saved path instead of the visible one")
+        self.assertEqual(dialog.settings[K.SETTING_IMAGUS_SIEVE_PATH], widget_path,
+                         "the dialog's settings were left out of sync with its widget")
+
+    def test_empty_path_asks_for_one_instead_of_downloading(self):
+        dialog = self._dialog()
+        dialog.imagus_sieve_edit.setText("")
+        dialog.sieve_repo_edit.setText("https://example.com/sieve.json")
+        dialog.settings[K.SETTING_IMAGUS_SIEVE_PATH] = ""
+
+        with patch("src.parser.site_pattern_manager.SitePatternManager") as pm:
+            dialog._on_sieve_download()
+
+        pm.assert_not_called()
+        self.assertIn("sieve file", dialog.sieve_status_label.text().lower())
+
+
+class TestMainWindowWiring(unittest.TestCase):
+    """C-06 / C-09 / C-01: source-level wiring guards (see the module docstring)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with io.open(MAIN_WINDOW_PATH, encoding="utf-8") as f:
+            cls.source = f.read()
+
+    def test_replaced_qthread_is_handed_to_qt(self):
+        self.assertIn("old_thread.finished.connect(old_thread.deleteLater)", self.source,
+                      "C-06: the replaced QThread is never deleted by Qt")
+        self.assertIn("self.parser_thread = None", self.source,
+                      "C-06: the old thread reference is not cleared before replacement")
+
+    def test_queue_signals_mark_the_file_dirty(self):
+        for signal in ("task_added", "task_removed", "task_status_changed"):
+            self.assertIn(f"self.task_queue.{signal}.connect(self._mark_queue_dirty)",
+                          self.source, f"C-09: {signal} does not mark the queue dirty")
+
+    def test_periodic_timer_autosaves_the_queue(self):
+        self.assertIn("self._autosave_queue()", self.source)
+        self.assertIn("self.task_queue.save(queue_path())", self.source)
+
+    def test_server_start_failure_reaches_the_gui(self):
+        self.assertIn("extension_server_failed = Signal(str)", self.source)
+        self.assertIn("self.extension_server_failed.emit(", self.source)
+        self.assertIn("QMessageBox.warning(self, \"Extension API unavailable\"", self.source)
+
+
+class TestQueueSignalsThatDriveAutosave(unittest.TestCase):
+    """Runtime half of C-09: the signals the debounce listens to really fire."""
+
+    def test_add_status_and_remove_emit(self):
+        tm = TaskQueueManager(base_download_dir=tempfile.mkdtemp(prefix="wmp_q_"))
+        self.addCleanup(shutil.rmtree, tm.base_download_dir, True)
+        fired = {"added": 0, "removed": 0, "status": 0}
+        tm.task_added.connect(lambda *_: fired.__setitem__("added", fired["added"] + 1))
+        tm.task_removed.connect(lambda *_: fired.__setitem__("removed", fired["removed"] + 1))
+        tm.task_status_changed.connect(
+            lambda *_: fired.__setitem__("status", fired["status"] + 1))
+
+        task = tm.add_task("https://a.example/", {}, "/tmp/out/a")
+        tm.start_task(task.id)
+        tm.clear_active()  # an active task is deliberately not removable
+        tm.remove_task(task.id)
+
+        self.assertEqual(fired["added"], 1)
+        self.assertGreaterEqual(fired["status"], 1)
+        self.assertEqual(fired["removed"], 1)
+
+    def test_save_is_atomic_and_round_trips(self):
+        tm = TaskQueueManager(base_download_dir=tempfile.mkdtemp(prefix="wmp_q_"))
+        self.addCleanup(shutil.rmtree, tm.base_download_dir, True)
+        tm.add_task("https://a.example/", {"retry_count": 3}, "/tmp/out/a")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "task_queue.json")
+            tm.save(path)
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            fresh = TaskQueueManager(base_download_dir=d)
+            self.assertEqual(fresh.load(path), 1)

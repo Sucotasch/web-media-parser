@@ -25,7 +25,7 @@ from src.parser.priority_url_queue import PriorityURLQueue
 from src.parser.parser_manager import ParserManager
 from src import constants as K
 
-from helpers import MockGUILogHandler, SIEVE_PATH
+from helpers import MockGUILogHandler, SIEVE_PATH, require_sieve
 
 SIEVE = SIEVE_PATH  # TST-5: single canonical sieve snapshot (July)
 IMX_LINK = "https://imx.to/i/6xt7ux"
@@ -38,6 +38,7 @@ class TestSieveLinkChain(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        require_sieve()  # E-03: loud failure instead of TypeError deep in a test
         cls.pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=SIEVE)
 
     def test_get_link_rule_matches_imx(self):
@@ -55,15 +56,37 @@ class TestSieveLinkChain(unittest.TestCase):
         self.assertIsNone(self.pm.apply_link_url_transform(rule, m))
 
     def test_data_template_rejected_js_branch(self):
-        """C-4: the JS url-branch must also refuse data: results."""
+        """C-4: without a JS engine the JS url-branch contributes nothing at all.
+
+        E-04 (2026-10-15): the old assertion (`result is None or not
+        result[0].startswith("data:")`) passed in every world and never reached
+        the guard it names — with `js_engine=None` the branch returns before it.
+        The honest contract for this configuration is exactly `None`.
+        """
         import re as _re
         rule = {"link": "^https?://example\\.com/img/", "url": ":'data:,'+$[1]", "res": "x"}
         m = _re.search(rule["link"], "https://example.com/img/abc123")
         self.assertIsNotNone(m)
-        # js_engine is None in this suite -> JS branch returns None before the
-        # data: check; assert the contract holds either way.
-        result = self.pm.apply_link_url_transform(rule, m)
-        self.assertTrue(result is None or not result[0].startswith("data:"))
+        self.assertIsNone(self.pm.apply_link_url_transform(rule, m))
+
+    def test_data_template_rejected_when_js_engine_returns_data(self):
+        """C-4: the guard at site_pattern_manager.py:1069 refuses a data: result.
+
+        Exercised with a JS-engine double so the branch (and the guard) actually
+        run — the case the old test could not reach.
+        """
+        import re as _re
+
+        class _DataEngine:
+            def run_js(self, code, groups, page_url):
+                return "data:,evil"
+
+        pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=SIEVE,
+                                js_engine=_DataEngine())
+        rule = {"link": "^https?://example\\.com/img/", "url": ":'data:,'+$[1]", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/img/abc123")
+        self.assertIsNotNone(m)
+        self.assertIsNone(pm.apply_link_url_transform(rule, m))
 
     def test_get_link_rule_returns_none_for_unmatched(self):
         # Empty/invalid inputs never match any rule.
@@ -241,6 +264,16 @@ class TestLoopChainResolution(unittest.TestCase):
         async def __aexit__(self, exc_type, exc_val, exc_tb):
             return False
 
+    def _tmpdir(self):
+        """F-08: bare mkdtemp leaked one %TEMP% dir per call (measured: 3 for
+        this file alone, 13 for the whole suite). addCleanup removes it even
+        when an assertion fails."""
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="wmp_fsd_")
+        self.addCleanup(tmp.cleanup)
+        return tmp.name
+
     @staticmethod
     def _sieve_file(tmp_path, loop_flag):
         import json
@@ -274,8 +307,7 @@ class TestLoopChainResolution(unittest.TestCase):
         return pm
 
     def test_loop_chain_resolves_multi_hop(self, ):
-        import tempfile
-        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=True)
+        sieve = self._sieve_file(self._tmpdir(), loop_flag=True)
         pm = self._make_manager(sieve)
         session = AsyncMock()
 
@@ -305,8 +337,7 @@ class TestLoopChainResolution(unittest.TestCase):
         self.assertEqual(session.get.call_count, 2)
 
     def test_without_loop_flag_chain_stops_at_first_hop(self):
-        import tempfile
-        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=False)
+        sieve = self._sieve_file(self._tmpdir(), loop_flag=False)
         pm = self._make_manager(sieve)
         session = AsyncMock()
 
@@ -325,8 +356,8 @@ class TestLoopChainResolution(unittest.TestCase):
         self.assertEqual(session.get.call_count, 1)
 
     def test_cyclic_loop_chain_terminates(self):
-        import tempfile, json as jsonlib
-        sieve = self._sieve_file(tempfile.mkdtemp(), loop_flag=True)
+        import json as jsonlib
+        sieve = self._sieve_file(self._tmpdir(), loop_flag=True)
         # Make the two rules point at each other (cycle): Hop1 -> Hop2 -> Hop1
         data = jsonlib.load(open(sieve, encoding="utf-8"))
         data["Hop2"] = {

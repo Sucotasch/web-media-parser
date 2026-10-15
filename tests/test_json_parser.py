@@ -95,8 +95,9 @@ class TestInvokeParserJsonBranch(unittest.TestCase):
             [(t, u) for t, u, _ in media],
             [("image", "https://cdn.example.com/pic.jpg")],
         )
-        # A JSON API must also surface pagination links, not only media.
-        self.assertIsInstance(links, set)
+        # F-09: `assertIsInstance(links, set)` could not fail. This payload has
+        # no pagination field, so the contract is an empty link set.
+        self.assertEqual(links, set())
 
     def test_json_branch_does_not_raise_typeerror(self):
         """Regression: the old `async with JSONWebpageParser(...)` raised
@@ -206,10 +207,16 @@ class TestRc1NestedMediaAndPagination(unittest.TestCase):
         self.assertEqual(self._links({"item": {"href": "https://example.com/x"}}), set())
 
     def test_scan_is_bounded_on_pathological_payload(self):
+        # F-09: the old test only *called* the scanner (no assertion at all).
+        # A 60-deep payload must neither raise RecursionError nor surface the
+        # buried link — and the control below proves the assertion is not
+        # vacuous (one level up the same link IS found).
         deep = {"next": self.FEED + "?page=2"}
         for _ in range(60):
             deep = {"a": deep}
-        self._links(deep)  # must not raise RecursionError
+        self.assertEqual(self._links(deep), set())
+        self.assertEqual(self._links({"next": self.FEED + "?page=2"}),
+                         {self.FEED + "?page=2"})
 
 
 if __name__ == "__main__":

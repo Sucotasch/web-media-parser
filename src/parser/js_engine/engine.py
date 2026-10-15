@@ -36,6 +36,7 @@ import shutil
 import logging
 import threading
 import subprocess
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,12 @@ class DenoJsEngine:
         self._gateway_lock = threading.Lock()
         self._cache = {}
         self._cache_order = []
+        # B-19: a doomed worker used to be completely silent (stderr=DEVNULL,
+        # every failure path logged at DEBUG). Keep the worker's stderr in a
+        # per-engine temp file so a broken bundled cache / a syntax error in
+        # worker.js surfaces as one warning instead of nothing happening.
+        self._stderr_log = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
+        self._stderr_flagged = False
 
     # --- availability ---------------------------------------------------
 
@@ -244,7 +251,7 @@ class DenoJsEngine:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._stderr_log,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -252,21 +259,50 @@ class DenoJsEngine:
                 **_popen_kwargs(),
             )
         except Exception as e:
-            logger.debug(f"Deno worker spawn failed: {e}")
+            logger.warning(f"Deno worker spawn failed: {e}")
+            self._log_stderr_tail("spawn failure")
             self._proc = None
             raise
         return self._proc
 
-    @staticmethod
-    def _kill_worker(proc):
+    def _log_stderr_tail(self, reason: str = "", limit: int = 2000) -> None:
+        """B-19: log the worker's stderr once, when something went wrong.
+
+        Without this, a worker that dies on every call (incomplete bundled
+        deno_cache, syntax error in worker.js) produced zero log lines above
+        DEBUG — the user turned the engine on and nothing happened. One-shot: a
+        reproducibly broken setup would otherwise log per call.
+        """
+        if self._stderr_flagged:
+            return
+        try:
+            self._stderr_log.flush()
+            self._stderr_log.seek(0)
+            tail = self._stderr_log.read()[-limit:]
+        except Exception:
+            return
+        if not tail or not tail.strip():
+            return
+        self._stderr_flagged = True
+        logger.warning(f"Deno worker stderr{' (' + reason + ')' if reason else ''}: "
+                       f"{tail.strip()[-limit:]!r}")
+
+    def _kill_worker(self, proc):
         """Terminate a worker subprocess and fully reap it (DL-9).
 
         A bare kill() leaves the child un-reaped (zombie on POSIX until GC,
         leaked handles on Windows). Bounded: 2s grace for terminate(), then
         kill() + a final wait() to reap.
+
+        B-15: this used to swallow every failure silently — a worker that
+        refused to die leaked as a process plus two pipe handles per timed-out
+        call, with no trace in the log. Failures are now reported, the pipes are
+        closed (the survivor never sees EOF otherwise), and the caller decides
+        whether the handle can be dropped.
         """
         if proc is None:
             return
+        reaped = False
         try:
             if proc.poll() is None:
                 proc.terminate()
@@ -281,12 +317,44 @@ class DenoJsEngine:
                         proc.wait(timeout=1)
                     except Exception:
                         pass
-        except Exception:
-            pass
+            reaped = proc.poll() is not None
+        except Exception as e:
+            logger.warning(f"Deno worker reap failed: {e}")
+            self._log_stderr_tail("reap failure")
+        finally:
+            for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+            # stderr is the engine's own temp file (B-19) — closing it here would
+            # break the next spawn; only a foreign stderr handle is closed.
+            proc_stderr = getattr(proc, "stderr", None)
+            if proc_stderr is not None and proc_stderr is not self._stderr_log:
+                try:
+                    proc_stderr.close()
+                except Exception:
+                    pass
+        if not reaped:
+            self._log_stderr_tail("worker survived terminate/kill")
 
     def _kill_proc(self):
-        proc, self._proc = self._proc, None
+        """Kill the plain worker, keeping the handle while it is still alive.
+
+        B-15: `self._proc` used to be cleared before the kill was attempted, so a
+        failed kill made the live process invisible: nothing would ever reap it
+        and the next call spawned a second worker next to it.
+        """
+        proc = self._proc
+        if proc is None:
+            return
         self._kill_worker(proc)
+        if proc.poll() is None:
+            logger.warning("Deno worker is still alive after terminate()/kill() — "
+                           "keeping the handle so it can be retried")
+            return
+        self._proc = None
 
     def _ensure_dom_proc(self):
         if self._dom_proc is not None and self._dom_proc.poll() is None:
@@ -299,7 +367,7 @@ class DenoJsEngine:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._stderr_log,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -308,14 +376,21 @@ class DenoJsEngine:
                 **_popen_kwargs(),
             )
         except Exception as e:
-            logger.debug(f"Deno DOM worker spawn failed: {e}")
+            logger.warning(f"Deno DOM worker spawn failed: {e}")
+            self._log_stderr_tail("DOM spawn failure")
             self._dom_proc = None
             raise
         return self._dom_proc
 
     def _kill_dom_proc(self):
-        proc, self._dom_proc = self._dom_proc, None
+        proc = self._dom_proc
+        if proc is None:
+            return
         self._kill_worker(proc)
+        if proc.poll() is None:
+            logger.warning("Deno DOM worker is still alive after terminate()/kill()")
+            return
+        self._dom_proc = None
 
     def _ensure_gateway_proc(self):
         """Spawn the P4 gateway worker (happy-dom, JS evaluation ON).
@@ -334,7 +409,7 @@ class DenoJsEngine:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=self._stderr_log,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -343,14 +418,21 @@ class DenoJsEngine:
                 **_popen_kwargs(),
             )
         except Exception as e:
-            logger.debug(f"Deno gateway worker spawn failed: {e}")
+            logger.warning(f"Deno gateway worker spawn failed: {e}")
+            self._log_stderr_tail("gateway spawn failure")
             self._gateway_proc = None
             raise
         return self._gateway_proc
 
     def _kill_gateway_proc(self):
-        proc, self._gateway_proc = self._gateway_proc, None
+        proc = self._gateway_proc
+        if proc is None:
+            return
         self._kill_worker(proc)
+        if proc.poll() is None:
+            logger.warning("Deno gateway worker is still alive after terminate()/kill()")
+            return
+        self._gateway_proc = None
 
     def shutdown(self):
         """Terminate all workers. Safe to call multiple times."""
@@ -362,6 +444,12 @@ class DenoJsEngine:
             self._kill_dom_proc()
         with self._gateway_lock:
             self._kill_gateway_proc()
+        # B-19: release the stderr temp file. Safe to call repeatedly (`shutdown`
+        # is documented as idempotent); a closed file only costs the tail log.
+        try:
+            self._stderr_log.close()
+        except Exception:
+            pass
 
     # --- cache ----------------------------------------------------------
 
@@ -461,9 +549,16 @@ class DenoJsEngine:
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():
-            # Worker is stuck (infinite loop inside a rule). Kill and re-raise.
-            (killer or self._kill_proc)()
-            raise TimeoutError("Deno worker timed out")
+            # B-16: `join` can return while the reader is still a few
+            # microseconds away from storing its line, so a response that
+            # arrived exactly at the deadline used to be thrown away — together
+            # with the healthy worker, at the cost of a ~300 ms cold respawn on
+            # the next call. Give the reader a short grace and re-check.
+            t.join(timeout=0.05)
+            if t.is_alive():
+                # Worker is stuck (infinite loop inside a rule). Kill and re-raise.
+                (killer or self._kill_proc)()
+                raise TimeoutError("Deno worker timed out")
         line = result_holder[0]
         if not line:
             raise OSError("Deno worker closed stdout")

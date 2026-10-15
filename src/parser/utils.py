@@ -125,13 +125,49 @@ def is_format_allowed(url, media_type="image", settings=None):
 
 def get_domain(url):
     """
-    Extract domain from URL
+    Extract domain from URL.
+
+    D-12: lowercased. Hosts are case-insensitive, and everything that consumes a
+    domain already lowercases it (sieve rule keys, `get_patterns_for_url`, the
+    domain blocklist, per-domain counters). Returning the raw netloc meant an
+    uppercase host — legal in HTML hrefs, and `urljoin` preserves it — matched no
+    sieve rule at all.
     """
     try:
         parsed_url = urlparse(url)
-        return parsed_url.netloc
+        return parsed_url.netloc.lower()
     except Exception:
         return ""
+
+
+def guess_media_type(url):
+    """Classify a media URL as image/video/audio from its extension (D-11).
+
+    One implementation for every discovery route. The JSON route had its own
+    copy and the HTML route four inline
+    `"video" if any(ext in url for ext in [".mp4", ".webm"]) else "image"`
+    copies, so the same URL got a different type — and therefore a different
+    format allowlist — depending on where it was found (clip.mov / song.mp3 were
+    "image" on the HTML route).
+
+    Unknown extensions default to "image": a CDN path or media query with no
+    extension is almost always a picture, and the download stats/filenames only
+    understand image/video.
+    """
+    url_lower = (url or "").lower()
+    try:
+        path = urlparse(url_lower).path
+    except Exception:
+        path = url_lower
+    if any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS):
+        return "image"
+    if any(path.endswith(ext) for ext in K.VIDEO_EXTENSIONS):
+        return "video"
+    if any(path.endswith(ext) for ext in K.AUDIO_EXTENSIONS):
+        return "audio"
+    if any(platform in url_lower for platform in K.VIDEO_PLATFORM_INDICATORS):
+        return "video"
+    return "image"
 
 
 def is_webpage_url(url):
@@ -517,6 +553,12 @@ _AD_KEYWORDS = (
     # known ad networks / trackers (host-level; high precision)
     "adsense", "doubleclick", "googlesyndication", "googleadservices",
     "adnxs", "taboola", "outbrain", "adservice", "adroll", "criteo",
+    # D-10: the union of the two token tables that used to exist. These came
+    # from junk_filter.AD_PATH_TOKENS and were only applied by the MEDIA gate, so
+    # a URL like /impressions/1.jpg was dropped as an ad while /impressions/1 was
+    # happily crawled as a page. junk_filter now delegates here.
+    "impression", "beacon", "affiliate", "popunder",
+    "mgid", "revcontent", "juicyads", "exoclick", "propellerads", "popads",
 )
 
 # Tokens are split on any non-word character. A token matches a keyword when

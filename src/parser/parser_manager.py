@@ -37,6 +37,7 @@ from src.parser.utils import (
     is_same_domain,
     normalize_url,
     format_proxy_url,
+    registrable_domain,
     is_format_allowed,
     should_skip_crawl_url,
     # is_image_url, # Not used directly
@@ -140,6 +141,11 @@ class ParserManager(QObject):
         self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
         self._active_tasks = 0
         self._active_tasks_lock = threading.Lock()
+        # A-03: items taken out of a queue but not finished yet. They live in no
+        # queue's own storage, so a snapshot without them silently loses the
+        # page or the download that was in flight when the user hit Pause.
+        self._inflight_url_item = None
+        self._inflight_media = None
         
         self.loop = asyncio.new_event_loop()
         # DL-7: start_url is passed so browser-extension cookies are scoped to the
@@ -192,7 +198,19 @@ class ParserManager(QObject):
                     for line in f:
                         domain = line.strip()
                         if domain and not domain.startswith("#"):
-                            blocked_domains.add(domain)
+                            # A-04: store the entry lowercased/normalized plus its
+                            # registrable form, so "www.example.com" in the file
+                            # also blocks "example.com" and the other way round.
+                            # IPs keep their literal form (deriving a base domain
+                            # from "1.2.3.4" would yield the nonsense "3.4").
+                            entry = domain.strip().lower().lstrip("*.").rstrip(".")
+                            if not entry:
+                                continue
+                            blocked_domains.add(entry)
+                            if not all(part.isdigit() for part in entry.split(".")):
+                                base = registrable_domain(entry)
+                                if base:
+                                    blocked_domains.add(base)
                 logger.info(f"Loaded {len(blocked_domains)} domains into the blocklist from {path_to_load}.")
             except Exception as e:
                 logger.error(f"Error loading domain blocklist from {path_to_load}: {e}", exc_info=True)
@@ -202,6 +220,28 @@ class ParserManager(QObject):
                 "Proceeding with an empty blocklist."
             )
         return blocked_domains
+
+    def _is_domain_blocked(self, host: str) -> bool:
+        """A-04: is this host blocklisted, subdomains included?
+
+        The old check compared the raw netloc against the file entries, so a
+        blocklist entry "example.com" never matched "img.example.com" (and a
+        host with a port matched nothing at all). Suffix matching on the
+        registrable-name boundary keeps "notexample.com" out.
+        """
+        if not host:
+            return False
+        bare = host.strip().lower()
+        if "@" in bare:  # strip credentials
+            bare = bare.split("@")[-1]
+        if bare.count(":") == 1:  # strip a port, but not an IPv6 literal
+            bare = bare.split(":")[0]
+        bare = bare.rstrip(".")
+        if not bare:
+            return False
+        if bare in self.blocked_domains:
+            return True
+        return any(bare.endswith("." + entry) for entry in self.blocked_domains if entry)
 
     async def _update_queue_priorities(
         self, url: str, media_files: List[Tuple[str, str, Dict[str, Any]]]
@@ -231,6 +271,11 @@ class ParserManager(QObject):
         self.quarantine_queue = asyncio.Queue()
         self._active_tasks = 0
         self._active_tasks_lock = threading.Lock()
+        # A-03: items taken out of a queue but not finished yet. They live in no
+        # queue's own storage, so a snapshot without them silently loses the
+        # page or the download that was in flight when the user hit Pause.
+        self._inflight_url_item = None
+        self._inflight_media = None
         self._processed_lock = asyncio.Lock()  # Initialize lock for thread-safe registry access
         self._completed_naturally = False
         self._last_activity_time = time.time()
@@ -797,7 +842,7 @@ class ParserManager(QObject):
                 abs_disc_url = urljoin(url, abs_disc_url)
             
             disc_domain = get_domain(abs_disc_url)
-            if disc_domain in self.blocked_domains:
+            if self._is_domain_blocked(disc_domain):
                 logger.debug(f"Skipping blocked domain for URL {abs_disc_url} (Domain: {disc_domain})")
                 continue
             
@@ -862,6 +907,7 @@ class ParserManager(QObject):
                 self._active_tasks += 1
 
             current_url, depth, source_page_url, context = url_data
+            self._inflight_url_item = url_data  # A-03
             logger.debug(f"Parser worker got URL: {current_url} (depth={depth})")
             try:
                 # Check before expensive network call
@@ -902,6 +948,7 @@ class ParserManager(QObject):
                 self.stats["pages_processed"] += 1
                 self._last_activity_time = time.time()
             finally:
+                self._inflight_url_item = None  # A-03
                 with self._active_tasks_lock:
                     self._active_tasks -= 1
                 self.url_queue.task_done()
@@ -941,11 +988,19 @@ class ParserManager(QObject):
                 target_dir_path_final = self.download_path 
                 page_domain_for_subdir = get_domain(source_url)
                 
-                if page_domain_for_subdir:
+                # B-08: '.'/'..' as a host cannot form a directory name.
+                if page_domain_for_subdir and page_domain_for_subdir not in (".", ".."):
                     sane_domain = re.sub(r'[<>:"\/\\|?*]', '_', page_domain_for_subdir)
                     parsed_source_page = urlparse(source_url)
                     source_page_path_components = parsed_source_page.path.strip('/').split('/')
-                    sane_path_parts = [re.sub(r'[<>:"\/\\|?*]', '_', part)[:K.MAX_SUBDIR_COMPONENT_LENGTH] for part in source_page_path_components if part][:K.MAX_PATH_COMPONENTS_FOR_SUBDIR]
+                    # B-08: drop '.' and '..' here — the sanitizer below strips path
+                    # separators but kept the dots, and urlparse does not normalise dot
+                    # segments, so a page URL could build a subdirectory above the root.
+                    sane_path_parts = [
+                        re.sub(r'[<>:"\/\\|?*]', '_', part)[:K.MAX_SUBDIR_COMPONENT_LENGTH]
+                        for part in source_page_path_components
+                        if part and part not in (".", "..")
+                    ][:K.MAX_PATH_COMPONENTS_FOR_SUBDIR]
                     path_subdir = os.path.join(*sane_path_parts) if sane_path_parts else ""
                     subdirname = os.path.join(sane_domain, path_subdir) if path_subdir else sane_domain
                     target_dir_path_final = os.path.join(self.download_path, subdirname)
@@ -977,6 +1032,7 @@ class ParserManager(QObject):
             
             with self._active_tasks_lock:
                 self._active_tasks += 1
+            self._inflight_media = media_item  # A-03
 
             try:
                 # Check before expensive download
@@ -1065,6 +1121,7 @@ class ParserManager(QObject):
             except Exception as err:
                 logger.error(f"Error in downloader_worker for {media_item.get('url', 'Unknown URL')}: {str(err)}", exc_info=True)
             finally:
+                self._inflight_media = None  # A-03
                 with self._active_tasks_lock:
                     self._active_tasks -= 1
                 self.download_queue.task_done()
@@ -1246,9 +1303,21 @@ class ParserManager(QObject):
                 "processed_urls": list(self.processed_urls),
                 "downloaded_files": list(self.downloaded_files),
                 "pages_with_downloads": list(self._pages_with_downloads),
-                "stats": self.stats, "settings": self.settings, "start_url": self.start_url,
+                # B-01: snapshot the two containers the workers keep mutating.
+                # They used to be stored by reference and pickled later, in an
+                # executor thread, after this lock was already released — a page
+                # finishing in that window either raised "dictionary changed size
+                # during iteration" (state not saved at all) or wrote a
+                # half-applied snapshot.
+                "stats": dict(self.stats),
+                "settings": self.settings, "start_url": self.start_url,
                 "download_path": self.download_path,
-                "domain_health": self.domain_health, "quarantined_domains": list(self.quarantined_domains)
+                "domain_health": {d: dict(v) if isinstance(v, dict) else v
+                                  for d, v in self.domain_health.items()},
+                "quarantined_domains": list(self.quarantined_domains),
+                # A-03: the page/download that is being worked on right now.
+                "inflight_url_item": self._inflight_url_item,
+                "inflight_media": self._inflight_media,
             }
 
         logger.info(f"save_state: {len(url_queue_items)} URL items, {len(download_queue_items)} download items, {len(self.downloaded_files)} downloaded files")
@@ -1314,6 +1383,21 @@ class ParserManager(QObject):
 
             for item in state.get("quarantine_queue_items", []):
                 await self.quarantine_queue.put(item)
+
+            # A-03: put the interrupted page/download back at the front of its
+            # queue. They were already consumed from the queue, so restoring
+            # them cannot duplicate anything.
+            inflight_url = state.get("inflight_url_item")
+            if inflight_url and len(inflight_url) == 4:
+                await self.url_queue.put(
+                    inflight_url[0], inflight_url[1], inflight_url[2], inflight_url[3],
+                    bypass_checks=True,
+                )
+                logger.info(f"load_state: re-queued in-flight page {inflight_url[0]}")
+            inflight_media = state.get("inflight_media")
+            if inflight_media:
+                await self.download_queue.put(inflight_media)
+                logger.info(f"load_state: re-queued in-flight download {inflight_media.get('url')}")
 
             logger.info(f"Successfully loaded state from {session_file_path}")
         except Exception as err:

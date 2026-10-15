@@ -108,6 +108,50 @@ def test_allowlist_passes_junk_transitions(monkeypatch):
         "https://vipergirls.to/threads/search.php") is False
 
 
+# --- D-10: one token table for both gates ---------------------------------
+
+def test_media_and_crawl_gates_agree_on_the_same_path_segment():
+    """D-10: the media gate used a path-token table the crawl gate did not have,
+    so the same segment was junk for one decision and normal for the other:
+    /impressions/1.jpg was dropped while /impressions/1 was crawled.
+    """
+    assert junk_filter.is_ad_url("https://x.example/impressions/1.jpg") is True
+    assert junk_filter.should_skip_junk_url("https://x.example/impressions/1") is True
+    assert should_skip_crawl_url("https://x.example/impressions/1") is True
+
+
+@pytest.mark.parametrize("url", [
+    # Legitimate gallery paths must stay crawlable: the shared table is
+    # token-based, so "ads" inside "downloads" never matches.
+    "https://gallery.com/media/pixel-art/1.jpg",
+    "https://gallery.com/downloads/photo.jpg",
+    "https://gallery.com/forum.php",
+    "https://gallery.com/album/impressionist-paintings/1",
+])
+def test_crawl_gate_keeps_legitimate_paths(url):
+    assert junk_filter.should_skip_junk_url(url) is False, url
+
+
+def test_documented_widening_of_the_crawl_gate():
+    """The known, accepted consequence of D-10 (measured, not assumed).
+
+    The shared matcher splits on non-word characters, so a HYPHENATED slug that
+    contains an ad token is skipped: `impressions-of-iceland` matches the
+    "impression" token. That was already true of the media gate before this
+    change (its images were dropped as ads) — the crawl gate now agrees instead
+    of crawling a page whose media it would throw away.
+    """
+    slug = "https://gallery.com/album/impressions-of-iceland/1"
+    assert junk_filter.is_ad_url(slug + ".jpg") is True
+    assert junk_filter.should_skip_junk_url(slug) is True
+
+
+def test_no_second_private_token_table():
+    """D-10: the duplicated table is gone — the matcher delegates to utils."""
+    assert not hasattr(junk_filter, "AD_PATH_TOKENS")
+    assert junk_filter._path_has_ad_token("https://x.example/beacon/1") is True
+
+
 # --- integration through existing entry points ----------------------------
 
 def test_is_banner_or_ad_integration():

@@ -40,6 +40,13 @@ DEFAULT_IMPERSONATE = "chrome"
 # impersonate profile) — announced once, not per request.
 _missing_warned = False
 
+# B-14: the one-shot flags below are read-modify-write state shared by every
+# parser/downloader thread. Without a lock, N threads that trip the condition
+# in the same window each log the same warning (log spam at exactly the moment
+# the user is trying to read it). The lock only covers the flag decision and
+# the warning itself — it is never held around network work.
+_warn_lock = threading.Lock()
+
 # Lazy import; curl_cffi is an optional dependency (opt-in engine).
 try:
     from curl_cffi import requests as _curl_requests  # type: ignore
@@ -56,12 +63,13 @@ def engine_uses_curl(settings: Dict[str, Any]) -> bool:
     if settings.get(K.SETTING_HTTP_ENGINE, K.DEFAULT_HTTP_ENGINE) != "curl_cffi":
         return False
     if not CURL_CFFI_AVAILABLE:
-        if not _missing_warned:
-            _missing_warned = True
-            logger.warning(
-                "http_engine=curl_cffi requested but curl_cffi is not installed — "
-                "falling back to requests (aiohttp engine)."
-            )
+        with _warn_lock:
+            if not _missing_warned:
+                _missing_warned = True
+                logger.warning(
+                    "http_engine=curl_cffi requested but curl_cffi is not installed — "
+                    "falling back to requests (aiohttp engine)."
+                )
         return False
     return True
 
@@ -88,13 +96,15 @@ def tls_verify(settings: Dict[str, Any], legacy_default: bool = True) -> bool:
     global _unverified_warned
     default = K.DEFAULT_VERIFY_TLS if legacy_default else True
     verify = bool(settings.get(K.SETTING_VERIFY_TLS, default))
-    if not verify and not _unverified_warned:
-        _unverified_warned = True
-        logger.warning(
-            "TLS verification is disabled for sync fallback requests "
-            f"({K.SETTING_VERIFY_TLS}=false). Enable it in Settings → HTTP if "
-            "your network does not require intercepting proxies."
-        )
+    if not verify:
+        with _warn_lock:
+            if not _unverified_warned:
+                _unverified_warned = True
+                logger.warning(
+                    "TLS verification is disabled for sync fallback requests "
+                    f"({K.SETTING_VERIFY_TLS}=false). Enable it in Settings → HTTP if "
+                    "your network does not require intercepting proxies."
+                )
     return verify
 
 
@@ -161,12 +171,13 @@ def create_sync_session(settings: Dict[str, Any]):
             logger.info(f"Creating curl_cffi sync session (impersonate={profile})")
             return _curl_requests.Session(impersonate=profile)
         except Exception as e:
-            if not _missing_warned:
-                _missing_warned = True
-                logger.warning(
-                    f"curl_cffi impersonate profile {profile!r} unavailable "
-                    f"({e}) — falling back to requests (aiohttp engine)."
-                )
+            with _warn_lock:
+                if not _missing_warned:
+                    _missing_warned = True
+                    logger.warning(
+                        f"curl_cffi impersonate profile {profile!r} unavailable "
+                        f"({e}) — falling back to requests (aiohttp engine)."
+                    )
     import requests
     return requests.Session()
 

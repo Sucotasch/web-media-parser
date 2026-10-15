@@ -143,6 +143,10 @@ class MainWindow(QMainWindow):
     # auto-start, or "" when the task table should just refresh.
     extension_tasks_added = Signal(str)
 
+    # C-01: emitted from the extension HTTP server thread when the API server
+    # could not start (port 19876 busy). Payload: the error text.
+    extension_server_failed = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Web Media Parser")
@@ -190,8 +194,20 @@ class MainWindow(QMainWindow):
             lambda tid, _: self._update_task_row(tid)
         )
 
+        # C-09: persist queue changes as they happen. task_queue.json used to be
+        # written only on a clean window close, so a crash / TaskKill / "End
+        # task" lost every task added since startup (and orphaned the per-task
+        # download folders already on disk). Writes are debounced onto the
+        # existing 2 s stats timer instead of one file write per signal.
+        self._queue_dirty = False
+        self.task_queue.task_added.connect(self._mark_queue_dirty)
+        self.task_queue.task_removed.connect(self._mark_queue_dirty)
+        self.task_queue.task_status_changed.connect(self._mark_queue_dirty)
+
         # GUI-1: marshals UI updates from the extension HTTP server thread.
         self.extension_tasks_added.connect(self._updateUiFromExtension)
+        # C-01: report an extension-server start failure on the GUI thread.
+        self.extension_server_failed.connect(self._on_extension_server_failed)
 
         # Load queue state from previous session
         self._load_queue_state()
@@ -572,12 +588,49 @@ class MainWindow(QMainWindow):
     def _load_queue_state(self):
         """Load task queue from disk and refresh the table."""
         count = self.task_queue.load(queue_path())
+        # C-09: loading emits the queue signals (add_task per item); the state we
+        # just read is by definition already on disk, so don't rewrite it.
+        self._queue_dirty = False
         if count > 0:
             self.log_handler.info(f"Loaded {count} tasks from queue file")
             self._refresh_task_table()
 
+    def _mark_queue_dirty(self, *_args):
+        """C-09: note that task_queue.json needs a write (debounced)."""
+        self._queue_dirty = True
+
+    def _autosave_queue(self):
+        """C-09: write task_queue.json if anything changed since the last write.
+
+        Called from the 2 s stats timer; `save()` is atomic (temp + replace).
+        """
+        if not self._queue_dirty:
+            return
+        self._queue_dirty = False
+        try:
+            self.task_queue.save(queue_path())
+        except Exception as e:
+            self._queue_dirty = True  # retry on the next tick
+            self.log_handler.error(f"Error autosaving queue state: {e}")
+
+    def _on_extension_server_failed(self, message: str):
+        """C-01: the extension API server could not bind its port.
+
+        Without this the window looked healthy while every extension request
+        failed with "Desktop app not reachable" — the failure was only a
+        logger.error in a background thread.
+        """
+        text = (f"Extension API server failed to start on port "
+                f"{self.extension_server.port}.\n\n{message}\n\n"
+                f"Another instance of Web Media Parser is probably already "
+                f"running — the browser extension will talk to that one.")
+        self.log_handler.error(text.replace("\n", " "))
+        self.status_bar.showMessage("Extension API unavailable (port busy)")
+        QMessageBox.warning(self, "Extension API unavailable", text)
+
     def _update_active_task_stats(self):
         """Called periodically by QTimer to refresh stats of the active task."""
+        self._autosave_queue()  # C-09: debounced queue persistence
         if self.parser_manager and self.parser_manager.is_running:
             active = self.task_queue.active_task
             if active:
@@ -687,10 +740,16 @@ class MainWindow(QMainWindow):
         # just asked to clear everything.
         self._pending_extension_payloads = []
 
-        # Clear task queue
+        # Clear task queue.
+        # F-02: this used to clear the manager's private queue list and null its
+        # private active-id field directly, bypassing clear_active() — the only
+        # path that emits active_task_changed — so every consumer of that signal
+        # kept a stale active task.
         count = len(self.task_queue.queue)
-        self.task_queue._queue.clear()
-        self.task_queue._active_id = None
+        if self.task_queue.active_task is not None:
+            self.task_queue.clear_active()
+        for task_id in [t.id for t in self.task_queue.queue]:
+            self.task_queue.remove_task(task_id)
         self._refresh_task_table()
         self.update_ui_state(False)
         self.log_handler.info(f"Cleared {count} tasks from queue")
@@ -918,13 +977,20 @@ class MainWindow(QMainWindow):
             except (RuntimeError, TypeError):
                 pass  # signal not connected
 
-        # GUI-2: make sure the previous parser thread is truly dead before we
-        # start a new one (rapid pause → start would otherwise leak the QThread
-        # and risk "QThread destroyed while running").
-        if self.parser_thread and self.parser_thread.isRunning():
-            self.parser_thread.quit()
-            if not self.parser_thread.wait(5000):
-                self.log_handler.warning("Old parser thread did not stop in 5s")
+        # GUI-2/C-06: make sure the previous parser thread is truly dead before
+        # starting a new one, and hand the old wrapper to Qt BEFORE dropping our
+        # reference. If wait() times out the thread is still running, and letting
+        # the Python wrapper be collected would destroy a live QThread ("QThread:
+        # Destroyed while thread is still running"). deleteLater() fires only
+        # after finished(), so the wrapper outlives the thread either way.
+        old_thread = self.parser_thread
+        self.parser_thread = None
+        if old_thread is not None:
+            old_thread.finished.connect(old_thread.deleteLater)
+            if old_thread.isRunning():
+                old_thread.quit()
+                if not old_thread.wait(5000):
+                    self.log_handler.warning("Old parser thread did not stop in 5s")
 
         self.parser_manager = ParserManager(
             url=task.url,
@@ -1240,7 +1306,12 @@ class MainWindow(QMainWindow):
                 loop.run_until_complete(self.extension_server.start())
                 loop.run_forever()
             except Exception as e:
-                logger.error(f"Extension server error: {e}")
+                # C-01: surface the failure on the GUI thread instead of dying
+                # quietly in this background thread.
+                logger.error(f"Extension server error: {e}", exc_info=True)
+                self.extension_server_failed.emit(
+                    self.extension_server.start_error or str(e)
+                )
             finally:
                 try:
                     loop.run_until_complete(self.extension_server.stop())

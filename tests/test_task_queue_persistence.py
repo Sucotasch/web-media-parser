@@ -5,7 +5,9 @@ and the narrowed *.part cleanup patterns."""
 
 import os
 import sys
+import io
 import json
+import shutil
 import tempfile
 import unittest
 
@@ -17,7 +19,11 @@ from src.core.task_item import TaskStatus
 
 class TestQueuePersistence(unittest.TestCase):
     def _manager(self):
-        return TaskQueueManager(base_download_dir=tempfile.mkdtemp(prefix="wmp_q_"))
+        # F-08: mkdtemp without cleanup leaked a directory per call (4 wmp_q_*
+        # dirs survived the full suite). addCleanup removes it per test.
+        path = tempfile.mkdtemp(prefix="wmp_q_")
+        self.addCleanup(shutil.rmtree, path, True)
+        return TaskQueueManager(base_download_dir=path)
 
     def test_save_load_roundtrip(self):
         tm = self._manager()
@@ -138,6 +144,7 @@ class TestPartialCleanup(unittest.TestCase):
                 "photo.jpg.a1b2.partial",   # single-thread temp (DL-5 naming)
                 "video.mp4.a1b2.part0",     # MT chunk
                 "video.mp4.a1b2.part3",
+                "video.mp4.a1b2.mt.partial",  # MT assembly (B-10/NF-3)
                 "user.partial.png",         # user file — must survive
                 "album.jpg",                # finished download — must survive
             ):
@@ -156,3 +163,47 @@ class TestPartialCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class TestHistoryClearUsesQueueApi(unittest.TestCase):
+    """F-02: clearing the download history must go through TaskQueueManager.
+
+    `MainWindow._clear_download_history` used to poke `task_queue._queue.clear()`
+    and `._active_id = None` directly, bypassing `clear_active()` — the only path
+    that emits `active_task_changed`, so every consumer of that signal kept a
+    stale active task.
+    """
+
+    def test_clear_active_announces_the_empty_active_task(self):
+        tm = TaskQueueManager(base_download_dir=tempfile.mkdtemp(prefix="wmp_q_"))
+        self.addCleanup(shutil.rmtree, tm.base_download_dir, True)
+        task = tm.add_task("https://a.example/", {}, "/tmp/out/a")
+        seen = []
+        tm.active_task_changed.connect(lambda task_id: seen.append(task_id))
+
+        self.assertTrue(tm.start_task(task.id))
+        self.assertIsNotNone(tm.active_task)
+
+        tm.clear_active()
+        self.assertIsNone(tm.active_task)
+        self.assertEqual(seen[-1], "",
+                         "clear_active must emit active_task_changed('')")
+
+    def test_remove_task_is_the_supported_way_to_empty_the_queue(self):
+        tm = TaskQueueManager(base_download_dir=tempfile.mkdtemp(prefix="wmp_q_"))
+        self.addCleanup(shutil.rmtree, tm.base_download_dir, True)
+        ids = [tm.add_task(f"https://{c}.example/", {}, f"/tmp/out/{c}").id
+               for c in ("a", "b", "c")]
+        for task_id in ids:
+            self.assertTrue(tm.remove_task(task_id))
+        self.assertEqual(tm.queue, [])
+
+    def test_main_window_does_not_reach_into_queue_internals(self):
+        """Source-level guard: the internals are exactly what F-02 was about."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "src", "gui", "main_window.py")
+        with io.open(path, encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn("task_queue._queue", source,
+                         "main_window touches the queue's private list")
+        self.assertNotIn("task_queue._active_id", source,
+                         "main_window resets the active task behind the manager's back")
+        self.assertIn("self.task_queue.clear_active()", source)

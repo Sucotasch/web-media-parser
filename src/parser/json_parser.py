@@ -9,9 +9,9 @@ import re
 import json
 import logging
 from typing import Dict, Any, List, Tuple, Optional, Set
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin
 
-from src.parser.utils import is_image_url, is_media_url, format_proxy_url, is_format_allowed
+from src.parser.utils import is_image_url, is_media_url, format_proxy_url, is_format_allowed, guess_media_type
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -278,33 +278,13 @@ class JSONWebpageParser:
         return bool(url_pattern.match(text))
 
     def _guess_media_type(self, url: str) -> str:
-        """
-        Guess the media type from the URL using centralized constants
-        """
-        url_lower = url.lower()
-        parsed_url = urlparse(url_lower)
-        path = parsed_url.path
-        
-        # Check for image extensions from constants
-        if any(path.endswith(ext) for ext in K.IMAGE_EXTENSIONS):
-            return "image"
-            
-        # Check for video extensions from constants
-        if any(path.endswith(ext) for ext in K.VIDEO_EXTENSIONS):
-            return "video"
-            
-        # Check for audio extensions from constants
-        if any(path.endswith(ext) for ext in K.AUDIO_EXTENSIONS):
-            return "audio"
-            
-        # Check for known video platforms from constants
-        if any(platform in url_lower for platform in K.VIDEO_PLATFORM_INDICATORS):
-            return "video"
+        """Guess the media type from the URL (D-11: the shared classifier).
 
-        # Unknown extension but is_media_url matched (CDN path, media query…):
-        # most such URLs are images; parser_manager stats/filenames only know
-        # image/video, and "file" fell through to a wrong .mp4 default name.
-        return "image"
+        The body of this method moved verbatim to `utils.guess_media_type`; the
+        HTML discovery route used to carry four inline copies that disagreed with
+        it (both route and allowlist per media type).
+        """
+        return guess_media_type(url)
 
     def get_media_files(self) -> List[Tuple[str, str, Dict[str, Any]]]:
         """

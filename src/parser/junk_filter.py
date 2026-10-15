@@ -55,19 +55,11 @@ AD_HOST_SUFFIXES = (
     "trafficfactory.biz", "trafficjunky.net", "exosrv.com", "badoink.com",
 )
 
-# Path tokens (token-based, same semantics as _matches_ad_keyword). These are
-# ad/creative markers that a real gallery almost never uses in media URLs.
-# CORE-4: "pixel" and "creative" are deliberately NOT here — "pixel-art"
-# galleries and "creative-portfolio" hosts are legitimate content that was
-# silently dropped. Real tracker creatives (pixel_300x250.gif) are still
-# caught by the weak NNNxNNN + third-party rule below.
-AD_PATH_TOKENS = (
-    "advert", "adserver", "adservice", "adsense", "adroll", "affiliate",
-    "banner", "impression", "beacon", "tracking",
-    "tracker", "analytics", "sponsor", "promo", "popup", "popunder",
-    "doubleclick", "googlesyndication", "taboola", "outbrain", "criteo",
-    "mgid", "revcontent", "juicyads", "exoclick", "propellerads", "popads",
-)
+# D-10: the path-token table lives in utils._AD_KEYWORDS — ONE table for both
+# gates (media and crawling). It used to live here as AD_PATH_TOKENS next to a
+# near-identical copy in utils, and only the media gate consulted this one, so
+# the same path segment was junk for one decision and normal for the other
+# (/impressions/1.jpg dropped, /impressions/1 crawled).
 
 # Numeric banner sizes in a filename/path: "banner_300x250.jpg", "728x90/…".
 # WEAK signal — never fires alone.
@@ -148,22 +140,16 @@ def _host_matches_ad(url: str) -> bool:
 
 
 def _path_has_ad_token(url: str) -> bool:
+    """D-10: the shared token matcher (utils), not a second private table.
+
+    Lazy import: utils imports this module at the top, so a module-level import
+    here would be circular.
+    """
+    from src.parser.utils import _ad_tokens_from_url, _matches_ad_keyword
     try:
-        combined = f"{urlparse(url).netloc}/{urlparse(url).path}".lower()
+        return any(_matches_ad_keyword(t) for t in _ad_tokens_from_url(url))
     except Exception:
-        combined = (url or "").lower()
-    tokens = [t for t in re.split(r"[^\w]+", combined) if t]
-    for tok in tokens:
-        if not tok:
-            continue
-        for kw in AD_PATH_TOKENS:
-            k = kw.replace("-", "")
-            t = tok.replace("-", "")
-            if t == k:
-                return True
-            if len(t) == len(k) + 1 and t.startswith(k) and t.endswith("s"):
-                return True
-    return False
+        return False
 
 
 def is_ad_url(url, page_url=None):
@@ -250,6 +236,11 @@ def should_skip_junk_url(url: str) -> bool:
     except Exception:
         return False
     if _host_matches_ad(url):
+        return True
+    # D-10: the crawl gate now applies the same ad/junk path-token classifier as
+    # the media gate, so a junk path cannot be junk for one gate and fine for
+    # the other.
+    if _path_has_ad_token(url):
         return True
     for rx in SKIP_CRAWL_REGEXES:
         if rx.search(full):

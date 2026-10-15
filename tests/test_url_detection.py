@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from src.parser.utils import (
     is_media_url, is_image_url, is_video_url, is_same_domain, registrable_domain,
-    is_banner_or_ad, should_skip_crawl_url,
+    is_banner_or_ad, should_skip_crawl_url, get_domain, guess_media_type,
 )
 
 
@@ -106,3 +106,53 @@ def test_registrable_domain():
     assert registrable_domain("blog.bbc.co.uk") == "bbc.co.uk"
     assert registrable_domain("evil.co.uk") == "evil.co.uk"
     assert registrable_domain("cdn.artstation.com") == "artstation.com"
+
+
+def test_get_domain_is_lowercased():
+    """D-12: hosts are case-insensitive and every consumer assumes lowercase."""
+    assert get_domain("HTTPS://CDN.Example.COM/a/b.jpg") == "cdn.example.com"
+    assert get_domain("https://cdn.example.com/a/b.jpg") == "cdn.example.com"
+    assert get_domain("not a url") == ""
+
+
+def test_priority_queue_domain_is_lowercased():
+    """D-12: domain scores are keyed by domain — an uppercase host must not get
+    its own counter."""
+    from src.parser.priority_url_queue import PriorityURLQueue
+
+    q = PriorityURLQueue(settings={})
+    assert q._get_domain("https://I.4CDN.ORG/g/1.jpg") == "i.4cdn.org"
+    assert q._get_domain("https://i.4cdn.org/g/1.jpg") == "i.4cdn.org"
+
+
+def test_guess_media_type_uses_the_extension_tables():
+    """D-11: one classifier for every discovery route."""
+    assert guess_media_type("https://x.example/photo.jpg") == "image"
+    assert guess_media_type("https://x.example/photo.JPG") == "image"
+    assert guess_media_type("https://x.example/clip.mov") == "video"
+    assert guess_media_type("https://x.example/movie.mkv") == "video"
+    assert guess_media_type("https://x.example/song.mp3") == "audio"
+    assert guess_media_type("https://youtube.com/watch?v=1") == "video"
+    # Unknown extension but a media URL (CDN path): images are the common case
+    # and the download stats/filenames only understand image/video.
+    assert guess_media_type("https://cdn.example.com/noext/12345") == "image"
+    assert guess_media_type("") == "image"
+
+
+def test_html_and_json_routes_agree_on_media_type():
+    """D-11: the HTML route used inline copies that disagreed with the JSON one,
+    so clip.mov / movie.mkv / song.mp3 were typed differently (and therefore
+    passed a different format allowlist) depending on where they were found."""
+    from unittest.mock import MagicMock
+
+    from src.parser.json_parser import JSONWebpageParser
+
+    json_parser = JSONWebpageParser(
+        url="https://x.example/feed.json", settings={},
+        external_session=MagicMock(),
+    )
+    for url in ("https://cdn.example.com/clip.mov",
+                "https://cdn.example.com/movie.mkv",
+                "https://cdn.example.com/song.mp3",
+                "https://cdn.example.com/photo.jpg"):
+        assert json_parser._guess_media_type(url) == guess_media_type(url), url

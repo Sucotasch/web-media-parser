@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -163,7 +164,10 @@ class TestAsyncClientManager(unittest.TestCase):
         result = BrotliSupportFix.patch()
         after = ClientRequest.DEFAULT_HEADERS.get(hdrs.ACCEPT_ENCODING)
         self.assertEqual(after, before)
-        self.assertIn(result, (True, False))
+        # F-09: `assertIn(result, (True, False))` could not fail. patch()
+        # reports real capability: a bool derived from brotli importability.
+        self.assertIsInstance(result, bool)
+        self.assertEqual(result, importlib.util.find_spec("brotli") is not None)
 
 
 if __name__ == '__main__':

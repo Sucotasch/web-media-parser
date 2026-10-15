@@ -9,7 +9,7 @@ import asyncio
 import logging
 from typing import Dict, Any, Tuple
 import re
-from collections import Counter
+from collections import Counter, deque
 from urllib.parse import urlparse
 from heapq import heappush, heappop
 from dataclasses import dataclass, field
@@ -41,7 +41,6 @@ class PriorityURLQueue:
 
     def __init__(self, settings: Dict[str, Any] = None):
         self._queue = []
-        self._url_scores: Dict[str, float] = {}
         self._domain_scores: Dict[str, float] = {}
         self._url_patterns: Dict[str, int] = {}
         self.settings = settings or {}
@@ -53,7 +52,12 @@ class PriorityURLQueue:
         # Deliberate re-queues are exempt: interstitial_retry (media→webpage
         # recovery), from_media_item (webpage-looking media re-parse) and
         # bypass_checks (state restoration).
+        # F-12: `_seen` is bounded (K.MAX_SEEN_URLS) — `_seen_order` remembers
+        # insertion order so the oldest entries can be dropped first. It used to
+        # grow for the whole task run with no ceiling (and `_url_scores`, a dict
+        # that was never written or read, used to sit next to it as dead state).
         self._seen = set()
+        self._seen_order = deque()
         # NOTE: _lock and _not_empty are asyncio primitives.
         # They are created lazily in reset() which is called from
         # ParserManager.start_parsing() after the event loop is running.
@@ -67,11 +71,22 @@ class PriorityURLQueue:
         self._not_empty = asyncio.Event()
         self._waiters = []
         self._seen = set()
+        self._seen_order = deque()
+
+    def _mark_seen(self, url: str) -> None:
+        """Record a URL as queued, keeping the dedup set bounded (F-12)."""
+        if url in self._seen:
+            return
+        self._seen.add(url)
+        self._seen_order.append(url)
+        while len(self._seen_order) > K.MAX_SEEN_URLS:
+            self._seen.discard(self._seen_order.popleft())
 
     def _get_domain(self, url: str) -> str:
-        """Extract domain from URL"""
+        """Extract domain from URL (D-12: lowercased — domain scores are keyed by
+        domain, and an uppercase host must not get its own counter)."""
         try:
-            return urlparse(url).netloc
+            return urlparse(url).netloc.lower()
         except (ValueError, TypeError):
             return ""
             
@@ -539,7 +554,6 @@ class PriorityURLQueue:
                 if url in self._seen:
                     logger.debug(f"Duplicate URL skipped in queue (dedup): {url[:120]}")
                     return
-            self._seen.add(url)
             if bypass_checks:
                 # Use a default or provided priority if bypassing
                 priority = context.get('priority', 1.0) if context else 1.0
@@ -573,6 +587,12 @@ class PriorityURLQueue:
             elif priority > 5.0:
                 logger.debug(f"High priority URL: {priority:.2f} for {url} (depth={depth})")
                 
+            # A-05: mark the URL as queued only AFTER the relationship gate.
+            # Marking it before (the pre-fix order) burned the dedup slot on a
+            # URL that was then dropped as zero-priority, so the same URL
+            # arriving later as a media lookup (from_image) was silently
+            # discarded as a duplicate and its fullsize was never resolved.
+            self._mark_seen(url)
             item = PrioritizedURL(
                 priority=-priority,  # Negative for max-heap behavior
                 url=url,

@@ -98,16 +98,73 @@ def test_native_dollar_target_sanitized():
 
 def test_default_loader_finds_sieve_and_dedups():
     """PAT-1/2/9: default dev load picks up Imagus sieves from the project
-    root, dedups rule names across files, and loads site_patterns.json once."""
+    root, dedups rule names across files, and loads site_patterns.json once.
+
+    E-02 (2026-10-15): the old `assert total < 1000` was vacuous — it held for
+    the shipped snapshot (673 rules) whatever the loader did, and went red the
+    moment a legitimate second sieve file appeared in the root. The dedup
+    invariant is now explicit: the loaded rule count can never exceed the number
+    of UNIQUE rule names in the files that were actually loaded.
+    """
+    import glob
+    import json as _json
+    import os as _os
+
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    sieve_files = sorted(glob.glob(_os.path.join(root, "Imagus_sieve_*.json")))
+    assert sieve_files, "no Imagus_sieve_*.json in the project root (TST-5)"
+    unique_names = set()
+    for f in sieve_files:
+        with open(f, encoding="utf-8") as fh:
+            unique_names.update(_json.load(fh).keys())
+
     pm = SitePatternManager()  # defaults, dev layout
     total = len(pm.imagus_global_rules) + sum(len(r) for r in pm.imagus_rules.values())
     assert total > 0, "No Imagus sieve rules loaded with defaults (PAT-1)"
-    # PAT-2: 849 + 823 = 1672 without dedup; the deduped total is the number
-    # of unique rule names, well under 1000.
-    assert total < 1000, f"Sieve dedup failed: {total} rules loaded"
+    assert total <= len(unique_names), (
+        f"Sieve dedup failed: {total} rules loaded from {len(sieve_files)} file(s) "
+        f"holding {len(unique_names)} unique rule names (PAT-2)"
+    )
+    assert len(pm.loaded_files) >= len(sieve_files), "not every root sieve was loaded"
     # PAT-9: built-in site_patterns.json loaded exactly once
     spm = [f for f in pm.loaded_files if f.endswith('site_patterns.json')]
     assert len(spm) == 1, f"site_patterns.json loaded {len(spm)} times (PAT-9)"
+
+
+def test_sieve_dedup_drops_duplicate_rule_names(tmp_path):
+    """PAT-2: the dedup branch itself, exercised with two real files.
+
+    E-02: no test ever loaded two sieves, so "a later file's duplicate rule name
+    does not count twice" had zero coverage.
+    """
+    import json as _json
+
+    first = tmp_path / "Imagus_sieve_test_A.json"
+    second = tmp_path / "Imagus_sieve_test_B.json"
+    first.write_text(_json.dumps({
+        "Dup": {"link": r"dup\.example/", "img": r"dup\.example/(\w+)\.jpg", "to": "$1.jpg"},
+        "OnlyA": {"link": r"a\.example/", "img": r"a\.example/(\w+)\.jpg", "to": "$1.jpg"},
+    }), encoding="utf-8")
+    second.write_text(_json.dumps({
+        "Dup": {"link": r"dup2\.example/", "img": r"dup2\.example/(\w+)\.jpg", "to": "$1.jpg"},
+        "OnlyB": {"link": r"b\.example/", "img": r"b\.example/(\w+)\.jpg", "to": "$1.jpg"},
+    }), encoding="utf-8")
+
+    pm = SitePatternManager(enable_built_in=False)
+    pm.imagus_rules, pm.imagus_global_rules = {}, []
+    pm._loaded_sieve_rule_names = set()
+    pm.loaded_files = []
+
+    def loaded():
+        return len(pm.imagus_global_rules) + sum(len(r) for r in pm.imagus_rules.values())
+
+    assert pm._load_imagus_file(str(first)) is True
+    assert loaded() == 2, f"first file: {loaded()} rules loaded (expected 2)"
+    assert pm._load_imagus_file(str(second)) is True
+    assert loaded() == 3, (
+        f"dedup failed: {loaded()} rules after the second file (expected 3 — "
+        f"'Dup' must not be counted twice)"
+    )
 
 
 def test_google_images_root_pattern_loaded(tmp_path):
@@ -259,6 +316,63 @@ def _make_sieve_pm(tmp_path, rules=None):
     p = tmp_path / "sieve.json"
     p.write_text(json.dumps(rules), encoding="utf-8")
     return SitePatternManager(enable_built_in=False, imagus_sieve_path=str(p))
+
+
+def test_protocol_relative_to_template_does_not_double_the_scheme(tmp_path):
+    """A-06: a `to` template starting with `//` produced `https:////host/path`.
+
+    Synthetic twin of the ~19 shipped rules that use a protocol-relative `to`
+    (Imgflip-h-p, OfferUp-pp, MakeAGif-g-p, ...): the substitution prefixed the
+    page scheme unconditionally, and `'://' not in '//host/...'` is true.
+    """
+    pm = _make_sieve_pm(tmp_path, {
+        "Proto_Relative": {
+            "img": r"^thumbs[.]example[.]com/(\w+)[.]jpg$",
+            "to": "//cdn.example.com/$1.jpg",
+        },
+    })
+
+    variants = pm.transform_image_url(
+        "https://thumbs.example.com/abc.jpg", "https://thumbs.example.com/gallery")
+
+    assert "https://cdn.example.com/abc.jpg" in variants
+    assert not [v for v in variants if ":////" in v], variants
+
+
+def test_protocol_relative_real_rule_imgflip():
+    """A-06 with the shipped rule (Imgflip-h-p: `to = //i.$1$2.#jpg gif#`)."""
+    from helpers import require_sieve
+
+    pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=require_sieve())
+
+    variants = pm.transform_image_url(
+        "https://i.imgflip.com/2/abc123.jpg", "https://imgflip.com/i/2abc")
+
+    assert "https://i.imgflip.com/abc123.jpg" in variants, variants
+    assert not [v for v in variants if ":////" in v], variants
+
+
+def test_uppercase_host_still_matches_sieve_rules():
+    """D-12: a host in upper case (legal in HTML, preserved by urljoin) used to
+    find no sieve rule at all — `get_domain` returned the raw netloc while the
+    rule index and the lookups are lowercased.
+
+    Measured before the fix: 1 variant for `I.4CDN.ORG`, 6 for `i.4cdn.org`.
+    """
+    from helpers import require_sieve
+
+    pm = SitePatternManager(enable_built_in=False, imagus_sieve_path=require_sieve())
+    lower = pm.transform_image_url(
+        "https://i.4cdn.org/g/12345s.jpg", "https://boards.4chan.org/g/")
+    upper_host = pm.transform_image_url(
+        "https://I.4CDN.ORG/g/12345s.jpg", "https://boards.4chan.org/g/")
+    upper_page = pm.transform_image_url(
+        "https://i.4cdn.org/g/12345s.jpg", "https://BOARDS.4CHAN.ORG/g/")
+
+    assert len(lower) > 1, lower
+    assert len(upper_host) == len(lower), upper_host
+    assert len(upper_page) == len(lower), upper_page
+    assert [u.lower() for u in upper_host] == lower
 
 
 class _FakeResp:

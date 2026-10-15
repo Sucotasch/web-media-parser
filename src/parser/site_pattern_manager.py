@@ -897,8 +897,15 @@ def _transform(m):
                                     for variant in substituted.split('\n'):
                                         variant = variant.strip()
                                         if variant and '://' not in variant:
-                                            scheme = results[0].split('://', 1)[0]
-                                            variant = f"{scheme}://{variant}"
+                                            # A-06: a protocol-relative template
+                                            # startswith '//' and '://' is not in it,
+                                            # so the old code produced
+                                            # https:////host/path.
+                                            if variant.startswith('//'):
+                                                variant = 'https:' + variant
+                                            else:
+                                                scheme = results[0].split('://', 1)[0]
+                                                variant = f"{scheme}://{variant}"
                                         if variant and variant != v_url:
                                             sieve_results.append(variant)
                                     transformed = True
@@ -947,8 +954,14 @@ def _transform(m):
                             substituted = re.sub(img_regex, to_pattern, v_url, flags=re.IGNORECASE)
                         
                         if v_url != results[0] and '://' not in substituted:
-                            scheme = results[0].split('://', 1)[0]
-                            substituted = f"{scheme}://{substituted}"
+                            # A-06: 19 shipped rules use a protocol-relative `to`
+                            # (Imgflip-h-p, OfferUp-pp, ...). Without this branch
+                            # the result was https:////host/path.
+                            if substituted.startswith('//'):
+                                substituted = 'https:' + substituted
+                            else:
+                                scheme = results[0].split('://', 1)[0]
+                                substituted = f"{scheme}://{substituted}"
                             
                         if substituted != results[0]:
                             logger.debug(f"Imagus match found: {img_regex} -> {substituted}")

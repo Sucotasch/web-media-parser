@@ -45,70 +45,15 @@ class SettingsDialog(QDialog):
 
         # Default settings — single source of truth is constants.py
         self.default_settings = {
-            # Parser settings
-            "search_depth": K.DEFAULT_SEARCH_DEPTH,
-            "page_limit": 1000,
-            "stay_in_domain": K.DEFAULT_STAY_IN_DOMAIN,
-            "process_js": K.DEFAULT_PROCESS_JS,
-            "page_timeout": K.DEFAULT_PAGE_TIMEOUT,
-            # Pattern settings
-            "use_patterns": K.DEFAULT_USE_PATTERNS,
-            "custom_pattern_path": None,
-            "imagus_sieve_path": None,
-            # Bypass settings
-            "bypass_cookie_consent": K.DEFAULT_BYPASS_COOKIE_CONSENT,
-            "bypass_js_redirects": K.DEFAULT_BYPASS_JS_REDIRECTS,
-            # Filters
-            "min_image_width": K.DEFAULT_MIN_IMAGE_WIDTH,
-            "min_image_height": K.DEFAULT_MIN_IMAGE_HEIGHT,
-            "min_image_size": K.DEFAULT_MIN_IMAGE_SIZE_KB,
-            "min_video_size": K.DEFAULT_MIN_VIDEO_SIZE_KB,
-            # Performance
-            "parser_threads": K.DEFAULT_PARSER_THREADS,
-            "downloader_threads": K.DEFAULT_DOWNLOADER_THREADS,
-            "max_download_speed": 0,
-            "threads_per_file": K.DEFAULT_THREADS_PER_FILE,
-            # Remember last used directory — default is the app folder so the
-            # program never writes to / depends on the user profile (portable).
+            # F-01: constants.py is the single source. This used to be a 30-key
+            # copy that had drifted: its own 25-word `stop_words` list (duplicate
+            # "login") vs 9 in K, and it omitted filter_junk / js_engine /
+            # http_engine / http_impersonate / http_escalate / verify_tls /
+            # enabled_audio_formats / filter_hidden_links, so each of those fell
+            # back to a *third* default at its consumer site.
+            **K.DEFAULT_SETTINGS_VALUES,
+            # Keys that exist only in the settings file (no consumer else).
             "last_download_dir": os.path.join(get_app_dir(), "downloads"),
-            "user_agent": K.DEFAULT_USER_AGENT,
-            "referrer": "auto",
-            "accept_language": K.DEFAULT_ACCEPT_LANGUAGE,
-            "timeout": K.DEFAULT_TIMEOUT,
-            "retry_count": K.DEFAULT_RETRY_COUNT,
-            "proxy": "",
-            # Media formats
-            "enabled_image_formats": list(K.DEFAULT_ENABLED_IMAGE_FORMATS),
-            "enabled_video_formats": list(K.DEFAULT_ENABLED_VIDEO_FORMATS),
-            # Stop words
-            "stop_words": [
-                "login",
-                "signin",
-                "signup",
-                "register",
-                "password",
-                "account",
-                "payment",
-                "checkout",
-                "subscribe",
-                "join",
-                "login",
-                "admin",
-                "analytics",
-                "pixel",
-                "tracking",
-                "advertisement",
-                "banner",
-                "popup",
-                "faq",
-                "help",
-                "support",
-                "contact",
-                "about",
-                "terms",
-                "privacy",
-            ],
-            # Logging
             "log_to_file": False,
             "log_file_path": "web_media_parser.log",
         }
@@ -293,6 +238,32 @@ class SettingsDialog(QDialog):
         video_grid.addWidget(self.min_video_size_spin, 0, 1)
 
         filters_layout.addWidget(video_group)
+
+        # Download integrity group (A-07 / B-12)
+        integrity_group = QGroupBox("Download Integrity")
+        integrity_grid = QGridLayout(integrity_group)
+
+        integrity_grid.addWidget(QLabel("Max. File Size (KB):"), 0, 0)
+        self.max_file_size_spin = QSpinBox()
+        # 100 000 000 KB ≈ 95 GiB — high enough for the 2 GiB default to be visible
+        self.max_file_size_spin.setRange(0, 100_000_000)
+        self.max_file_size_spin.setSingleStep(1024)
+        self.max_file_size_spin.setToolTip(
+            "Abort a download once it grows past this size (KB). 0 = no limit. "
+            "The shipped default is 2 GiB; the check runs before anything is "
+            "written, so a host that streams without end cannot fill the disk."
+        )
+        integrity_grid.addWidget(self.max_file_size_spin, 0, 1)
+
+        integrity_grid.addWidget(QLabel("Reject unverified length:"), 1, 0)
+        self.require_verified_length_check = QCheckBox()
+        self.require_verified_length_check.setToolTip(
+            "Off (default): a body with neither Content-Length nor chunked "
+            "framing is kept and reported as unverified. On: such downloads "
+            "are refused instead of being trusted."
+        )
+        integrity_grid.addWidget(self.require_verified_length_check, 1, 1)
+        filters_layout.addWidget(integrity_group)
 
         # Media format allowlists (settings-driven replacement for hard-coded junk formats)
         image_formats_group = QGroupBox("Image Formats")
@@ -587,11 +558,17 @@ class SettingsDialog(QDialog):
         if not url:
             self.sieve_status_label.setText("Enter a repository URL first.")
             return
-        sieve_path = self.settings.get(K.SETTING_IMAGUS_SIEVE_PATH, "") or None
+        # C-03: use the path the user is LOOKING at. `self.settings` only picks
+        # up the widget in save_settings(), while browse_imagus_file() writes the
+        # widget alone — an unsaved selection was ignored here, or worse, the
+        # previously saved file was atomically overwritten with new content.
+        sieve_path = self.imagus_sieve_edit.text().strip() or None
         if not sieve_path:
             self.sieve_status_label.setText(
-                "Configure a sieve file path first (Patterns tab).")
+                "Choose a sieve file first (Imagus Sieve File on the Patterns tab).")
             return
+        # Keep the view-model in sync so a later save writes the same path.
+        self.settings[K.SETTING_IMAGUS_SIEVE_PATH] = sieve_path
 
         self.sieve_download_btn.setEnabled(False)
         self.sieve_status_label.setText("Downloading…")
@@ -752,6 +729,10 @@ class SettingsDialog(QDialog):
         self.min_image_height_spin.setValue(self.settings.get("min_image_height", 100))
         self.min_image_size_spin.setValue(self.settings.get("min_image_size", 40))
         self.min_video_size_spin.setValue(self.settings.get("min_video_size", 1000))
+        self.max_file_size_spin.setValue(self.settings.get(
+            K.SETTING_MAX_FILE_SIZE, K.DEFAULT_SETTINGS_VALUES[K.SETTING_MAX_FILE_SIZE]))
+        self.require_verified_length_check.setChecked(self.settings.get(
+            K.SETTING_REQUIRE_VERIFIED_LENGTH, K.DEFAULT_REQUIRE_VERIFIED_LENGTH))
 
         # Media formats
         enabled_images = set(self.settings.get(
@@ -817,6 +798,7 @@ class SettingsDialog(QDialog):
             self.search_depth_spin, self.page_limit_spin, self.page_timeout_spin,
             self.min_image_width_spin, self.min_image_height_spin,
             self.min_image_size_spin, self.min_video_size_spin,
+            self.max_file_size_spin,
             self.parser_threads_spin, self.downloader_threads_spin,
             self.threads_per_file_spin, self.timeout_spin, self.retry_count_spin,
         ):
@@ -842,6 +824,8 @@ class SettingsDialog(QDialog):
         settings[K.SETTING_MIN_IMG_HEIGHT] = self.min_image_height_spin.value()
         settings[K.SETTING_MIN_IMG_SIZE] = self.min_image_size_spin.value()
         settings[K.SETTING_MIN_VID_SIZE] = self.min_video_size_spin.value()
+        settings[K.SETTING_MAX_FILE_SIZE] = self.max_file_size_spin.value()
+        settings[K.SETTING_REQUIRE_VERIFIED_LENGTH] = self.require_verified_length_check.isChecked()
 
         # Stop words
         stop_words_text = self.stop_words_edit.toPlainText().strip()
@@ -942,6 +926,7 @@ class SettingsDialog(QDialog):
             "min_image_height": (0, 99999),
             "min_image_size": (0, 99999),
             "min_video_size": (0, 99999),
+            "max_file_size": (0, 100_000_000),
             "max_download_speed": (0, 100000),
         }
         for key, (lo, hi) in clamps.items():
@@ -988,6 +973,11 @@ class SettingsDialog(QDialog):
         # into a truthy string).
         if not isinstance(settings.get(K.SETTING_HTTP_ESCALATE), bool):
             settings[K.SETTING_HTTP_ESCALATE] = K.DEFAULT_HTTP_ESCALATE
+        # B-12 strict mode is a bool as well (a truthy string from a corrupt
+        # settings.json must not silently turn every close-delimited body into a
+        # failure).
+        if not isinstance(settings.get(K.SETTING_REQUIRE_VERIFIED_LENGTH), bool):
+            settings[K.SETTING_REQUIRE_VERIFIED_LENGTH] = K.DEFAULT_REQUIRE_VERIFIED_LENGTH
         # Normalize stop_words to a list of non-empty stripped strings.
         # Protects against a corrupted settings.json where stop_words is a
         # string (iterating chars) or contains non-string items.
@@ -1029,7 +1019,12 @@ class SettingsDialog(QDialog):
         
         # If no settings file exists, return defaults
         logger.info(f"Settings file not found at {settings_path}, using defaults.")
-        default_settings = self.default_settings.copy()
+        # F-01: `default_settings` now spreads K.DEFAULT_SETTINGS_VALUES, so its
+        # mutable values (stop_words, format lists) are shared with the module
+        # constants — copy them, or a later in-place edit of the dialog's
+        # settings would corrupt the process-wide defaults.
+        default_settings = {k: (list(v) if isinstance(v, list) else v)
+                            for k, v in self.default_settings.items()}
         
         # Ensure some critical defaults are set
         if "min_video_size" not in default_settings:

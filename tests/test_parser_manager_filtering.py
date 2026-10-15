@@ -1,4 +1,6 @@
 import asyncio
+import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -103,6 +105,87 @@ class TestParserManagerFiltering(unittest.TestCase):
 
         # Ensure it tried to queue exactly two URLs
         self.assertEqual(parser_manager.url_queue.put.call_count, 2)
+
+
+class TestDomainBlocklistCoversSubdomains(unittest.TestCase):
+    """A-04: a blocklist entry blocks the whole site, not just the exact netloc.
+
+    The check compared the raw netloc against the file entries, so
+    "blockeddomain.com" in the blocklist never stopped "img.blockeddomain.com"
+    (measured: 6 subdomains crawled) and a host carrying a port matched nothing.
+    """
+
+    def _manager(self, blocked, start_url="http://startdomain.com"):
+        with patch('src.parser.parser_manager.ParserManager._load_domain_blocklist',
+                   return_value=set(blocked)):
+            with patch('src.parser.parser_manager.AsyncClientManager', MagicMock()):
+                pm = ParserManager(
+                    url=start_url, download_path="test_downloads",
+                    settings={
+                        K.SETTING_SEARCH_DEPTH: 5,  # deep enough to queue depth-2 links
+                        K.SETTING_STAY_IN_DOMAIN: False,
+                        K.SETTING_STOP_WORDS: [],
+                    },
+                    log_handler=MockGUILogHandler(),
+                )
+        pm.url_queue.put = AsyncMock()
+        return pm
+
+    def test_subdomains_of_a_blocked_domain_are_not_queued(self):
+        pm = self._manager({'blockeddomain.com'})
+        links = {
+            "https://www.blockeddomain.com/page": {},
+            "https://img.blockeddomain.com/photo.jpg": {},
+            "https://a.b.blockeddomain.com/page": {},
+            "https://notblockeddomain.com/page": {},
+            "https://blockeddomain.com.evil.com/page": {},
+        }
+
+        asyncio.run(pm._process_parser_results(
+            url="http://startdomain.com/current", depth=1, links_data=links,
+            media_files=[], original_url_context={"start_url": "http://startdomain.com"},
+        ))
+
+        queued = [call[0][0] for call in pm.url_queue.put.call_args_list]
+        self.assertNotIn("https://www.blockeddomain.com/page", queued)
+        self.assertNotIn("https://img.blockeddomain.com/photo.jpg", queued)
+        self.assertNotIn("https://a.b.blockeddomain.com/page", queued)
+        # A look-alike host that merely CONTAINS the blocked name is a different
+        # site and must still be crawled (suffix matching on the name boundary).
+        self.assertIn("https://notblockeddomain.com/page", queued)
+        self.assertIn("https://blockeddomain.com.evil.com/page", queued)
+        self.assertEqual(len(queued), 2, queued)
+
+    def test_matching_details(self):
+        pm = self._manager({'blocked.com', '1.2.3.4'})
+        self.assertTrue(pm._is_domain_blocked('blocked.com'))
+        self.assertTrue(pm._is_domain_blocked('img.blocked.com'))
+        self.assertTrue(pm._is_domain_blocked('IMG.Blocked.COM:8080'))
+        self.assertTrue(pm._is_domain_blocked('user:pw@img.blocked.com'))
+        self.assertTrue(pm._is_domain_blocked('1.2.3.4'))
+        self.assertFalse(pm._is_domain_blocked('notblocked.com'))
+        self.assertFalse(pm._is_domain_blocked('blocked.com.evil.com'))
+        self.assertFalse(pm._is_domain_blocked(''))
+
+    def test_loader_normalizes_entries_and_keeps_ips_literal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'blocklist.txt')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('# comment\n\nWWW.Blocked.com\n*.wild.com\n1.2.3.4\n')
+
+            with patch('src.parser.parser_manager.AsyncClientManager', MagicMock()):
+                pm = ParserManager(
+                    url="http://startdomain.com", download_path="test_downloads",
+                    settings={}, log_handler=MockGUILogHandler(),
+                )
+            blocked = pm._load_domain_blocklist(blocklist_file_name=path)
+
+        self.assertIn('blocked.com', blocked)
+        self.assertIn('wild.com', blocked)
+        self.assertIn('1.2.3.4', blocked)
+        # Deriving a base domain from an IP would produce the nonsense "3.4",
+        # which would block unrelated hosts ending in .3.4.
+        self.assertNotIn('3.4', blocked)
 
 
 if __name__ == '__main__':

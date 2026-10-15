@@ -71,7 +71,7 @@ web-media-parser/
 │   ├── junk_allowlist.txt            # Allowlist для junk-фильтра
 │   └── patterns/site_patterns.json   # Встроенные паттерны (32)
 │
-├── tests/                  # 15 модулей pytest (~3200 строк)
+├── tests/                  # 24 модуля pytest (+ helpers.py/conftest.py)
 ├── docs/
 │   ├── DENO_JS_ENGINE_DESIGN.md           # Дизайн+статус P0–P4 (двигок Deno)
 │   └── DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md  # Рабочий план улучшений краула
@@ -130,7 +130,7 @@ web-media-parser/
 |---|---|
 | Natural | `_completion_monitor`: очереди пусты > 5 сек (`IDLE_COMPLETION_TIMEOUT_SECONDS`) → `_stop_event.set()` → `task_ended("completed")` → `on_task_ended` → thread.quit/wait → `start_next()` автозапуск |
 | Pause | GUI: `mark_paused()` → `save_state()` (run_coroutine_threadsafe, timeout 15) → `stop_parsing()` → `clear_active()`. Partial-файлы сохраняются |
-| Stop | GUI: `pm.stop_parsing()` (async, события) → `cleanup_partial_files()` (⚠ до фактической остановки потоков — Audit GUI-3) → удаление state.pkl → `mark_stopped()` |
+| Stop | GUI: `pm.stop_parsing()` (async, события) → `cleanup_partial_files()` (⚠ до фактической остановки потоков — Audit GUI-3) → удаление last_session.pkl → `mark_stopped()` |
 | Close окна | `save(queue_path)` → save_state активной → stop → accept. Extension-сервер НЕ останавливается явно (daemon-поток; Audit GUI-5) |
 
 Сигнатуры остановки: `threading.Event` (`_thread_stop_event`) для потоков загрузки/монитора + `asyncio.Event` для loop-воркеров; обе выставляются в `stop_parsing()` (через `call_soon_threadsafe` для loop-примитивов).
@@ -211,16 +211,18 @@ web-media-parser/
 ## 8. Тесты
 
 ```bash
-python -m pytest tests -q    # 180 passed, 40 skipped (2026-08-16)
+python -m pytest tests -q    # 345 passed, 30 skipped (2026-10-15)
+
+> **Что лежит в state-файле (A-02, продуктовое решение 2026-10-15).** `last_session.pkl` — обычный pickle в каталоге загрузки: он содержит очереди URL/загрузок, статистику, health домена и **cookie, выученные на gateway/age-gate страницах** (в открытом виде). Шифрования и фильтрации кредов здесь нет намеренно: контур локальный и доверенный (однопользовательский инструмент, cookie из браузера самого пользователя), а вырезание cookie при персисте ломало бы resume на age-gate/авторизованных сайтах (`Close window` → Pause + save queue → перезапуск вернул бы consent-страницу). Не выкладывайте каталог загрузок в публичный архив/репозиторий.
 ```
 
-Скипы: 30 — нет Deno в окружении (весь P0/P1/P4 JS-стек), 9 — curl_cffi не установлен в venv (при том что он в requirements.txt — Audit PKG-1), 1 — сетевой плейсхолдер. Слабые/вакуумные тесты и пробелы — Audit TST-1…TST-6.
+Скипы: **все 30** — нет Deno в окружении (`Deno binary/worker not available`, `Deno DOM worker / happy-dom cache not available`); проверено `-rs` 2026-10-15. Прежняя запись «9 — curl_cffi не установлен, 1 — сетевой плейсхолдер» неверна: `curl_cffi 0.16.0` установлен, escalation-тесты идут (E-06). Слабые/вакуумные тесты и пробелы — Audit TST-1…TST-6.
 
 ---
 
 ## 9. История (сжато)
 
-- **2026-04-12/14 — очередь задач.** TaskItem/TaskQueueManager/UI/пауза-резюм/`task_ended`/`{task_id}/state.pkl`. Известные тогда проблемы (Resume-дубликаты, порядок mark_paused, неограниченный log history) — решены: `load_state` перенесён внутрь `_main_task` (до посева URL), `mark_paused()` теперь ДО `stop_parsing()`, history — deque(5000). Внешние аудиты того периода (Gemini 7/10, Qwen 5/10) учтены; применённые фиксы — thread-safe stop, wait in-flight, quarantine в state, regex `$10`, рекурсивный `_expand_variants`.
+- **2026-04-12/14 — очередь задач.** TaskItem/TaskQueueManager/UI/пауза-резюм/`task_ended`/`{task_id}/last_session.pkl`. Известные тогда проблемы (Resume-дубликаты, порядок mark_paused, неограниченный log history) — решены: `load_state` перенесён внутрь `_main_task` (до посева URL), `mark_paused()` теперь ДО `stop_parsing()`, history — deque(5000). Внешние аудиты того периода (Gemini 7/10, Qwen 5/10) учтены; применённые фиксы — thread-safe stop, wait in-flight, quarantine в state, regex `$10`, рекурсивный `_expand_variants`.
 - **2026-07-16 — план улучшений краула** (`docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md`): WP по junk/links/fullsize — легли в основу P2-lite и сегментного stop-words.
 - **2026-08-07..10 — P0–P4** (`docs/DENO_JS_ENGINE_DESIGN.md`): Deno-движок (sieve-JS, DOM-правила, this.node-шимы), junk_filter, curl_cffi + эскалация, gateway-bypass с consent-кэшем. Боевая проверка: fullsize-дискавери 1940 media (было 0), 0 DOM-ошибок.
 - **2026-08-16 — полный аудит** (`Audit.md`): два блока (приложение/расширение), ~90 находок с фиксами; CONTEXT переписан как as-built (этот документ).

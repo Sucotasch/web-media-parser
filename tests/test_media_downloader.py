@@ -537,3 +537,155 @@ def test_multi_thread_path_rejects_html_chunks(tmp_path):
     assert "Webpage/script content" in result["error"]
     files = _images_on_disk(tmp_path)
     assert files == [] or b"<html" not in open(tmp_path / files[0], "rb").read()[:400]
+
+# F-14 (2026-10-15): the Stop path, progress reporting and the multi-thread
+# entry point had no coverage in this file at all (VERIFY_2026-10-15 §3.5/F-14:
+# `stop_event` / `progress_callback` / `_download_with_threads` — 0 mentions).
+# Every assertion below was measured on this machine before it was written; the
+# `*.partial` residue under Stop is stage-2 work (FIXPLAN_2026-10-15, Этап 2).
+
+
+def _stopped_event():
+    """A threading.Event already set — i.e. the user pressed Stop."""
+    ev = threading.Event()
+    ev.set()
+    return ev
+
+
+def _make_downloader(tmp_path, session, stop=None, threads=1, cb=None,
+                     name="photo.jpg", body_len=None):
+    from src import constants as K
+
+    settings = dict(ZERO_MIN_SIZE, **{K.SETTING_THREADS_PER_FILE: threads})
+    downloader = MediaDownloader(
+        url="https://cdn.example.com/photo.jpg",
+        filepath=str(tmp_path / name),
+        settings=settings,
+        media_type="image",
+        stop_event=stop,
+    )
+    downloader.session = session
+    downloader.progress_callback = cb
+    return downloader
+
+
+def test_stop_before_attempt_issues_no_request(tmp_path):
+    """Stop pressed while the file is still queued: no HEAD, no GET, no file."""
+    session = MagicMock()
+    downloader = _make_downloader(tmp_path, session, stop=_stopped_event())
+    result = downloader.download()
+
+    assert result["success"] is False
+    assert result["error"] == "Download manually aborted"
+    session.head.assert_not_called()
+    session.get.assert_not_called()
+    assert os.listdir(tmp_path) == []
+
+
+def test_stop_mid_stream_does_not_publish_a_media_file(tmp_path):
+    """Stop while bytes are flowing: abort, nothing under the media name.
+
+    Measured: this path leaves a `*.partial` behind — the Stop branch calls
+    os.remove() while its own file object is still open, which Windows refuses
+    (the OSError is swallowed). That residue is fixed in Этап 2, so this test
+    asserts only the contract that holds today: no file is published under the
+    destination name and an operator Stop is not a host fault.
+    """
+    body = _JPEG + b"Z" * (4096 * 8)
+    stop = threading.Event()
+
+    class _StoppingSession(_HeadRefusingSession):
+        def get(self, url, headers=None, **kwargs):
+            stop.set()  # the operator hits Stop once the stream is open
+            return super().get(url, headers=headers, **kwargs)
+
+    downloader = _make_downloader(tmp_path, _StoppingSession(200, "image/jpeg", body,
+                                                             "image/jpeg"),
+                                  stop=stop)
+    result = downloader.download()
+
+    assert result["success"] is False
+    assert result["error"] == "Download manually aborted"
+    assert "failure_kind" not in result, "an operator Stop must not penalise the host"
+    assert _images_on_disk(tmp_path) == []
+
+
+def test_stop_during_multi_thread_chunks_aborts_both_phases(tmp_path):
+    """Stop pressed while ranged chunk requests are streaming.
+
+    Measured sequence: both chunk threads report "Download manually aborted" and
+    the MT attempt fails, the downloader falls back to single-threaded — where
+    the Stop check fires again and produces the final result. The fallback GET
+    still goes out (Stop is checked per attempt, not per phase); Этап 2 narrows
+    that. Asserted here: the abort result, no published file, no host penalty,
+    and that the MT phase really ran (two range requests).
+    """
+    body = _JPEG + b"M" * 2_500_000
+    stop = threading.Event()
+    range_requests = []
+
+    class _RangeCountingSession(_HeadRefusingSession):
+        def get(self, url, headers=None, **kwargs):
+            rng = (headers or {}).get("Range")
+            if rng:
+                range_requests.append(rng)
+                stop.set()  # Stop lands mid-stream, not before the attempt
+            return super().get(url, headers=headers, **kwargs)
+
+    session = _RangeCountingSession(200, "image/jpeg", body, "image/jpeg",
+                                    accept_ranges=True)
+    downloader = _make_downloader(tmp_path, session, stop=stop, threads=2,
+                                  name="big.jpg")
+    result = downloader.download()
+
+    assert len(range_requests) == 2, f"multi-thread phase did not run: {range_requests}"
+    assert result["success"] is False
+    assert result["error"] == "Download manually aborted"
+    assert "failure_kind" not in result
+    assert _images_on_disk(tmp_path) == []
+    assert not os.path.exists(str(tmp_path / "big.jpg"))
+    assert not any(f.endswith(".part0") or f.endswith(".part1")
+                   for f in os.listdir(tmp_path)), os.listdir(tmp_path)
+
+
+def test_download_with_threads_refuses_below_min_part_size(tmp_path):
+    """_download_with_threads returns early when the size yields < 2 parts."""
+    downloader = _make_downloader(tmp_path, MagicMock())
+    result = downloader._download_with_threads(1024)
+    assert result["success"] is False
+    assert "Not enough parts" in result["error"]
+
+
+def test_progress_callback_single_thread_ends_at_100(tmp_path):
+    values = []
+    downloader = _make_downloader(tmp_path, _HeadRefusingSession(200, "image/jpeg",
+                                                                 _JPEG, "image/jpeg"),
+                                  cb=values.append)
+    result = downloader.download()
+
+    assert result["success"] is True, result
+    assert values[-1] == 100, f"progress never reached 100%: {values}"
+    assert all(isinstance(v, int) and 0 <= v <= 100 for v in values), values
+    assert values == sorted(values), f"progress went backwards: {values}"
+
+
+def test_progress_callback_multi_thread_reports_intermediate_values(tmp_path):
+    """The MT path must report intermediate progress, not only the final 100.
+
+    Measured with 2 threads: [50, 100, 100] — one update per chunk plus the
+    completion callback. The point of the assertion is the intermediate value:
+    a bar that only ever jumps 0 → 100 makes the progress column useless.
+    """
+    body = _JPEG + b"M" * 2_500_000
+    values = []
+    downloader = _make_downloader(tmp_path, _HeadRefusingSession(200, "image/jpeg",
+                                                                 body, "image/jpeg",
+                                                                 accept_ranges=True),
+                                  threads=2, cb=values.append, name="big.jpg")
+    result = downloader.download()
+
+    assert result["success"] is True, result
+    assert values[-1] == 100, values
+    assert min(values) < 100, f"no intermediate progress reported: {values}"
+    assert values == sorted(values), f"progress went backwards: {values}"
+    assert all(0 <= v <= 100 for v in values), values

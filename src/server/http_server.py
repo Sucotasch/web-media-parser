@@ -39,6 +39,9 @@ class ExtensionServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._thread: Optional[threading.Thread] = None
+        # C-01: the last start failure, so the GUI can tell the user why the
+        # extension is unreachable (None = started fine / not tried yet).
+        self.start_error: Optional[str] = None
 
     def set_callbacks(self, add_tasks, get_status):
         """Set callbacks for task management (called from GUI thread)."""
@@ -46,11 +49,25 @@ class ExtensionServer:
         self.get_status_callback = get_status
 
     async def start(self):
-        """Start the HTTP server (called from asyncio event loop)."""
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "127.0.0.1", self.port)
-        await self._site.start()
+        """Start the HTTP server (called from asyncio event loop).
+
+        C-01: a port conflict (a second app instance, or any other listener on
+        19876) raises here. That used to be swallowed one level up, so the
+        window looked perfectly healthy while every extension request failed
+        with "Desktop app not reachable". The failure is recorded in
+        `start_error` and re-raised for the caller's UI path.
+        """
+        self.start_error = None
+        try:
+            self._runner = web.AppRunner(self._app)
+            await self._runner.setup()
+            self._site = web.TCPSite(self._runner, "127.0.0.1", self.port)
+            await self._site.start()
+        except Exception as e:
+            self.start_error = f"{type(e).__name__}: {e}"
+            logger.error(f"Extension API server failed to start on port {self.port}: {e}",
+                         exc_info=True)
+            raise
         logger.info(f"Extension API server started on http://localhost:{self.port}")
 
     async def stop(self):

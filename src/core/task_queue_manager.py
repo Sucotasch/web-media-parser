@@ -224,8 +224,10 @@ class TaskQueueManager(QObject):
         if not dp or not os.path.isdir(dp):
             return
         # Remove only the downloader's own temp files (GUI-9): single-thread
-        # downloads write '{file}.{tid:x}.partial', MT chunks '{file}.{tid:x}.partN'.
-        # A broad '*.part*' glob also matched user files like 'foo.partial.png'.
+        # downloads write '{file}.{tid:x}.partial', MT chunks '{file}.{tid:x}.partN',
+        # and the MT assembly writes '{file}.mt.partial' (B-10/NF-3) — the last two
+        # are covered by the same two patterns. A broad '*.part*' glob also matched
+        # user files like 'foo.partial.png', so the patterns stay narrow.
         for pat in ("*.partial", "*.part[0-9]*"):
             for p in glob.glob(os.path.join(dp, "**", pat), recursive=True):
                 try:

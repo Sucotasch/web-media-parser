@@ -154,7 +154,7 @@ Follow the project's Karpathy discipline — the tracked source is `.agents/skil
 | File | Use when |
 |------|----------|
 | `README.md` / `README_EN.md` | User-facing features, install, extension usage |
-| `CONTEXT.md`, `knowledge.md` | As-built architecture notes; **both lag the code — trust the code** (dated file counts, `state.pkl`, `QWEN.md` and the "stale setup.py" notes in them are outdated) |
+| `CONTEXT.md`, `knowledge.md` | As-built architecture notes; **trust the code when they disagree** (E-06 2026-10-15 fixed the drifted parts: test counts, `state.pkl` → `last_session.pkl`, the deleted `QWEN.md`, the "stale setup.py" claim — deps mirror `requirements.txt` exactly) |
 | `Audit/`, `Audit.md` | Dated audits + fixplans; `GATES.md` holds per-gate CHECK/EXPECT commands (its pass-count baselines are stale — use the current pytest numbers above) |
 | `PLAN.md` | Phase plan for crawl/parity work |
 | `docs/DENO_JS_ENGINE_DESIGN.md` | Design + P0–P4 status log of the Deno/HTTP-engine work |

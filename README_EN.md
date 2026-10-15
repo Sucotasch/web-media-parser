@@ -59,7 +59,7 @@ Automatically detects images and videos, upgrades thumbnails to high-resolution 
 - **Connection reuse** — Shared HTTP sessions and connection pooling.
 - **Speed limit** — Bandwidth throttling for single-thread file downloads.
 - **Deduplication** — Skips previously downloaded media URLs.
-- **Crash-safe state storage** — Atomic persistence of `state.pkl` using temporary files, fsync, and atomic rename.
+- **Crash-safe state storage** — Atomic persistence of `last_session.pkl` using temporary files, fsync, and atomic rename.
 
 ### Portability & Packaging
 - **Onedir bundle** — Completely portable PyInstaller onedir distribution.

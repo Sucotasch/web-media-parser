@@ -35,6 +35,14 @@ DEFAULT_MIN_IMAGE_HEIGHT = 100
 DEFAULT_MIN_IMAGE_SIZE_KB = 40 # Minimum image file size in KB
 DEFAULT_MIN_VIDEO_SIZE_KB = 1000 # Minimum video file size in KB
 
+# A-07: hard ceiling for a single file. The old code read Content-Length only to
+# enforce a *minimum* and to size progress bars, so a host that answered a
+# plausible length and then streamed without end filled the disk. 0 = no limit
+# (the downloader's fallback, so hand-built settings dicts keep working); the
+# shipped default settings carry 2 GiB as a backstop (product decision §4.5).
+DEFAULT_MAX_FILE_SIZE = 0 # in KB, 0 = unlimited
+DEFAULT_REQUIRE_VERIFIED_LENGTH = False # B-12 strict mode: reject bodies with no verifiable length
+
 # Domain Health & Quarantine
 DEFAULT_QUARANTINE_FAILURE_THRESHOLD = 3
 DEFAULT_DOMAIN_PROBATION_TIMEOUT = 5  # Timeout for downloads from domains on "probation"
@@ -51,6 +59,9 @@ DEFAULT_ACCEPT_JSON_HEADER = "application/json, text/javascript, */*; q=0.01"
 
 # File Operations
 WRITE_BUFFER_SIZE = 1024 * 1024  # 1MB buffer for disk writes
+# B-11: how many leading bytes of a GET body are inspected before the first
+# write. Enough for an HTML/XML/JSON prolog, small enough to be free.
+SNIFF_PREFIX_BYTES = 512
 MAX_FILENAME_LENGTH = 200 # Max length for sanitized filenames (excluding extension)
 
 # UI & Dialog Defaults
@@ -67,8 +78,16 @@ DEFAULT_USE_PATTERNS = True     # For SitePatternManager
 # Stop words for URL filtering — matched against PATH SEGMENTS (segment-aware),
 # never as free substrings (so "ad" can't kill "media"/"admin"). Plain words
 # only: underscored variants (about_us, privacy_policy) never match real segments.
+# F-01: single source for the crawl stop-word list. The settings dialog used to
+# carry its own 25-word copy (with a duplicate "login") while this list had 9, so
+# a missing/invalid `stop_words` value silently narrowed the filter by 2.7x. This
+# is the deduplicated union of both lists — the wider behaviour users already got
+# from the dialog stays, and the narrower fallbacks are gone.
 DEFAULT_STOP_WORDS = [
-    "login", "register", "cart", "checkout", "about", "contact", "privacy", "terms", "careers"
+    "login", "signin", "signup", "register", "password", "account", "payment",
+    "checkout", "subscribe", "join", "admin", "analytics", "pixel", "tracking",
+    "advertisement", "banner", "popup", "faq", "help", "support", "contact",
+    "about", "terms", "privacy", "cart", "careers",
 ]
 
 # Crawl limits
@@ -80,6 +99,14 @@ DEFAULT_MAX_LINKS_PER_PAGE = 200  # Cap links per page to prevent queue explosio
 # dropped by PriorityURLQueue.put() before they can flood the queue.
 MAX_URL_PATH_SEGMENTS = 50   # Max path segments a queued URL may have
 MAX_URL_LENGTH = 2000        # Max total length of a queued URL
+
+# F-12: bound on PriorityURLQueue's dedup memory. `_seen` holds every URL the
+# frontier has ever considered (including rejected ones) for the whole task run;
+# a long crawl on a big host grew it without limit. Beyond this many entries the
+# oldest are forgotten — the cost is only that a re-discovered ancient URL is
+# queued a second time (the crawler's own processed_urls set still stops a
+# re-parse), while the memory ceiling becomes predictable.
+MAX_SEEN_URLS = 100000
 
 # Fullsize discovery via the sieve link->url->res chain (mirrors the
 # extension's discoverFullsize). Applied to thumbnail-transition links
@@ -227,6 +254,8 @@ SETTING_MIN_IMG_WIDTH = "min_image_width"
 SETTING_MIN_IMG_HEIGHT = "min_image_height"
 SETTING_MIN_IMG_SIZE = "min_image_size" # in KB
 SETTING_MIN_VID_SIZE = "min_video_size" # in KB
+SETTING_MAX_FILE_SIZE = "max_file_size" # A-07: in KB, 0 = unlimited
+SETTING_REQUIRE_VERIFIED_LENGTH = "require_verified_length" # B-12 strict mode
 SETTING_TIMEOUT = "timeout"
 SETTING_RETRY_COUNT = "retry_count"
 SETTING_USER_AGENT = "user_agent"
@@ -290,6 +319,10 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_MIN_IMG_HEIGHT: DEFAULT_MIN_IMAGE_HEIGHT,
     SETTING_MIN_IMG_SIZE: DEFAULT_MIN_IMAGE_SIZE_KB,
     SETTING_MIN_VID_SIZE: DEFAULT_MIN_VIDEO_SIZE_KB,
+    # A-07: 2 GiB backstop for a fresh profile / Reset (the code fallback stays
+    # 0 = unlimited, so a settings dict built by hand is never capped).
+    SETTING_MAX_FILE_SIZE: 2 * 1024 * 1024,
+    SETTING_REQUIRE_VERIFIED_LENGTH: DEFAULT_REQUIRE_VERIFIED_LENGTH,
     SETTING_TIMEOUT: DEFAULT_TIMEOUT,
     SETTING_RETRY_COUNT: DEFAULT_RETRY_COUNT,
     SETTING_USER_AGENT: DEFAULT_USER_AGENT,
@@ -313,6 +346,7 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_PAGE_LIMIT: 1000,  # 0 = unlimited (matches the dialog tooltip)
     SETTING_STOP_WORDS: DEFAULT_STOP_WORDS,
     SETTING_MAX_DOWNLOAD_SPEED: 0, # KB/s
+    SETTING_PROXY: "",  # F-01: was dialog-only
     SETTING_PAGE_TIMEOUT: DEFAULT_PAGE_TIMEOUT,
     # NOTE: SETTING_ENABLED_*_FORMATS defaults are injected below via
     # DEFAULT_SETTINGS_VALUES.update() because the format lists are defined
