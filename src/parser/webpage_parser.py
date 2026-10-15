@@ -114,7 +114,9 @@ class WebpageParser:
         process_js: bool, # This will now control all advanced content extraction
         external_session: aiohttp.ClientSession, 
         pattern_manager: Optional[SitePatternManager] = None,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        js_executor=None,
+        html_executor=None,
     ):
         self.url = url
         self.settings = settings 
@@ -140,6 +142,10 @@ class WebpageParser:
         self._last_html: Optional[str] = None  # P4: raw HTML for the DOM gateway click
         self._js_gateway_html: Optional[str] = None  # P4: mutated DOM to parse instead of refetch
         self._empty_body_warned: set = set()  # B-07: warn once per empty-body URL
+        # A-16/B-02: dedicated pools (None keeps the default executor for
+        # standalone use in tests and scripts).
+        self.js_executor = js_executor
+        self.html_executor = html_executor
 
     def get_discovered_urls(self) -> Dict[str, Dict[str, Any]]:
         return self.links
@@ -349,7 +355,7 @@ class WebpageParser:
                     resp = session.get(self.url, headers=fb_headers, timeout=fb_timeout, allow_redirects=True, verify=http_engine.tls_verify(self.settings))
                     return resp
 
-                resp = await loop.run_in_executor(None, _sync_fetch)
+                resp = await loop.run_in_executor(self.html_executor, _sync_fetch)
                 http_status = resp.status_code
                 if 400 <= http_status < 600:
                     return None, K.PARSER_HTTP_ERROR_4XX if http_status < 500 else K.PARSER_HTTP_ERROR_5XX, f"HTTP {http_status} via fallback", http_status
@@ -430,7 +436,7 @@ class WebpageParser:
                 )
                 return resp
 
-            resp = await loop.run_in_executor(None, _esc_fetch)
+            resp = await loop.run_in_executor(self.html_executor, _esc_fetch)
             status = resp.status_code
             self._last_http_status = status
             if status >= 400:
@@ -602,7 +608,7 @@ class WebpageParser:
                     resp = session.get(target_url, headers=headers, timeout=10, verify=http_engine.tls_verify(self.settings), allow_redirects=True)
                 return resp.status_code < 400
             
-            return await loop.run_in_executor(None, _sync_bypass)
+            return await loop.run_in_executor(self.html_executor, _sync_bypass)
         except Exception as e:
             logger.debug(f"Universal bypass execution failed: {e}")
             return False
@@ -743,7 +749,7 @@ class WebpageParser:
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
-                None,
+                self.js_executor,
                 lambda: engine.run_gateway_click(
                     html=html,
                     page_url=self.url,
@@ -770,7 +776,7 @@ class WebpageParser:
             if any(re.search(pattern, domain) for pattern in patterns): return platform
         return None
 
-    def _get_best_image_url(self, element: Any) -> Tuple[Optional[str], Dict[str, Any]]:
+    async def _get_best_image_url(self, element: Any) -> Tuple[Optional[str], Dict[str, Any]]:
         attributes = {}; candidates = []
         sources = {
             "src": element.get("src", ""), "data-src": element.get("data-src", ""),
@@ -856,7 +862,13 @@ class WebpageParser:
             best_attrs["original_width"] = filtered_candidates[0]["width"]
             
             if self.pattern_manager and best_url:
-                transformed_results = self.pattern_manager.transform_image_url(best_url, self.url)
+                # A-16: transform_image_url can execute a sieve JS rule in the
+                # Deno worker (blocking, up to the rule timeout) — run it off
+                # the event loop.
+                transformed_results = await asyncio.get_running_loop().run_in_executor(
+                    self.js_executor,
+                    lambda: self.pattern_manager.transform_image_url(best_url, self.url),
+                )
                 # transform_image_url now always returns a list of at least one item
                 if transformed_results and (len(transformed_results) > 1 or transformed_results[0] != best_url):
                     best_attrs["original_url"] = best_url
@@ -897,7 +909,7 @@ class WebpageParser:
             images.extend(u for u in urls if re.search(r"\.(jpg|jpeg|png|webp|gif|avif)", u.lower()))
         return images
 
-    def _extract_picture_sources(self, picture_elem: Any) -> List[Dict[str, Any]]:
+    async def _extract_picture_sources(self, picture_elem: Any) -> List[Dict[str, Any]]:
         sources = []
         for source_tag in picture_elem.find_all("source"):
             srcset = source_tag.get("srcset", "")
@@ -907,14 +919,14 @@ class WebpageParser:
                 for c in candidates: c.update({"media": media, "type": type_}); sources.append(c)
         img_tag = picture_elem.find("img")
         if img_tag:
-            url, attrs = self._get_best_image_url(img_tag)
+            url, attrs = await self._get_best_image_url(img_tag)
             if url: sources.append({"url": url, "width": attrs.get("original_width", 0), "source": "img", "media": "", "type": ""})
         return sources
 
     async def _extract_images(self, soup: BeautifulSoup) -> None: 
         found = 0
         for picture in soup.find_all("picture"):
-            for source_data in self._extract_picture_sources(picture):
+            for source_data in await self._extract_picture_sources(picture):
                 url = source_data.get("url")
                 if not url: continue
                 # Handle possible list of URLs from transformation
@@ -948,7 +960,7 @@ class WebpageParser:
                 logger.debug(f"Skipping hidden img element (bot-trap defense) in {self.url}")
                 continue
 
-            urls, attrs = self._get_best_image_url(img)
+            urls, attrs = await self._get_best_image_url(img)
             for url in urls:
                 if not url: continue
                 abs_url = urljoin(self.url, url)
@@ -1538,7 +1550,7 @@ class WebpageParser:
 
         try:
             loop = asyncio.get_running_loop()
-            soup = await loop.run_in_executor(None, BeautifulSoup, content, "lxml")
+            soup = await loop.run_in_executor(self.html_executor, BeautifulSoup, content, "lxml")
             
             # 1. Image extraction
             await self._extract_images(soup) 

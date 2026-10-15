@@ -9,8 +9,9 @@ No item starts before its gate is written here. New defects found during work ar
 immediately, never ignored. Baseline: `7bac98b` (2026-09-09), 265 passed / 30 skipped at that commit; re-measured 2026-10-15: 345 passed / 30 skipped.
 
 The defect plan built on the 2026-10-15 audit is `Audit/FIXPLAN_2026-10-15.md`; its stages and gates
-live in `GATES.2026-10-15.md` (stages 0-3 met; current tree: 443 passed / 30 skipped, node suite and
-the ruff selection green). Stages 4-8 are the remaining work.
+live in `GATES.2026-10-15.md` (stages 0-4 met; current tree: 455 passed / 30 skipped, node suite and
+the ruff selection green). Stages 5-8 (extension sieve core, server body validation, GUI/server, 
+polish) are the remaining work.
 
 ---
 

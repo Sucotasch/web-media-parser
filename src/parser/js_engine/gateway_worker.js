@@ -117,8 +117,9 @@ function handle(line) {
   if (typeof html !== "string") {
     return JSON.stringify({ id, error: "missing html" });
   }
+  let win = null;
   try {
-    const win = new Window({
+    win = new Window({
       url: pageUrl || "https://local.invalid/",
       settings: { enableJavaScriptEvaluation: true },
     });
@@ -176,6 +177,9 @@ function handle(line) {
     });
   } catch (e) {
     return JSON.stringify({ id, error: String((e && e.message) || e) });
+  } finally {
+    // B-17: release the parsed document AFTER the response is built.
+    try { if (win) win.happyDOM.close(); } catch (_) {}
   }
 }
 
@@ -194,6 +198,8 @@ for (;;) {
   const n = Deno.stdin.readSync(buf);
   if (n === null) break; // EOF
   acc += decoder.decode(buf.subarray(0, n), { stream: true });
+  // B-18: oversized request (a 20 MB page carried as one JSON line) → die.
+  if (acc.length > (64 << 20)) Deno.exit(1);
   let idx;
   while ((idx = acc.indexOf("\n")) >= 0) {
     const line = acc.slice(0, idx).trim();

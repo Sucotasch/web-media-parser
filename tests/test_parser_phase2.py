@@ -110,13 +110,16 @@ class TestJsonLdMedia(unittest.TestCase):
 class TestBestImageUrlScoreWidth(unittest.TestCase):
     """CORE-17: named hi-res attrs survive min_image_width > 100."""
 
+    # A-16 (2026-10-15): `_get_best_image_url` is a coroutine now — its
+    # transform step can execute a sieve JS rule and is awaited off the event
+    # loop instead of blocking it.
     def test_named_hi_res_survives_high_min_width(self):
         settings = {K.SETTING_MIN_IMG_WIDTH: 200}
         p = _make_parser(settings)
         soup = BeautifulSoup(
             '<img src="thumb.jpg" data-hi-res-src="full.jpg" width="400" height="300">',
             "html.parser")
-        urls, attrs = p._get_best_image_url(soup.find("img"))
+        urls, attrs = asyncio.run(p._get_best_image_url(soup.find("img")))
         self.assertEqual(urls, ["full.jpg"])
         self.assertEqual(attrs["source"], "data-hi-res-src")
 
@@ -125,7 +128,7 @@ class TestBestImageUrlScoreWidth(unittest.TestCase):
         soup = BeautifulSoup(
             '<img src="thumb.jpg" srcset="a.jpg 100w, b.jpg 2000w">',
             "html.parser")
-        urls, _ = p._get_best_image_url(soup.find("img"))
+        urls, _ = asyncio.run(p._get_best_image_url(soup.find("img")))
         self.assertEqual(urls, ["b.jpg"])
 
 

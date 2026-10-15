@@ -38,15 +38,20 @@ from src.parser.js_engine.engine import DenoJsEngine
 
 
 class _RecordingStdin:
-    def __init__(self, broken=False):
+    def __init__(self, broken=False, block_for=0.0):
         self.written = []
         self.flushes = 0
         self.broken = broken
+        self.block_for = block_for
         self.closed = False
 
     def write(self, data):
         if self.broken:
             raise BrokenPipeError("worker is gone")
+        if self.block_for:
+            # A-15: a child that has not started reading stdin yet (happy-dom
+            # import / Deno's Check step) blocks the writer for real.
+            time.sleep(self.block_for)
         self.written.append(data)
         return len(data)
 
@@ -60,10 +65,13 @@ class _RecordingStdin:
 
 
 class _FakeStdout:
-    def __init__(self, lines=(), block_for=0.0, wait_event=None):
+    def __init__(self, lines=(), block_for=0.0, wait_event=None, stdin=None,
+                 echo_id=True):
         self._lines = list(lines)
         self._block_for = block_for
         self._wait_event = wait_event
+        self._stdin = stdin
+        self._echo_id = echo_id
         self.closed = False
 
     def readline(self):
@@ -72,8 +80,26 @@ class _FakeStdout:
         if self._block_for:
             time.sleep(self._block_for)  # a rule stuck in while(true)
         if self._lines:
-            return self._lines.pop(0)
+            return self._echo_request_id(self._lines.pop(0))
         return ""  # worker closed stdout
+
+    def _echo_request_id(self, line):
+        """The real workers echo the request id (B-16b); so must the double.
+
+        Returns the response line with the id of the most recent request, so a
+        canned `{"id": 0, ...}` response does not look like a foreign line.
+        """
+        if not self._echo_id or self._stdin is None or not self._stdin.written:
+            return line
+        try:
+            request_id = json.loads(self._stdin.written[-1].strip()).get("id")
+            response = json.loads(line)
+        except Exception:
+            return line
+        if not isinstance(response, dict) or request_id is None:
+            return line
+        response["id"] = request_id
+        return json.dumps(response) + "\n"
 
     def close(self):
         self.closed = True
@@ -83,9 +109,11 @@ class _FakeProc:
     """Minimal subprocess.Popen stand-in with reap accounting."""
 
     def __init__(self, alive=True, lines=(), block_for=0.0, broken_pipe=False,
-                 refuse_terminate=False, immortal=False, wait_event=None):
-        self.stdin = _RecordingStdin(broken=broken_pipe)
-        self.stdout = _FakeStdout(lines, block_for, wait_event)
+                 refuse_terminate=False, immortal=False, wait_event=None,
+                 write_block_for=0.0, echo_id=True):
+        self.stdin = _RecordingStdin(broken=broken_pipe, block_for=write_block_for)
+        self.stdout = _FakeStdout(lines, block_for, wait_event, stdin=self.stdin,
+                                  echo_id=echo_id)
         self._alive = alive
         self.terminate_calls = 0
         self.kill_calls = 0
@@ -424,3 +452,154 @@ class TestTimeoutGrace(unittest.TestCase):
         self.assertLess(elapsed, 2.0, f"the timeout stopped bounding the call ({elapsed:.2f}s)")
         self.assertEqual(proc.terminate_calls, 1)
         self.assertIsNone(engine._proc)
+
+
+class TestStdinWriteIsBounded(unittest.TestCase):
+    """A-15: a child that does not read stdin must not hang the caller.
+
+    `proc.stdin.write` blocks once the pipe buffer is full (~72 KB — every real
+    gallery page) and the child only starts reading after its own startup
+    (happy-dom's npm import, Deno's Check step). The read timeout never covered
+    that window, so `shutdown()` waited forever on the worker lock and Stop
+    could not end the task.
+    """
+
+    def test_blocked_write_is_bounded_and_the_worker_is_killed(self):
+        engine = _engine(timeout=0.1)
+        proc = _FakeProc(lines=[_response("ok")], write_block_for=0.6)
+        engine._proc = proc
+
+        started = time.time()
+        result = engine.run_js("code", [])
+        elapsed = time.time() - started
+
+        self.assertIsNone(result, "a blocked write must fail open")
+        self.assertLess(elapsed, 1.0, f"the caller was stuck for {elapsed:.2f}s")
+        self.assertGreaterEqual(proc.kill_calls or proc.terminate_calls, 1,
+                                "the worker with the blocked pipe was left running")
+        self.assertIsNone(engine._proc)
+
+    def test_a_normal_write_still_round_trips(self):
+        """Control: the guarded write path is still the normal path."""
+        engine = _engine()
+        proc = _FakeProc(lines=[_response("fine")])
+        engine._proc = proc
+        self.assertEqual(engine.run_js("code", []), "fine")
+        self.assertEqual(proc.stdin.flushes, 1)
+
+
+class TestResponseIdCorrelation(unittest.TestCase):
+    """B-16(b)/A-08: a response is only accepted for the request that asked.
+
+    Requests used to be hard-coded to `id: 0` and the answer was never checked,
+    so a rule that wrote its own line to stdout (via the `Deno` global, the
+    A-08 injection) had that line attributed to the current request.
+    """
+
+    def test_every_request_carries_a_fresh_id(self):
+        engine = _engine()
+        proc = _FakeProc(lines=[_response("a"), _response("b")])
+        engine._proc = proc
+        engine.run_js("c1", [])
+        engine.run_js("c2", [])
+        ids = [json.loads(line)["id"] for line in proc.stdin.written]
+        self.assertEqual(len(set(ids)), 2, f"request ids reused: {ids}")
+
+    def test_a_foreign_line_is_skipped_and_the_real_answer_used(self):
+        engine = _engine()
+        # The engine's first request id is 1: line one is the injected line, the
+        # second carries the real answer for THIS request.
+        proc = _FakeProc(lines=[json.dumps({"id": 999, "result": "https://evil/x.jpg"}) + "\n",
+                                json.dumps({"id": 1, "result": "https://real/x.jpg"}) + "\n"],
+                         echo_id=False)
+        engine._proc = proc
+
+        self.assertEqual(engine.run_js("code", []), "https://real/x.jpg")
+        self.assertEqual(proc.terminate_calls, 0, "a single foreign line is recoverable")
+
+    def test_repeated_foreign_lines_kill_the_worker_and_fail_open(self):
+        engine = _engine()
+        proc = _FakeProc(lines=[json.dumps({"id": 999, "result": "a"}) + "\n",
+                                json.dumps({"id": 998, "result": "b"}) + "\n"],
+                         echo_id=False)
+        engine._proc = proc
+
+        self.assertIsNone(engine.run_js("code", []))
+        self.assertGreaterEqual(proc.kill_calls or proc.terminate_calls, 1)
+
+
+class TestWorkerRecycling(unittest.TestCase):
+    """B-17: a worker is retired after K.JS_WORKER_MAX_REQUESTS calls.
+
+    The DOM worker parses a page into a fresh happy-dom Window per call and the
+    process lives for the whole task, so memory only stopped growing when the
+    process did (measured: 70 MB with recycling vs 118 MB without).
+    """
+
+    def test_worker_is_recycled_after_the_call_budget(self):
+        proc = _FakeProc(lines=[_response("a")] * 3)
+        engine = _engine()
+        engine._max_requests = 2
+
+        with patch("src.parser.js_engine.engine.subprocess.Popen",
+                   return_value=proc) as popen:
+            self.assertEqual(engine.run_js("c1", []), "a")
+            self.assertEqual(engine.run_js("c2", []), "a")  # budget reached → recycle
+            self.assertEqual(engine.run_js("c3", []), "a")  # fresh worker
+
+        self.assertGreaterEqual(proc.terminate_calls, 1)
+        self.assertEqual(popen.call_count, 2,
+                         "the call after the budget must spawn a fresh worker")
+
+    def test_budget_disabled_keeps_one_worker(self):
+        """Control: with the budget off the worker is reused (no needless spawn)."""
+        proc = _FakeProc(lines=[_response("a")] * 3)
+        engine = _engine()
+        engine._max_requests = 0
+
+        with patch("src.parser.js_engine.engine.subprocess.Popen",
+                   return_value=proc) as popen:
+            for _ in range(3):
+                self.assertEqual(engine.run_js("c", []), "a")
+
+        self.assertEqual(popen.call_count, 1)
+
+
+class TestWorkerSourceGuards(unittest.TestCase):
+    """A-08 / B-18 / B-17 in the worker scripts themselves.
+
+    Deno is not installed on this machine (the suite's 30 skips), so the JS half
+    of these fixes cannot be exercised here. The Python half of A-08/B-16(b) is
+    tested behaviourally above; the worker-side guards are pinned at the source.
+    """
+
+    def _source(self, name):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "src", "parser", "js_engine", name)
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_deno_global_is_shadowed_inside_the_compiled_rule_body(self):
+        # The shadow must be concatenated INTO the function body — a comment or
+        # a stray statement elsewhere would not shadow the global.
+        self.assertIn("const Deno = undefined;\\n' + wrapped",
+                      self._source("worker.js"))
+        self.assertIn("const Deno = undefined;\\n' + code",
+                      self._source("dom_worker.js"))
+
+    def test_every_worker_caps_the_accumulated_request(self):
+        for name in ("worker.js", "dom_worker.js", "gateway_worker.js"):
+            self.assertIn("if (acc.length > (64 << 20)) Deno.exit(1);",
+                          self._source(name), name)
+
+    def test_happydom_windows_are_released(self):
+        for name in ("dom_worker.js", "gateway_worker.js"):
+            src = self._source(name)
+            self.assertIn("win.happyDOM.close()", src, name)
+            self.assertIn("finally {", src, f"{name}: the release must run on every path")
+            # …and AFTER the response is built: closing first empties the
+            # document the rule was about to read (NF-10).
+            self.assertGreater(src.index("win.happyDOM.close()"),
+                               src.index("return JSON.stringify({ id, result"),
+                               f"{name}: happyDOM.close() runs before the response is built")

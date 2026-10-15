@@ -200,8 +200,9 @@ function handle(line) {
   if (typeof code !== "string" || !code) {
     return JSON.stringify({ id, error: "empty code" });
   }
+  let win = null;
   try {
-    const win = new Window({
+    win = new Window({
       url: pageUrl || "https://local.invalid/",
       settings: { enableJavaScriptEvaluation: false },
     });
@@ -223,15 +224,24 @@ function handle(line) {
     // P1 fullsize discovery produced zero results on real sites.
     const $ = Array.isArray(groups) ? groups.slice() : [];
     $._ = htmlStr;
+    // A-08: lexical shadow — see worker.js. `new Function` would otherwise
+    // resolve `Deno` to the global one and let rule code write to the JSON
+    // protocol channel on stdout.
     const fn = new Function(
       "document", "window", "URL", "location", "$",
-      '"use strict";\n' + code,
+      '"use strict";\nconst Deno = undefined;\n' + code,
     );
     const self = shimSelf(doc, href, $);
     const result = normalize(fn.call(self, doc, win, win.URL, win.location, $));
     return JSON.stringify({ id, result });
   } catch (e) {
     return JSON.stringify({ id, error: String((e && e.message) || e) });
+  } finally {
+    // B-17/NF-10: the worker process lives for the whole task and this runs on
+    // EVERY linked page × rule, so an unreleased Window means an unreleased
+    // parsed document per call. The close must happen AFTER the response is
+    // built (closing first empties the document the rule was about to read).
+    try { if (win) win.happyDOM.close(); } catch (_) {}
   }
 }
 
@@ -250,6 +260,9 @@ for (;;) {
   const n = Deno.stdin.readSync(buf);
   if (n === null) break; // EOF
   acc += decoder.decode(buf.subarray(0, n), { stream: true });
+  // B-18: runaway request → die; Python treats the closed stdout as fail-open
+  // and respawns a fresh worker.
+  if (acc.length > (64 << 20)) Deno.exit(1);
   let idx;
   while ((idx = acc.indexOf("\n")) >= 0) {
     const line = acc.slice(0, idx).trim();

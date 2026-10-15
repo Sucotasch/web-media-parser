@@ -225,6 +225,22 @@ class DenoJsEngine:
         # worker.js surfaces as one warning instead of nothing happening.
         self._stderr_log = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
         self._stderr_flagged = False
+        # B-16(b)/A-08: every request carries its own id and the response must
+        # echo it. Requests used to be hard-coded to 0 with no verification, so
+        # a desynchronised stream (a rule writing to stdout) was silently
+        # attributed to the current request.
+        self._request_id = 0
+        # B-17: the DOM worker holds one parsed happy-dom document per call; the
+        # process is recycled every K.JS_WORKER_MAX_REQUESTS calls instead of
+        # growing for the whole task (measured: 70 MB vs 118 MB after 50 calls).
+        self._proc_calls = 0
+        self._dom_calls = 0
+        self._gateway_calls = 0
+        try:
+            from src import constants as K
+            self._max_requests = getattr(K, "JS_WORKER_MAX_REQUESTS", 200)
+        except Exception:
+            self._max_requests = 200
 
     # --- availability ---------------------------------------------------
 
@@ -501,32 +517,101 @@ class DenoJsEngine:
 
     def _call(self, code: str, groups, page_url: str):
         proc = self._ensure_proc()
+        request_id = self._next_request_id()
         request = json.dumps({
-            "id": 0,
+            "id": request_id,
             "code": code,
             "groups": groups,
             "pageUrl": page_url,
         })
         try:
-            proc.stdin.write(request + "\n")
-            proc.stdin.flush()
+            self._send(proc, request, self._kill_proc)
         except Exception:
-            # Broken pipe — worker died; re-spawn on the next call.
+            # Broken pipe / blocked write — worker died or is stuck; respawn next
+            # call.
             self._kill_proc()
             raise
-        # Read the single response line with a timeout via a watcher thread.
-        resp_line = self._read_line_timeout(proc)
-        if resp_line is None:
-            raise TimeoutError("Deno worker timed out")
-        try:
-            resp = json.loads(resp_line)
-        except ValueError:
-            raise ValueError(f"Bad worker response: {resp_line[:120]!r}")
+        resp = self._read_matching_response(proc, request_id, self._kill_proc)
+        self._recycle_if_due(self._kill_proc, "proc")
         if resp.get("error"):
             # JS rule threw (e.g. it needs DOM). Not a fatal error.
             logger.debug(f"Deno JS rule error: {resp['error'][:160]}")
             return None
         return resp.get("result")
+
+    def _recycle_if_due(self, killer, counter_attr: str) -> None:
+        """B-17: retire a worker after K.JS_WORKER_MAX_REQUESTS calls.
+
+        The next call pays one cold spawn (~300 ms) and starts from a fresh
+        process, which is what bounds resident memory on long galleries.
+        """
+        count = getattr(self, "_" + counter_attr + "_calls") + 1
+        setattr(self, "_" + counter_attr + "_calls", count)
+        if self._max_requests and count >= self._max_requests:
+            logger.debug("Recycling the %s worker after %d calls", counter_attr, count)
+            setattr(self, "_" + counter_attr + "_calls", 0)
+            killer()
+
+    def _next_request_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _send(self, proc, payload: str, killer) -> None:
+        """A-15: write one protocol line without hanging the caller.
+
+        `proc.stdin.write` is fully blocking (`bufsize=1` flushes immediately)
+        and the child does not read stdin until its own startup finished —
+        happy-dom's `import` for the DOM/gateway workers, Deno's "Check" step
+        for the plain one. Anything past the pipe buffer (~72 KB: every real
+        gallery page) therefore blocked the caller indefinitely, and the read
+        timeout never covered it: `shutdown()` then waited forever on the
+        worker lock, so Stop could not end the task.
+
+        The write runs on its own thread; if it does not complete within the
+        call timeout, the worker is killed and the caller sees an OSError
+        (fail-open).
+        """
+        err = []
+
+        def _write():
+            try:
+                proc.stdin.write(payload + "\n")
+                proc.stdin.flush()
+            except Exception as e:  # broken pipe — the caller respawns
+                err.append(e)
+
+        t = threading.Thread(target=_write, daemon=True)
+        t.start()
+        t.join(self._timeout)
+        if t.is_alive():
+            killer()
+            raise OSError("Deno worker stdin write blocked")
+        if err:
+            raise err[0]
+
+    def _read_matching_response(self, proc, request_id: int, killer):
+        """B-16(b): read the response whose `id` matches our request.
+
+        One foreign line is skipped (its answer is the next line); a second
+        mismatch means the stream is desynchronised for good, so the worker is
+        killed and the caller fails open.
+        """
+        for _ in range(2):
+            line = self._read_line_timeout(proc, killer=killer)
+            if line is None:
+                raise TimeoutError("Deno worker timed out")
+            try:
+                resp = json.loads(line)
+            except ValueError:
+                raise ValueError(f"Bad worker response: {line[:120]!r}")
+            if resp.get("id") == request_id:
+                return resp
+            logger.warning(
+                "Deno worker answered with a foreign request id (%r) — skipping the line",
+                resp.get("id"),
+            )
+        killer()
+        raise ValueError("Deno worker protocol desynchronised (repeated id mismatch)")
 
     def _read_line_timeout(self, proc, killer=None, timeout: float | None = None) -> str | None:
         """Read one stdout line, aborting (and killing the worker) on timeout.
@@ -589,8 +674,9 @@ class DenoJsEngine:
 
     def _call_dom(self, code: str, html: str, page_url: str, groups, href: str):
         proc = self._ensure_dom_proc()
+        request_id = self._next_request_id()
         request = json.dumps({
-            "id": 0,
+            "id": request_id,
             "html": html,
             "pageUrl": page_url,
             "code": code,
@@ -598,19 +684,14 @@ class DenoJsEngine:
             "href": href,
         })
         try:
-            proc.stdin.write(request + "\n")
-            proc.stdin.flush()
+            self._send(proc, request, self._kill_dom_proc)
         except Exception:
-            # Broken pipe — worker died; re-spawn on the next call.
+            # Broken pipe / blocked write — worker died or is stuck; respawn next
+            # call.
             self._kill_dom_proc()
             raise
-        resp_line = self._read_line_timeout(proc, killer=self._kill_dom_proc)
-        if resp_line is None:
-            raise TimeoutError("Deno DOM worker timed out")
-        try:
-            resp = json.loads(resp_line)
-        except ValueError:
-            raise ValueError(f"Bad DOM worker response: {resp_line[:120]!r}")
+        resp = self._read_matching_response(proc, request_id, self._kill_dom_proc)
+        self._recycle_if_due(self._kill_dom_proc, "dom")
         if resp.get("error"):
             logger.debug(f"Deno DOM rule error: {resp['error'][:160]}")
             return None
@@ -638,16 +719,16 @@ class DenoJsEngine:
         with self._gateway_lock:
             try:
                 proc = self._ensure_gateway_proc()
+                request_id = self._next_request_id()
                 request = json.dumps({
-                    "id": 0,
+                    "id": request_id,
                     "html": html,
                     "pageUrl": page_url or "",
                     "textPatterns": patterns,
                     "overlaySelectors": overlays,
                 })
                 try:
-                    proc.stdin.write(request + "\n")
-                    proc.stdin.flush()
+                    self._send(proc, request, self._kill_gateway_proc)
                 except Exception:
                     self._kill_gateway_proc()
                     raise
@@ -657,6 +738,11 @@ class DenoJsEngine:
                 if resp_line is None:
                     raise TimeoutError("Deno gateway worker timed out")
                 resp = json.loads(resp_line)
+                if resp.get("id") != request_id:
+                    raise ValueError(
+                        f"Deno gateway worker answered with a foreign id: {resp.get('id')!r}"
+                    )
+                self._recycle_if_due(self._kill_gateway_proc, "gateway")
                 if resp.get("error"):
                     logger.debug(f"Deno gateway click error: {resp['error'][:160]}")
                     return None

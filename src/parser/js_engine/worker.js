@@ -117,8 +117,13 @@ function handle(line) {
       }
       wrapCache.set(body, wrapped);
     }
+    // A-08: `new Function` compiles the rule body in the GLOBAL scope, so the
+    // identifier `Deno` resolved to globalThis.Deno and a rule could write
+    // extra lines into the JSON protocol channel (or call Deno.exit) — the
+    // --allow-* flags do not cover stdio/exit. A lexical shadow is enough: no
+    // shipped rule references Deno.
     const fn = new Function("$", "location", "document", "window", "URL",
-      '"use strict";\n' + wrapped);
+      '"use strict";\nconst Deno = undefined;\n' + wrapped);
     const self = shimSelf($);
     const result = fn.call(self, $, location, document, window, URL);
     return JSON.stringify(typeof result === "string" ? { id, result } : { id, result: null });
@@ -148,6 +153,9 @@ for (;;) {
   const n = Deno.stdin.readSync(buf);
   if (n === null) break; // EOF
   acc += decoder.decode(buf.subarray(0, n), { stream: true });
+  // B-18: a request larger than 64 MiB is a runaway page, not work — die so
+  // Python respawns a fresh worker instead of growing this one to OOM.
+  if (acc.length > (64 << 20)) Deno.exit(1);
   let idx;
   while ((idx = acc.indexOf("\n")) >= 0) {
     const line = acc.slice(0, idx).trim();

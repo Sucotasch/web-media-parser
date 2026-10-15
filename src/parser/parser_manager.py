@@ -43,6 +43,8 @@ from src.parser.utils import (
     # is_image_url, # Not used directly
     # is_video_url # Not used directly
 )
+from concurrent.futures import ThreadPoolExecutor
+
 from src.parser.shared_session import AsyncClientManager
 from src.parser import junk_filter
 from src.app_paths import task_state_path
@@ -146,6 +148,12 @@ class ParserManager(QObject):
         # page or the download that was in flight when the user hit Pause.
         self._inflight_url_item = None
         self._inflight_media = None
+        # B-02/A-16: created in _main_task (the event-loop thread) and always
+        # present so callers can pass them to run_in_executor without a
+        # getattr dance; None means "use the default executor" (tests, scripts).
+        self._dl_executor = None
+        self._html_executor = None
+        self._js_executor = None
         
         self.loop = asyncio.new_event_loop()
         # DL-7: start_url is passed so browser-extension cookies are scoped to the
@@ -276,6 +284,12 @@ class ParserManager(QObject):
         # page or the download that was in flight when the user hit Pause.
         self._inflight_url_item = None
         self._inflight_media = None
+        # B-02/A-16: created in _main_task (the event-loop thread) and always
+        # present so callers can pass them to run_in_executor without a
+        # getattr dance; None means "use the default executor" (tests, scripts).
+        self._dl_executor = None
+        self._html_executor = None
+        self._js_executor = None
         self._processed_lock = asyncio.Lock()  # Initialize lock for thread-safe registry access
         self._completed_naturally = False
         self._last_activity_time = time.time()
@@ -357,6 +371,28 @@ class ParserManager(QObject):
             # race conditions if start_parsing() is called again before this task ends.
             shared_dl_session = create_shared_downloader_session(self.settings)
             self._shared_downloader_session = shared_dl_session
+
+            # B-02/A-16: dedicated executors instead of the default pool. A
+            # download lives for the whole file transfer and used to occupy a
+            # slot in the pool that BeautifulSoup and the sync fallbacks also
+            # use: with downloader_threads=8 + parser_threads=4 against a
+            # default pool of min(32, cpu+4)=8, the configured thread counts and
+            # the per-domain semaphore were fiction. The JS pool is separate
+            # again, because a hanging sieve rule must not consume the slots
+            # that downloads and HTML parsing need (and vice versa).
+            self._dl_executor = ThreadPoolExecutor(
+                max_workers=max(1, int(self.settings.get(
+                    K.SETTING_DOWNLOADER_THREADS, K.DEFAULT_DOWNLOADER_THREADS))),
+                thread_name_prefix="media_dl",
+            )
+            self._html_executor = ThreadPoolExecutor(
+                max_workers=max(1, int(self.settings.get(
+                    K.SETTING_PARSER_THREADS, K.DEFAULT_PARSER_THREADS))),
+                thread_name_prefix="html_parse",
+            )
+            self._js_executor = ThreadPoolExecutor(
+                max_workers=K.JS_ENGINE_POOL_WORKERS, thread_name_prefix="js_engine",
+            )
         except Exception as e:
             logger.error(f"Critical error before parser workers started: {e}", exc_info=True)
             self._had_critical_error = True
@@ -398,6 +434,20 @@ class ParserManager(QObject):
             self._had_critical_error = True
         finally:
             logger.info("_main_task finished.")
+            # B-02/A-16: retire the dedicated pools. `wait=False` keeps a stuck
+            # JS rule from holding the task's teardown (the rule's worker is
+            # killed separately).
+            for _executor in (getattr(self, "_dl_executor", None),
+                              getattr(self, "_html_executor", None),
+                              getattr(self, "_js_executor", None)):
+                if _executor is not None:
+                    try:
+                        _executor.shutdown(wait=False)
+                    except Exception as e:
+                        logger.debug(f"Executor shutdown failed: {e}")
+            self._dl_executor = None
+            self._html_executor = None
+            self._js_executor = None
             # MONITOR-LEAK: stop the progress monitor thread even on NATURAL
             # completion or an early crash — stop_parsing() is the only other
             # place that clears these, so without this the daemon monitor
@@ -548,7 +598,10 @@ class ParserManager(QObject):
                 url=url, settings=settings_for_parser,
                 process_js=self.settings.get(K.SETTING_PROCESS_JS, K.DEFAULT_PROCESS_JS),
                 external_session=session, pattern_manager=self.pattern_manager,
-                context=parser_context
+                context=parser_context,
+                # A-16/B-02: the blocking work this parser does (JS rules,
+                # BeautifulSoup, sync fallbacks) runs in the dedicated pools.
+                js_executor=self._js_executor, html_executor=self._html_executor,
             )
             parse_result = await p.parse()
             links_found = parse_result[0]
@@ -614,8 +667,13 @@ class ParserManager(QObject):
             rule, match = rule_match
             link_groups = [match.group(0)]
             link_groups += [match.group(i) for i in range(1, match.re.groups + 1)]
-            transformed = self.pattern_manager.apply_link_url_transform(
-                rule, match, page_url
+            # A-16: this call can execute a sieve JS rule in the Deno worker and
+            # blocks up to the rule timeout; on the event loop it froze the
+            # completion monitor, the progress signals and Stop itself.
+            probe_loop = asyncio.get_running_loop()
+            transformed = await probe_loop.run_in_executor(
+                self._js_executor,
+                lambda: self.pattern_manager.apply_link_url_transform(rule, match, page_url),
             )
 
             def _res_usable():
@@ -697,8 +755,10 @@ class ParserManager(QObject):
                             return
                         html = await resp.text()
 
-                    res_urls = [u for u in self.pattern_manager.extract_res_urls(
-                        rule, html, page_url=page_url, groups=link_groups, href=link_url)
+                    res_urls = [u for u in await probe_loop.run_in_executor(
+                        self._js_executor,
+                        lambda: self.pattern_manager.extract_res_urls(
+                            rule, html, page_url=page_url, groups=link_groups, href=link_url))
                         if is_format_allowed(u, "image", self.settings)]
 
                     # Loop continuation check: rule opted in via `loop & 1`,
@@ -713,8 +773,11 @@ class ParserManager(QObject):
                         cand_match = self.pattern_manager.get_link_rule(candidate)
                         if cand_match is not None and candidate not in seen_fetch_urls:
                             cand_rule, cand_m = cand_match
-                            cand_transformed = self.pattern_manager.apply_link_url_transform(
-                                cand_rule, cand_m, page_url)
+                            cand_transformed = await probe_loop.run_in_executor(
+                                self._js_executor,
+                                lambda: self.pattern_manager.apply_link_url_transform(
+                                    cand_rule, cand_m, page_url),
+                            )
                             cand_fetch = cand_transformed[0] if cand_transformed else candidate
                             if cand_fetch not in seen_fetch_urls:
                                 # Re-resolve: promote candidate to the next hop.
@@ -1066,7 +1129,8 @@ class ParserManager(QObject):
                     self.status_updated.emit(f"Downloading: {base_filename_for_status}")
                     
                     result = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: downloader.download(timeout=timeout_val, retries=retries_val)
+                        self._dl_executor,
+                        lambda: downloader.download(timeout=timeout_val, retries=retries_val)
                     )
                 finally:
                     sem.release()

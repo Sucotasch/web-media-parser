@@ -4,9 +4,9 @@ Baseline for this plan: `319 passed / 30 skipped` (measured 2026-10-15 before an
 One observable outcome per gate; CHECK commands run from the project root, EXPECT is matched
 against the combined output. Format follows `GATES.md`.
 
-**Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met
-(+ the stage sweep). 0 unmet, 0 abandoned. Measured values below; current tree `443 passed /
-30 skipped`.**
+**Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met;
+stage 4 — 8/8 met (+ the stage sweeps). 0 unmet, 0 abandoned. Measured values below; current tree
+`455 passed / 30 skipped`.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -463,6 +463,82 @@ A-03, A-04, A-05, A-06, B-03 … B-07, D-10, D-11, D-12. Baseline entering the s
 
 **Falsification, stage 3: 18 mutations, all RED** (3 state/queue items, A-06, 4 encoding, 2 session,
 1 picture, 3 attribute, 1 empty-body, 1 token-gate, 2 media-type, 1 domain-case).
+
+---
+
+## Stage 4 — the Deno/JS engine (FIXPLAN_2026-10-15 §3/Этап 4)
+
+A-08, A-15, A-16, B-02, B-16(b), B-17, B-18. Baseline entering the stage:
+`443 passed / 30 skipped`. New file `tests/test_executor_offload.py` (2 tests);
+`test_js_engine_lifecycle.py` grew from 13 to 32 tests (its fake worker now echoes the request id,
+like the real one).
+
+### G-4-1 · A-16 · a blocking JS rule no longer freezes the event loop
+- CHECK: `python -m pytest tests/test_executor_offload.py -q`
+- EXPECT: with a JS call that blocks 0.3 s, the loop's largest gap between ticks stays < 0.1 s —
+  on both JS-bearing paths (image extraction and the fullsize probe).
+- RESULT: **MET** — `2 passed`. `webpage_parser._get_best_image_url` is a coroutine that awaits
+  `transform_image_url` in the dedicated JS pool, and all three probe calls
+  (`apply_link_url_transform` × 2, `extract_res_urls`) go through `run_in_executor`. This is the
+  audit's own quantity (it measured a 5.02 s freeze for `while(true){}`); the stand-in blocks for
+  0.3 s instead of running Deno, which is not installed here. 2 mutations (direct call on the loop)
+  → RED.
+
+### G-4-2 · B-02 · blocking work has dedicated pools
+- CHECK: source + `python -m pytest tests/test_executor_offload.py -q`
+- EXPECT: downloads, HTML parsing and JS rules no longer share one executor, and the pools are
+  retired with the task.
+- RESULT: **MET (by construction, not by measurement)** — `_dl_executor` (downloader_threads),
+  `_html_executor` (parser_threads) and `_js_executor` (`K.JS_ENGINE_POOL_WORKERS = 2`) are created in
+  `_main_task` and shut down (`wait=False`) in its `finally`; `run_in_executor(None, …)` was replaced
+  at every site (`BeautifulSoup`, the sync fallback, escalation, the sync bypass, the gateway click,
+  `MediaDownloader.download`). **Limitation:** the pool starvation the audit describes (8 default
+  slots for 12 configured workers) is a scheduling effect; with no Deno and no live wall-clock
+  measurement in this stage it is asserted structurally, not measured.
+
+### G-4-3 · A-15 · a blocked stdin write cannot hang the caller
+- CHECK: `python -m pytest tests/test_js_engine_lifecycle.py -q -k StdinWrite`
+- EXPECT: a child that does not read stdin stops the caller within the timeout, the worker is
+  killed, and a normal write still round-trips.
+- RESULT: **MET** — `2 passed`. The write runs on its own thread and is bounded by the call timeout;
+  on expiry the right worker (plain/DOM/gateway) is killed and the caller sees `OSError` (fail-open).
+  Mutation (direct blocking write) → RED.
+
+### G-4-4 · B-16(b) / A-08 · responses are correlated by request id
+- CHECK: `python -m pytest tests/test_js_engine_lifecycle.py -q -k ResponseIdCorrelation`
+- EXPECT: every request carries a fresh id; one foreign line is skipped and the real answer used; two
+  foreign lines kill the worker and fail open.
+- RESULT: **MET** — `3 passed`. Requests used to be hard-coded `"id": 0` and the answer was never
+  checked. Mutation (no id check) → RED.
+
+### G-4-5 · A-08 / B-18 / B-17 · the worker scripts carry their guards
+- CHECK: `python -m pytest tests/test_js_engine_lifecycle.py -q -k WorkerSourceGuards`,
+  `node --check` on all three workers
+- EXPECT: `Deno` is shadowed INSIDE the compiled rule body in `worker.js` and `dom_worker.js`; every
+  worker caps its accumulated request at 64 MiB; both happy-dom workers release their Window after
+  the response is built.
+- RESULT: **MET** — `3 passed`, `node --check` exit 0. **Limitation:** Deno is not installed on this
+  machine (the suite's 30 skips), so the JS half is pinned at the source level; the Python half
+  (id correlation, fail-open) is tested behaviourally in G-4-4. 3 mutations → RED.
+
+### G-4-6 · B-17 · workers are recycled after a call budget
+- CHECK: `python -m pytest tests/test_js_engine_lifecycle.py -q -k Recycling`
+- EXPECT: the call after `K.JS_WORKER_MAX_REQUESTS` (200) spawns a fresh worker; with the budget off
+  the worker is reused (control).
+- RESULT: **MET** — `2 passed`; the test drives a budget of 2 and observes `Popen` called twice.
+  Mutation (no recycling) → RED. The RSS measurement from the plan (70 MB vs 118 MB per 200 calls)
+  needs Deno and is not re-run here.
+
+### G-4-FULL · Stage 4 regression sweep
+- CHECK: `python -m pytest tests -q`, `node extension/tests/*.test.mjs`,
+  `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401`, `python -m pyflakes …`
+- EXPECT: all green, no new skips, no new lint findings.
+- RESULT: **MET** — Python `455 passed, 30 skipped in 28.4s` (**+12 this stage**, same 30 Deno skips);
+  node 12/12; ruff reports exactly the 3 intentional `webpage_parser.py:37-39` E402; pyflakes silent;
+  `node --check` clean on all three workers.
+
+**Falsification, stage 4: 8 mutations, all RED** (2 offload, blocked write, id check, recycling,
+acc cap, Deno shadow, happy-dom release).
 
 ---
 

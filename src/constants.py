@@ -115,6 +115,15 @@ MAX_SEEN_URLS = 100000
 # Media lookups are never content-capped (a 500-image gallery resolves all
 # 500); the guards are RESOURCE-based only: per-probe timeout, concurrency,
 # and a total time budget per source page so a dead host can't stall a worker.
+# B-17 (2026-10-15): a Deno worker is retired after this many calls, so the
+# parsed documents it holds cannot accumulate for a whole task run.
+JS_WORKER_MAX_REQUESTS = 200
+
+# A-16/B-02 (2026-10-15): worker threads for the dedicated JS-rule pool (sieve
+# `to`/`res` rules). Downloads and HTML parsing have their own pools sized by
+# the user's thread settings.
+JS_ENGINE_POOL_WORKERS = 2
+
 FULLSIZE_DISCOVER_CONCURRENCY = 5   # Concurrent probes (extension uses 5)
 FULLSIZE_DISCOVER_TIMEOUT = 8       # Seconds per probe (extension uses 8000ms)
 FULLSIZE_DISCOVER_TIME_BUDGET = 45  # Max total probe time per source page
