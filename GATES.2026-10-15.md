@@ -6,8 +6,8 @@ against the combined output. Format follows `GATES.md`.
 
 **Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met;
 stage 4 — 8/8 met; stage 5 — 11/11 met (2 live-Chrome items NOT MEASURED, see G-5-LIVE);
-stage 6 — 1/1 met; stage 7 — 4/4 met (+ the stage sweeps). 0 unmet, 0 abandoned.
-Measured values below; current tree `492 passed / 30 skipped`, node 14/14.**
+stage 6 — 1/1 met; stage 7 — 4/4 met; stage 8 — 5/5 met (+ the stage sweeps). 0 unmet,
+0 abandoned. Measured values below; current tree `492 passed / 30 skipped`, node 15/15.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -767,6 +767,88 @@ fixture `extension/tests/vectors/substitution.json`. Baseline entering the stage
 unnormalized variants in both languages, throwing `keepaliveAcquire`, one `onMessage` branch without
 `replyWith`, the D-05 call site, the D-07 scrub, the D-03 cap, the D-06 size cap, Python's `$nn`
 fallback, Python's normalizer).
+
+---
+
+## Stage 8 — polish, docs, final gate (FIXPLAN §3/Этап 8)
+
+Scope: F-07 (popup render cap), the residual E-06 doc drift, CONTEXT/AGENTS coverage of the new
+executor pools and constants, a rebuilt `dist/`, and the final sweep. Only F-07 touches code.
+
+### G-8-1 · F-07 · the popup paints a bounded list and says how many it left out
+- CHECK: `node extension/tests/render_cap.test.mjs`
+- EXPECT: `ALL PASS` — over-cap input yields exactly `RENDER_LIMIT` rows plus the hidden count, an
+  at-cap input hides nothing, the input list is not mutated, the "… and N more" line consumes the
+  hidden count, and previews are `loading="lazy"` + `decoding="async"`.
+- RESULT: **MET** — 15 checks `ALL PASS`. The cap was a literal inside `renderMediaList` (untestable
+  without a DOM), so the decision was extracted into a pure `capForRender(items, limit)` used by the
+  render path; the DOM-only half (lazy previews, the more-line) stays a structural assertion. Nine
+  of the fifteen checks execute the helper, six pin the call site.
+- FALSIFICATION: **4 mutations of `popup.js`, all RED** — off-by-one cap (`limit + 1`), previews
+  without `loading="lazy"`, more-line printing `hidden + 1`, render path calling the helper with a
+  dummy limit. Each mutation was reverted (`file identical to original: True`) and the suite re-run
+  green.
+
+### G-8-2 · E-06 (residual) · the numbers in the docs are the measured ones
+- CHECK: `python -m pytest tests -q` and
+  `grep -rn "345 passed\|319 passed\|483 passed\|24 pytest\|12 test suites" knowledge.md CONTEXT.md README.md README_EN.md AGENTS.md GATES.md PLAN.md`
+- EXPECT: every statement about the *current* tree says `492 passed / 30 skipped` and `15` (was 12)
+  Node suites; only dated historical records keep older numbers.
+- RESULT: **MET** — measured `492 passed, 30 skipped in 43.09s`; updated `knowledge.md` (33 pytest
+  modules, test + lint lines: ruff now has a declared home in `.[lint]` instead of "none
+  configured"), `CONTEXT.md` (§8 command block + status header 2026-10-15), `README.md` /
+  `README_EN.md` (319 → 492 tests, and 12 → 15 suites — G-8-1 added `render_cap`),
+  `AGENTS.md:32`, `GATES.md:3`, `PLAN.md`. Untouched as history: `Audit.md`, `Audit/VERIFY_2026-10-15.md`,
+  `PLAN.md` §8 log entries, `.ext-dev-loop/`.
+
+### G-8-3 · the new machinery is documented where the code is described
+- CHECK: `grep -n "_js_executor\|_dl_executor\|_html_executor\|JS_WORKER_MAX_REQUESTS\|SIEVE_LOOP_MAX_HOPS\|MAX_FILE_SIZE\|VERIFY_TLS" CONTEXT.md AGENTS.md knowledge.md`
+- EXPECT: CONTEXT §4 lists the three pools as a thread/worker row and as invariants 8-9, §5 mentions
+  worker recycling + media verification; AGENTS "Hard constraints" carries the pool rule and the
+  disposable-worker rule; `knowledge.md` lists the constants worth knowing.
+- RESULT: **MET** — all three files updated from the code (`parser_manager.py` `_dl/_html/_js_executor`
+  created in the loop thread and shut down in `_main_task`'s `finally`; `engine.py:_recycle_if_due` +
+  `K.JS_WORKER_MAX_REQUESTS`; `K.SIEVE_LOOP_MAX_HOPS`; `K.SETTING_MAX_FILE_SIZE` /
+  `K.DEFAULT_MAX_FILE_SIZE=0` with the 2 GiB GUI default). `CONTEXT.md` §7 also had to change: its
+  "do not trust it until fixed" table still listed the eight top defects as open — each row now
+  names how it was closed, measured where measurable (dev sieve load: 815 rule names / 561 rules /
+  34 patterns, PAT-1).
+
+### G-8-4 · the frozen build starts and serves
+- CHECK: stage `bin/deno.exe` (the bundled binary is gitignored), then
+  `WEB_MEDIA_PARSER_DENO=<staged deno.exe> python build_exe.py`, launch `dist/WebMediaParser/WebMediaParser.exe`,
+  `curl http://127.0.0.1:19876/api/status` + `/api/queue`, then kill the process.
+- EXPECT: the build logs `deno.exe (92 MB)` and `deno_cache/npm`; the exe logs a settings/queue path
+  lookup under `dist/WebMediaParser/`, `Extension API server started on http://localhost:19876`, and
+  both endpoints answer; the port closes after the kill.
+- RESULT: **MET** — build exit 0, `PyInstaller` 6.21, `deno.exe (92 MB)` + `deno_cache/npm (happy-dom)`
+  bundled; frozen run logged `Settings file not found at …\dist\WebMediaParser\settings.json, using
+  defaults` → `Extension API server started`, and `GET /api/status` returned
+  `{"active_task": null, "queue_length": 0, "files_downloaded": 0}` (`/api/queue` → 200); after
+  `taskkill /F /PID` the port stopped answering (`curl_exit=7`). This is a *startup + API* smoke
+  test — an end-to-end crawl through the frozen exe is not automatable here (see G-8-LIVE).
+
+### G-8-LIVE · the human-in-the-loop checks — NOT RUN
+- CHECK: parsing a real gallery through the frozen exe (Stop/Pause mid-task), loading the unpacked
+  extension against it, and the two live-Chrome items from G-5-LIVE.
+- RESULT: **NOT RUN** — no browser automation and no interactive session in this environment. Stated
+  as a gap, not a pass; the earlier stage ledgers report the same limitation.
+
+### G-8-FULL · Stage 8 regression sweep
+- CHECK: `python -m pytest tests -q`; every `extension/tests/*.test.mjs`; `node --check` on all six
+  extension scripts; `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401`
+- EXPECT: all green; no new skips; no new lint findings.
+- RESULT: **MET** — Python `492 passed, 30 skipped` (unchanged: this stage added one Node suite and
+  no Python test), node **15/15** (14 before; `render_cap` is new), `node --check` clean on
+  `background.js`, `content_script.js`, `shared.js`, `sieve.js`, `sieve_updater.js`, `popup/popup.js`,
+  ruff reports exactly 3 E402 — all in `src/parser/webpage_parser.py` (now lines 37-39; the earlier
+  stages' "35-37" drifted by the B-03 charset change, still the same intentional lazy imports).
+
+### Artifact note · `WebMediaParser.spec`
+The tracked spec is regenerated by every `python build_exe.py` run (PyInstaller rewrites it with
+platform separators — `resources\icon.ico` on Windows). The post-build copy in the tree was reverted
+to the committed forward-slash form so the delivery diff contains no build byproduct; the file stays
+ignored-for-dev-copies but trackable (G-0-2).
 
 ---
 

@@ -29,9 +29,9 @@ Extension API: `http://127.0.0.1:19876` (`GET /api/status`, `GET /api/queue`, `P
 
 ## Testing (the only automated gate)
 
-There is **no CI workflow, no `pyproject.toml`/`setup.cfg`/`.flake8`/`.editorconfig`, no typecheck**. Baseline as of 2026-10: **319 passed / 30 skipped**.
+There is **no CI workflow, no `pyproject.toml`/`setup.cfg`/`.flake8`/`.editorconfig`, no typecheck**. Current tree (2026-10-15): **492 passed / 30 skipped**, plus **15/15** Node suites in `extension/tests/*.test.mjs`. Lint is ruff from the `.[lint]` extra: `pip install -e .[lint]` then `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401` (expect exactly the three intentional `webpage_parser.py` E402 lines).
 
-- The 30 skips are Deno-dependent (`test_js_engine.py`, `test_gateway_bypass.py`) — they auto-skip when no Deno binary is resolvable. Skipping is the expected green state; do not "fix" the skips.
+- The 30 skips are Deno-dependent (`test_js_engine.py`, `test_gateway_bypass.py`) — they auto-skip when no Deno binary is resolvable. Skipping is the expected green state; do not "fix" the skips. Verify with `python -m pytest tests -q -rs`.
 - Deno resolution order (`src/parser/js_engine/engine.py: find_deno_bin`): `WEB_MEDIA_PARSER_DENO`/`DENO_BIN` env → `deno` PyPI package → `bin/deno.exe` next to the frozen exe → media-downloader's bundled `deno.exe` → `PATH`.
 - `tests/conftest.py` puts the project root and `tests/` on `sys.path`, so pytest works from any cwd. Imports are `src.*` and `helpers`.
 - Sieve-dependent tests pin `Imagus_sieve_2026.07.15_823.json` through `tests/helpers.py:SIEVE_PATH`. SitePatternManager resolves duplicate rule names "newest file wins", so repointing tests at another snapshot breaks unrelated tests.
@@ -118,7 +118,9 @@ Generated / never commit as product code: `venv/`, `build/`, `dist/`, `release/`
 - Shared downloader `requests.Session` uses `Retry(total=0)` (`create_shared_downloader_session`) so Stop aborts promptly. The per-download retry count comes from settings instead.
 - `DOMAIN_CONCURRENCY_LIMIT = 2` (parser + downloader combined) and `DEFAULT_MAX_LINKS_PER_PAGE = 200` (priority-sorted, top N kept).
 - Portable paths go through `src/app_paths.py` — no hardcoded absolute install paths.
-- Defaults and setting keys live in `src/constants.py`; consumers import `K.*` — single source of truth.
+- Blocking work goes to its **own executor pool** — `_js_executor` (2 workers) for JS rules, `_dl_executor` for downloads, `_html_executor` for BeautifulSoup/sync fetches — and never inline in a coroutine (measured loop stall 5.02 s → 0.03 s). Created in the loop thread, shut down in `_main_task`'s `finally`.
+- **Deno workers are disposable**: recycled every `K.JS_WORKER_MAX_REQUESTS` (200) calls, because `happyDOM.close()` does not actually release memory.
+- Defaults and setting keys live in `src/constants.py`; consumers import `K.*` — single source of truth. Recent keys: `SETTING_MAX_FILE_SIZE`/`DEFAULT_MAX_FILE_SIZE` (KB, 0 = unlimited in code; 2 GiB in the GUI defaults), `SIEVE_LOOP_MAX_HOPS = 5`, `JS_WORKER_MAX_REQUESTS = 200`, `SETTING_VERIFY_TLS` (default off; downloader sessions only — the escalation GET stays verified).
 - JS engine on Windows: `Popen` calls use `CREATE_NO_WINDOW`, otherwise a console window pops up per Deno spawn for the whole task.
 
 ---

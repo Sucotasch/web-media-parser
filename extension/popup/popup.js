@@ -388,8 +388,7 @@ function renderMediaList() {
   // <img> that the browser then tries to load). Show the first 300 and say how
   // many are left, so the list is usable instead of merely complete — the
   // filters and "select all" still cover what is on screen.
-  const RENDER_LIMIT = 300;
-  const shown = filtered.slice(0, RENDER_LIMIT);
+  const { shown, hidden } = capForRender(filtered);
 
   shown.forEach((item) => {
     const globalIndex = mediaItems.indexOf(item);
@@ -487,13 +486,22 @@ function renderMediaList() {
     mediaList.appendChild(div);
   });
 
-  if (filtered.length > RENDER_LIMIT) {
+  if (hidden > 0) {
     const more = document.createElement("div");
     more.className = "media-more";
-    more.textContent = `\u2026 and ${filtered.length - RENDER_LIMIT} more`
+    more.textContent = `\u2026 and ${hidden} more`
       + " \u2014 narrow the domain or source filter to reach them";
     mediaList.appendChild(more);
   }
+}
+
+// F-07: how many rows the popup paints at once, and whether it must say that
+// more exist. Pure so the cap is testable without a DOM.
+const RENDER_LIMIT = 300;
+
+function capForRender(items, limit = RENDER_LIMIT) {
+  const shown = items.slice(0, limit);
+  return { shown, hidden: items.length - shown.length };
 }
 
 function getVisibleCheckboxes() {

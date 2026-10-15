@@ -1,6 +1,7 @@
 # Web Media Parser — Контекст проекта и архитектура (as-built)
 
-> **Обновлено:** 2026-08-16 — приведён в соответствие с кодом после полного аудита (см. [`Audit.md`](Audit.md)).
+> **Обновлено:** 2026-10-15 — план исправлений `Audit/FIXPLAN_2026-10-15.md` применён (этапы 0-7,
+> гейты в `GATES.2026-10-15.md`; топ-дефекты аудита закрыты, см. §7). Архитектурная часть — от 2026-08-16.
 > **Статус:** очередь задач и все фичи P0–P4 (sieve-JS/Deno, junk-фильтр, curl_cffi, гейтвеи) реализованы.
 > Этот документ описывает **как код устроен сейчас**. Исторические планы/аудиты сжаты в §9.
 
@@ -154,7 +155,8 @@ web-media-parser/
 | AsyncEventLoopThread | ParserManager | весь asyncio: воркеры парсера/загрузчика, completion monitor |
 | ExtensionServer | MainWindow (daemon) | aiohttp на 127.0.0.1:19876; колбэки дергаются из этого потока (⚠ см. §7 GUI-1) |
 | Downloader executor | loop | `run_in_executor` на `MediaDownloader.download()` — синхронные requests/curl |
-| Deno subprocess'ы | js_engine | long-lived воркеры (worker/dom/gateway), JSON-over-stdio, без `--allow-*` |
+| Deno subprocess'ы | js_engine | long-lived воркеры (worker/dom/gateway), JSON-over-stdio, без `--allow-*`; ответ сверяется по `id`, воркер перерождается каждые `K.JS_WORKER_MAX_REQUESTS=200` вызовов |
+| Пулы executor'ов | ParserManager (в loop-потоке) | `_js_executor` (2), `_dl_executor`, `_html_executor` — JS-правила, закачки и BeautifulSoup/sync-фетч идут **только** туда; `shutdown` в `finally` `_main_task` |
 
 **Инварианты (нарушение = регрессии):**
 1. Один `ParserManager` = одна задача; `QThread` новый на задачу (нельзя restart).
@@ -164,6 +166,8 @@ web-media-parser/
 5. Кросс-потоковая остановка: только через события (`threading.Event` / `asyncio.Event`).
 6. Пути — через `src/app_paths.py`; константы/ключи настроек — через `K.*`.
 7. `one_shot=True` — не следовать ссылками; media-список может прийти предсобранным из расширения (`pending_downloads`).
+8. Блокирующая работа (JS-правило, закачка, `BeautifulSoup`, sync-фетч) — только в своём пуле executor'ов, никогда прямо в корутине: иначе loop встаёт (замер: 5,02 с → 0,03 с).
+9. Все настройки/константы берутся из `K.*`: новые ключи — `SETTING_MAX_FILE_SIZE`/`DEFAULT_MAX_FILE_SIZE` (КБ, 0 = без предела; в GUI-дефолтах 2 ГиБ), `SIEVE_LOOP_MAX_HOPS=5`, `JS_WORKER_MAX_REQUESTS=200`, `SETTING_VERIFY_TLS` (дефолт off — только downloader-сессии, эскалационный GET верифицируется всегда).
 
 ---
 
@@ -176,7 +180,8 @@ web-media-parser/
 - **Форматы**: allowlist'ы `enabled_image/video/audio_formats`; выключенные форматы не скачиваются (GIF/SVG/ICO/CUR по умолчанию off).
 - **Гейтвеи (P4)**: статическое извлечение consent-кук из `onclick` (всегда) + DOM-клик через `gateway_worker.js` (при `js_engine=deno`); consent-кэш по доменам в ParserManager; лимит 3 попытки, `_js_gateway_tried` one-shot.
 - **HTTP (P3)**: async-фетч всегда aiohttp; sync-пути (фолбэк, гейтвеи, скачивание) — `requests` или `curl_cffi` (имперсонация chrome); авто-эскалация: одна curl-попытка при 403/5xx (`SETTING_HTTP_ESCALATE`, дефолт on; 429 никогда).
-- **JS-движок (P0/P1)**: `js_engine: static|deno`; static — JS→Python конвертер; deno — воркеры в песочнице; любое падение → fail-open на статику.
+- **JS-движок (P0/P1)**: `js_engine: static|deno`; static — JS→Python конвертер; deno — воркеры в песочнице; любое падение → fail-open на статику; протокол сверяется по `id` (чужой ответ отбрасывается, запрос повторяется один раз), воркеры recycle'ятся по `K.JS_WORKER_MAX_REQUESTS` (`happyDOM.close()` память не возвращает — замер 118 → 70 МБ).
+- **Проверка медиа при закачке**: сниффинг первого чанка (`<!doctype|<html|<head|<body` — всегда отказ, `<?xml` — если Content-Type не image), рамки (chunked/close-delimited) + `unverified_length` вместо наивного сравнения размера, MT-сборка в `*.mt.partial` + `os.replace`, лимит `K.DEFAULT_MAX_FILE_SIZE` (0 = без предела).
 
 ---
 
@@ -191,27 +196,30 @@ web-media-parser/
 
 ## 7. Известные дефекты (сводно; детали и фиксы — Audit.md)
 
-**Не полагаться на «работает», пока не починено (топ):**
+**Топ-дефекты из аудита 2026-08-16 — применены** этапами 0-7 плана `Audit/FIXPLAN_2026-10-15.md`
+(гейты и замеры: `GATES.2026-10-15.md`; коммиты `d663444`, `fef0758`, `54688c6`, `f6958a7`):
 
-| ID | Суть |
-|---|---|
-| CORE-1 | JSON-парсер мёртв (`async with` без контекст-менеджера) — critical |
-| CORE-10 | Ошибка единственной страницы → задача не завершается (hang) |
-| GUI-1 | `QTimer.singleShot` из HTTP-потока — автостарт/refresh из расширения не срабатывают |
-| GUI-2 | Гонка смены задач: утечка QThread / порча статуса чужим `task_ended` (сигнал без task_id) |
-| GUI-4 | `task_queue.json` не атомарен; один битый элемент стирает всю очередь |
-| DL-3 | gzip-ответы ложно бракуются по размеру → карантин домена |
-| PAT-1 | Dev-запуск: 0 sieve-правил (файлы вне путей поиска) |
-| PAT-7/8 | Блоклист и allowlist в dev грузятся не оттуда (src-копия / неверный путь) |
+| ID | Суть | Как закрыт |
+|---|---|---|
+| CORE-1 | JSON-парсер мёртв (`async with` без контекст-менеджера) | контекстом управляет вызывающий; `async with self.session.get(...)` — тест `test_json_parser.py` |
+| CORE-10 | Ошибка единственной страницы → задача не завершается (hang) | `task_ended` эмитится на всех выходах `_main_task`, включая аварийный |
+| GUI-1 | `QTimer.singleShot` из HTTP-потока — автостарт/refresh из расширения не срабатывают | payload расширения буферизуется, `QTimer` только в GUI-потоке (`main_window.py:141`, `_pending_extension_payloads`) |
+| GUI-2 | Гонка смены задач: утечка QThread / порча статуса чужим `task_ended` | `task_ended = Signal(task_id, reason)`; `finished.connect(deleteLater)` |
+| GUI-4 | `task_queue.json` не атомарен; один битый элемент стирает всю очередь | `tmp + fsync + os.replace`, один битый элемент — только он и пропускается |
+| DL-3 | gzip-ответы ложно бракуются по размеру → карантин домена | проверка по framing + сниффинг тела + `unverified_length` вместо наивного сравнения размеров |
+| PAT-1 | Dev-запуск: 0 sieve-правил | проверено на этом дереве: 815 имён правил / 561 правило / 34 паттерна в dev |
+| PAT-7/8 | Блоклист и allowlist в dev грузятся не оттуда | единый `app_paths.resource_path()` для dev и frozen |
 
-Полный список (~90 находок с фиксами и кодом): **`Audit.md`**.
+Полный список (~90 находок с фиксами и кодом): **`Audit.md`**. Независимая верификация
+(63/63 Medium/Low, 3 новых дефекта) — `Audit/VERIFY_2026-10-15.md`.
 
 ---
 
 ## 8. Тесты
 
 ```bash
-python -m pytest tests -q    # 345 passed, 30 skipped (2026-10-15)
+python -m pytest tests -q    # 492 passed, 30 skipped (2026-10-15)
+for f in extension/tests/*.test.mjs; do node "$f"; done   # 15/15 ALL PASS
 
 > **Что лежит в state-файле (A-02, продуктовое решение 2026-10-15).** `last_session.pkl` — обычный pickle в каталоге загрузки: он содержит очереди URL/загрузок, статистику, health домена и **cookie, выученные на gateway/age-gate страницах** (в открытом виде). Шифрования и фильтрации кредов здесь нет намеренно: контур локальный и доверенный (однопользовательский инструмент, cookie из браузера самого пользователя), а вырезание cookie при персисте ломало бы resume на age-gate/авторизованных сайтах (`Close window` → Pause + save queue → перезапуск вернул бы consent-страницу). Не выкладывайте каталог загрузок в публичный архив/репозиторий.
 ```

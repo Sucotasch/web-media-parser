@@ -331,7 +331,7 @@ The codebase has undergone a comprehensive engineering audit (see detailed regis
 - Resolved multi-thread download chunk file descriptor leaks, session configuration leakage, Content-Type validation gates preventing error HTML pages from being saved as images, and filename normalization.
 - Achieved Imagus Sieve rule parity between desktop and browser extension, path-segment-aware URL filtering, and robust ad/banner categorization.
 - Browser extension fully cleaned of legacy `new Function` calls and deprecated manifest properties, with full packaging documentation for Chrome Web Store distribution (see [`docs/CHROME_WEB_STORE.md`](docs/CHROME_WEB_STORE.md) and [`PRIVACY_POLICY.md`](PRIVACY_POLICY.md)).
-- Test coverage: **319 passed tests** in Python (`pytest`) and **12 test suites** for the Chrome extension (`Node.js`).
+- Test coverage: **492 passed tests** in Python (`pytest`; 30 skipped without Deno) and **15 test suites** for the Chrome extension (`Node.js`).
 
 ---
 
