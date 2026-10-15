@@ -20,6 +20,39 @@
 // promoting those made "Full size" list 285 thumbnails next to the real
 // originals; they stay in the "Thumbnails" bucket (see classifyPageImages).
 const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img"]);
+// (D-07's sanitizeFilename lives below, next to the other shared helpers.)
+
+/**
+ * D-07: a filename Chrome's downloader will accept.
+ *
+ * Both the popup and the background passed the URL's last path segment through
+ * untouched, and Chrome rejects the DOWNLOAD when the name carries a path
+ * separator, a Windows device name, a trailing dot/space or a control
+ * character (measured: `..%2F..%2Fx.png` and `CON.png` both failed to start).
+ * A percent-encoded separator is the interesting case — the name is decoded
+ * before it is scrubbed, so `%2F` cannot smuggle one through.
+ *
+ * @param {string} name — the candidate name (URL path segment, usually)
+ * @param {string} [fallback] — used when nothing usable is left
+ * @returns {string}
+ */
+function sanitizeFilename(name, fallback) {
+  let base = String(name == null ? "" : name);
+  try {
+    base = decodeURIComponent(base);
+  } catch (e) {
+    // a malformed escape sequence: scrub the raw form instead
+  }
+  base = base.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim();
+  base = base.replace(/^\.+/, "").replace(/[. ]+$/, "");
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i.test(base)) base = `_${base}`;
+  if (base.length > 150) {
+    const dot = base.lastIndexOf(".");
+    const ext = dot > 0 && base.length - dot <= 6 ? base.slice(dot) : "";
+    base = base.slice(0, 150 - ext.length) + ext;
+  }
+  return base || fallback || "media";
+}
 
 // Time budget (ms) for the POSTPONED tier of fullsize discovery: links whose origin
 // already failed during this scan (timeout, 429, 5xx) and that were therefore moved

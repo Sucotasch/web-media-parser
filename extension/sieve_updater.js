@@ -26,6 +26,11 @@ const MAX_RETRIES = 3;
 // no longer the cheap early-exit it was designed as — it became a real
 // conditional GET on every worker start. One attempt per window is enough.
 const COLD_START_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000;
+// D-06: a sieve is ~1-2 MB. The response used to be read into a string and
+// JSON.parse'd with no bound at all, so a hostile or broken endpoint could make
+// the service worker allocate an arbitrary graph (measured: a 20 MiB body was
+// parsed without complaint). 8 MiB is ~4x the real bundle.
+const MAX_SIEVE_BYTES = 8 * 1024 * 1024;
 
 /**
  * Convert a raw.githubusercontent.com URL into its jsDelivr CDN equivalent
@@ -136,7 +141,16 @@ async function fetchSieve(url, lastModified) {
   });
   if (resp.status === 304) return { notModified: true };
   if (!resp.ok) throw new Error("HTTP " + resp.status);
+  // D-06: refuse before reading the body, when the server declares its size…
+  const declared = Number(resp.headers && resp.headers.get && resp.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_SIEVE_BYTES) {
+    throw new Error(`Sieve response too large (${declared} bytes)`);
+  }
   const text = await resp.text();
+  // …and again for a body without (or with a lying) Content-Length.
+  if (text.length > MAX_SIEVE_BYTES) {
+    throw new Error(`Sieve response too large (${text.length} bytes)`);
+  }
   const data = JSON.parse(text);
   if (typeof data !== "object" || data === null || Array.isArray(data)) {
     throw new Error("Invalid sieve format: must be an object");
@@ -159,6 +173,11 @@ async function updateSieve(repositoryUrl, options = {}) {
   const storage = options.storage || chrome.storage.local;
   const version = options.version || null;
   const repoUrl = repositoryUrl || SIEVE_REPO_URL;
+  // D-01: this flow can sit through MAX_RETRIES * two URLs with exponential
+  // backoff, far past MV3's ~30 s idle window — the caller passes its own
+  // keepalive in (background.js) so the worker is not terminated mid-update.
+  const keepalive = options.keepalive || null;
+  if (keepalive && typeof keepalive.acquire === "function") keepalive.acquire();
   const mirrorUrl = jsDelivrMirror(repoUrl);
   const stored = await storage.get(["sieveRules", "sieveVersion", "sieveUpdateLast"]);
   const lastModified = stored.sieveUpdateLast
@@ -171,32 +190,36 @@ async function updateSieve(repositoryUrl, options = {}) {
 
   let lastError = null;
   const urls = [repoUrl, mirrorUrl].filter(Boolean);
-  for (const url of urls) {
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        const result = await fetchSieve(url, lastModified);
-        if (result.notModified) {
-          return { status: "up-to-date", message: "Sieve is up to date (HTTP 304)" };
-        }
-        if (validRuleCount(result.data) === 0) {
-          throw new Error("Sieve contains no valid rules");
-        }
-        const merged = mergeSieve(parseStoredSieve(stored.sieveRules), result.data);
-        const patch = {
-          // R-E-1: readers JSON.parse this key — it must stay a string.
-          sieveRules: JSON.stringify(merged),
-          sieveUpdateLast: Date.now(),
-        };
-        if (version) patch.sieveVersion = version;
-        await storage.set(patch);
-        return { status: "updated", message: "Sieve updated successfully" };
-      } catch (e) {
-        lastError = e;
-        if (attempt < MAX_RETRIES - 1) {
-          await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+  try {
+    for (const url of urls) {
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const result = await fetchSieve(url, lastModified);
+          if (result.notModified) {
+            return { status: "up-to-date", message: "Sieve is up to date (HTTP 304)" };
+          }
+          if (validRuleCount(result.data) === 0) {
+            throw new Error("Sieve contains no valid rules");
+          }
+          const merged = mergeSieve(parseStoredSieve(stored.sieveRules), result.data);
+          const patch = {
+            // R-E-1: readers JSON.parse this key — it must stay a string.
+            sieveRules: JSON.stringify(merged),
+            sieveUpdateLast: Date.now(),
+          };
+          if (version) patch.sieveVersion = version;
+          await storage.set(patch);
+          return { status: "updated", message: "Sieve updated successfully" };
+        } catch (e) {
+          lastError = e;
+          if (attempt < MAX_RETRIES - 1) {
+            await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
+          }
         }
       }
     }
+  } finally {
+    if (keepalive && typeof keepalive.release === "function") keepalive.release();
   }
   return { status: "error", message: lastError ? lastError.message : "unknown error" };
 }
@@ -207,6 +230,7 @@ self.WMPSieveUpdater = {
   SIEVE_UPDATE_ALARM,
   SIEVE_REPO_URL,
   COLD_START_MIN_INTERVAL_MS,
+  MAX_SIEVE_BYTES,
   jsDelivrMirror,
   validRuleCount,
   mergeSieve,

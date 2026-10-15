@@ -14,6 +14,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const bg = readFileSync(join(here, "..", "background.js"), "utf8");
 const shared = readFileSync(join(here, "..", "shared.js"), "utf8");
 const updaterSrc = readFileSync(join(here, "..", "sieve_updater.js"), "utf8");
+const sieve = readFileSync(join(here, "..", "sieve.js"), "utf8");
 
 function extractFn(source, marker, label) {
   const start = source.indexOf(marker);
@@ -92,10 +93,20 @@ function makeUpgrade({ rules = null, stored = rules ? JSON.stringify(rules) : nu
     }
     return [];
   };
+  // D-05: upgradeMediaList now also strips a WordPress/CDN size suffix, and
+  // NF-1 normalizes the produced URL — both are real functions in background.js,
+  // so extract them rather than stubbing a different behaviour here.
+  const stripSizeSuffix = extractFn(bg, "function stripSizeSuffix(url) {", "stripSizeSuffix");
+  const strip = new Function(`return (${stripSizeSuffix})`)();
+  // normalizeVariant lives in sieve.js (the one shared by popup + worker).
+  const normalizeVariant = extractFn(sieve, "function normalizeVariant(", "normalizeVariant");
+  const normalize = new Function(`return (${normalizeVariant})`)();
   const fn = new Function(
     "chrome", "parseSieve", "applySieveRulesAll", "applyResizeUpgrade", "console",
+    "stripSizeSuffix", "normalizeVariant",
     `return (${upgradeSrc})`
-  )(chrome, parseSieve, applySieveRulesAll, resize, { warn: (...a) => warnings.push(a.join(" ")) });
+  )(chrome, parseSieve, applySieveRulesAll, resize,
+    { warn: (...a) => warnings.push(a.join(" ")) }, strip, normalize);
   return { fn, warnings };
 }
 
@@ -136,6 +147,17 @@ function makeUpgrade({ rules = null, stored = rules ? JSON.stringify(rules) : nu
   const out = await fn([{ url: "https://cdn/shop/a.jpg?v=1&width=500", source: "img" }], "https://a/");
   check("native resize fallback still strips params", out[0].url, "https://cdn/shop/a.jpg?v=1&");
   check("fallback items are marked transformed", [out[0].transformed, out[0].source], [true, "sieve-to"]);
+}
+
+{
+  // D-05: a WordPress/CDN size suffix on the URL itself is stripped through the
+  // REAL pipeline (not just by calling the helper directly), and the item keeps
+  // the original URL for reference.
+  const { fn } = makeUpgrade({ rules: { R: { img: "/nomatch/", to: "/x/$1" } } });
+  const out = await fn([{ url: "https://cdn/g/photo-300x200.jpg", source: "img" }], "https://a/");
+  check("D-05: the size suffix is stripped by upgradeMediaList", out[0].url, "https://cdn/g/photo.jpg");
+  check("D-05: the original URL is kept", out[0].original_url, "https://cdn/g/photo-300x200.jpg");
+  check("D-05: the item is marked transformed", [out[0].transformed, out[0].source], [true, "sieve-to"]);
 }
 
 {

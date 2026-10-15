@@ -16,10 +16,13 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(join(here, "..", "background.js"), "utf8");
 
-const startMarker = "async function chromeDownload(items, concurrentLimit = 2) {";
+// A-14 split the batch builder out of chromeDownload (which now only guards
+// against a second concurrent batch); the DownloadOptions assertions below are
+// about the batch itself, so that is what gets extracted and driven.
+const startMarker = "async function chromeDownloadBatch(items, concurrentLimit) {";
 const start = src.indexOf(startMarker);
 if (start < 0) {
-  console.error("FAIL: chromeDownload not found in background.js");
+  console.error("FAIL: chromeDownloadBatch not found in background.js");
   process.exit(1);
 }
 let depth = 0;
@@ -33,7 +36,7 @@ for (let i = start; i < src.length; i++) {
   }
 }
 if (end <= start) {
-  console.error("FAIL: could not extract chromeDownload body");
+  console.error("FAIL: could not extract chromeDownloadBatch body");
   process.exit(1);
 }
 
@@ -145,6 +148,42 @@ function run(items, resolveFn) {
     progressWrites.some(w => w && w.status === "active" && w.total === 1), true);
   check("final progress written as done",
     progressWrites.some(w => w && w.status === "done" && w.saved === 1), true);
+}
+
+// 5. A-14: the wrapper refuses a second batch while one is still running, and
+// the first one still finishes normally.
+{
+  const wrapperMarker = "async function chromeDownload(items, concurrentLimit = 2) {";
+  const wStart = src.indexOf(wrapperMarker);
+  let wDepth = 0;
+  let wEnd = wStart;
+  for (let i = wStart; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "{") wDepth++;
+    else if (ch === "}") {
+      wDepth--;
+      if (wDepth === 0) { wEnd = i + 1; break; }
+    }
+  }
+  if (wStart < 0 || wEnd <= wStart) {
+    console.error("FAIL: could not extract the chromeDownload wrapper");
+    process.exit(1);
+  }
+
+  let release = null;
+  const batches = { running: false };
+  const slowBatch = () => new Promise((r) => { release = () => r({ saved: 7 }); });
+  const wrapper = new Function(
+    "chromeDownloadBatch", "_batches",
+    `return (${src.slice(wStart, wEnd)})`
+  )(slowBatch, batches);
+
+  const first = wrapper([{ url: FULL_URL }], 2);
+  const second = await wrapper([{ url: FULL_URL }], 2);
+  check("a second batch is refused while one runs", second, { saved: 0, busy: true });
+  release();
+  check("the running batch still completes", await first, { saved: 7 });
+  check("the guard is released afterwards", batches.running, false);
 }
 
 if (failures > 0) {

@@ -16,7 +16,14 @@ if (!fnMatch) {
   console.error("FAIL: applyUrlTransform not found in background.js");
   process.exit(1);
 }
-const applyUrlTransform = new Function(`return (${fnMatch[0]})`)();
+// A-10/A-12: background.js no longer carries its own substitution — it calls
+// sieve.js's spec implementation, so inject the real one here instead of
+// letting the extracted body fail on an undefined global.
+const sieveSrc = readFileSync(join(here, "..", "sieve.js"), "utf8");
+const getSubstitution = new Function("console", `${sieveSrc}
+  return getSubstitution;
+`)(console);
+const applyUrlTransform = new Function("getSubstitution", `return (${fnMatch[0]})`)(getSubstitution);
 
 let failures = 0;
 function check(name, actual, expected) {

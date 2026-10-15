@@ -54,12 +54,21 @@
       media.push({ url, type, pageUrl: baseUrl, ...attrs });
     }
 
+    // D-03: parity with the desktop app's DEFAULT_MAX_LINKS_PER_PAGE (200), and
+    // ONLY for navigation links. A page with 1000 nav anchors (tag lists, page
+    // numbers, archives) used to flood discovery, which works the list in order
+    // — the real thumbnail links sat behind all of it and the page budget ran
+    // out before they were probed. Media-bearing links are never capped: they
+    // ARE the result, and dropping them would lose media with no upside.
+    const MAX_PLAIN_LINKS = 200;
+
     function addLink(url, presentsMedia = true) {
       url = toAbsolute(url);
       if (!url || linkSet.has(url)) return;
       if (url === baseUrl) return;
       // Filter out non-HTTP(S) schemes to prevent fetch errors in background
       if (!url.startsWith("http://") && !url.startsWith("https://")) return;
+      if (!presentsMedia && linkRest.length >= MAX_PLAIN_LINKS) return;
       linkSet.add(url);
       (presentsMedia ? links : linkRest).push(url);
     }

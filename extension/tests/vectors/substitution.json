@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "A-10 / A-12 / NF-2 / NF-7: shared vectors for the ONE substitution used by the",
+    "extension (sieve.js getSubstitution) and the desktop app",
+    "(src/parser/site_pattern_manager.py get_substitution).",
+    "The expected values are the ECMAScript spec's — String.prototype.replace (V8).",
+    "Each `expected` below is the REPLACEMENT STRING (GetSubstitution's output),",
+    "not the whole replaced subject; extension/tests/substitution.test.mjs rebuilds",
+    "the native result from the match span and `expected` before checking the",
+    "implementation, so this file cannot drift away from the spec by hand-editing."
+  ],
+  "substitution": [
+    {"name": "plain capture", "regex": "^img/(\\d+)\\.jpg$", "flags": "i", "url": "img/123.jpg", "template": "https://cdn/$1.jpg", "expected": "https://cdn/123.jpg"},
+    {"name": "capture with trailing literal", "regex": "^img/(\\d+)\\.jpg$", "flags": "i", "url": "img/123.jpg", "template": "$1big", "expected": "123big"},
+    {"name": "two captures swapped", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$2$1", "expected": "21"},
+    {"name": "two-digit reference beyond the count falls back to one digit", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$12", "expected": "12"},
+    {"name": "long digit run after a valid group is literal text", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$11200x1200", "expected": "11200x1200"},
+    {"name": "two-digit valid reference", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$10", "expected": "10"},
+    {"name": "out-of-range two-digit reference stays literal", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$99", "expected": "$99"},
+    {"name": "$0 is not a group", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$0", "expected": "$0"},
+    {"name": "$$ is a literal dollar", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$$1", "expected": "$1"},
+    {"name": "$& is the whole match", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "$&", "expected": "12"},
+    {"name": "$& inside text", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "a$&b", "expected": "a12b"},
+    {"name": "backslash is literal, the reference still resolves", "regex": "^(\\d)(\\d)$", "flags": "", "url": "12", "template": "\\$1", "expected": "\\1"},
+    {"name": "reference into a group-less regex", "regex": "^x$", "flags": "", "url": "x", "template": "$1", "expected": "$1"},
+    {"name": "same capture twice", "regex": "^(a)$", "flags": "", "url": "a", "template": "$1$1", "expected": "aa"},
+    {"name": "reference into a group-less regex with trailing text", "regex": "^a$", "flags": "", "url": "a", "template": "$1x", "expected": "$1x"},
+    {"name": "trailing dollar", "regex": "^a$", "flags": "", "url": "a", "template": "$", "expected": "$"},
+    {"name": "dollar and a non-digit", "regex": "^a$", "flags": "", "url": "a", "template": "$x", "expected": "$x"},
+    {"name": "braced reference is not supported", "regex": "^a$", "flags": "", "url": "a", "template": "${1}", "expected": "${1}"},
+    {"name": "leading zero is a valid number", "regex": "^(a)$", "flags": "", "url": "a", "template": "$01", "expected": "a"},
+    {"name": "leading zero without that group stays literal", "regex": "^a$", "flags": "", "url": "a", "template": "$01", "expected": "$01"},
+    {"name": "empty match", "regex": "", "flags": "", "url": "abc", "template": "[$&]", "expected": "[]"},
+    {"name": "text before the match", "regex": "b", "flags": "", "url": "abc", "template": "$`", "expected": "a"},
+    {"name": "text after the match", "regex": "b", "flags": "", "url": "abc", "template": "X$'", "expected": "Xc"},
+    {"name": "thumbnail host to full-size host", "regex": "^(https://[^/]+)/thumb/(.+)$", "flags": "i", "url": "https://cdn.example/thumb/a.jpg", "template": "$1/full/$2", "expected": "https://cdn.example/full/a.jpg"},
+    {"name": "one group, long digit run", "regex": "^(\\d+)$", "flags": "", "url": "12345", "template": "$12", "expected": "123452"},
+    {"name": "third digit after a two-digit fallback is literal", "regex": "^(\\d)$", "flags": "", "url": "7", "template": "$123", "expected": "723"},
+    {"name": "repeated valid reference", "regex": "^(\\d)$", "flags": "", "url": "7", "template": "$1$1$1", "expected": "777"},
+    {"name": "protocol relative template is untouched by substitution", "regex": "^thumb/(\\d+)$", "flags": "", "url": "thumb/9", "template": "//cdn/$1.jpg", "expected": "//cdn/9.jpg"}
+  ],
+  "expansion": [
+    {"name": "one #ext# block", "template": "/v/12.#jpg png#", "match": ["/v/12.jpg", "12"], "expected": ["/v/12.jpg", "/v/12.png"]},
+    {"name": "two blocks multiply", "template": "/#a b#/x#1 2#", "match": ["m"], "expected": ["/a/x1", "/a/x2", "/b/x1", "/b/x2"]},
+    {"name": "multi-line template", "template": "/big/12.jpg\n/small/12.jpg", "match": ["m"], "expected": ["/big/12.jpg", "/small/12.jpg"]},
+    {"name": "out-of-range reference stays literal", "template": "/x/$99.jpg", "match": ["m"], "expected": ["/x/$99.jpg"]},
+    {"name": "spec fallback then expansion", "template": "/$11200x1200.#jpg png#", "match": ["m", "G"], "expected": ["/G1200x1200.jpg", "/G1200x1200.png"]}
+  ]
+}

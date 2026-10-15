@@ -168,6 +168,25 @@ scanBtn.addEventListener("click", async () => {
 
 // --- Scan/download progress via storage (survives popup close) ---
 
+// D-02: the background reports the END of a scan on a second channel as well.
+// The popup renders from storage, so when the final storage write could not
+// land (quota, a broken storage area) "Scanning..." stayed on screen forever —
+// and a scan that ended in an error had no way to say so.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (!request || request.action !== "scanFinished") return false;
+  if (request.ok === false) {
+    showError(`Scan failed: ${request.error || "unknown error"}`);
+    scanBtn.disabled = false;
+    scanBtn.textContent = "Scan This Page";
+  } else if (!mediaItems.length) {
+    // Nothing was rendered (no result arrived) — make the button usable again.
+    scanBtn.disabled = false;
+    scanBtn.textContent = "Scan This Page";
+  }
+  sendResponse({ ok: true });
+  return false;
+});
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.scanProgress) {
@@ -365,7 +384,14 @@ function renderMediaList() {
   emptyDiv.classList.add("hidden");
   resultsDiv.classList.remove("hidden");
 
-  filtered.forEach((item) => {
+  // F-07: rendering 1000+ rows froze the popup (every row builds a preview
+  // <img> that the browser then tries to load). Show the first 300 and say how
+  // many are left, so the list is usable instead of merely complete — the
+  // filters and "select all" still cover what is on screen.
+  const RENDER_LIMIT = 300;
+  const shown = filtered.slice(0, RENDER_LIMIT);
+
+  shown.forEach((item) => {
     const globalIndex = mediaItems.indexOf(item);
     const div = document.createElement("div");
     div.className = "media-item";
@@ -397,6 +423,9 @@ function renderMediaList() {
     // Lazy-load thumbnail for images
     if (item.type === "image" && item.url) {
       const img = new Image();
+      // F-07: only the rows near the viewport are fetched at all.
+      img.loading = "lazy";
+      img.decoding = "async";
       img.src = item.url;
       img.className = "thumb-img";
       img.alt = "";
@@ -457,6 +486,14 @@ function renderMediaList() {
     div.appendChild(info);
     mediaList.appendChild(div);
   });
+
+  if (filtered.length > RENDER_LIMIT) {
+    const more = document.createElement("div");
+    more.className = "media-more";
+    more.textContent = `\u2026 and ${filtered.length - RENDER_LIMIT} more`
+      + " \u2014 narrow the domain or source filter to reach them";
+    mediaList.appendChild(more);
+  }
 }
 
 function getVisibleCheckboxes() {
@@ -515,7 +552,9 @@ chromeDownloadBtn.addEventListener("click", async () => {
     mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
       const item = mediaItems[parseInt(cb.dataset.index)];
       if (item) {
-        const baseName = item.url.split("/").pop().split("?")[0] || "";
+        // D-07: a name Chrome accepts — a path separator or a device name
+        // ("..%2F..%2Fx.png", "CON.png") makes it refuse the whole download.
+        const baseName = sanitizeFilename(item.url.split("/").pop().split("?")[0]);
         selected.push({
           url: item.url,
           referer: item.pageUrl || "",

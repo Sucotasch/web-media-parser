@@ -7,7 +7,9 @@ import sys
 # Add the parent directory to the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.parser.site_pattern_manager import SitePatternManager
+import re
+
+from src.parser.site_pattern_manager import SitePatternManager, get_substitution
 
 
 def test_site_pattern_manager_loading():
@@ -70,20 +72,29 @@ def test_url_transformation():
             f"Expected {expected_result}, got {transformed_url}"
 
 
-def test_sanitize_imagus_target_js_semantics():
-    r"""PAT-3/PAT-5: $& → \g<0>; $nn clamped by group count (JS semantics)."""
-    pm = SitePatternManager(enable_built_in=False)
-    # PAT-3: $& (whole match) must convert, not stay literal
-    t = pm._sanitize_imagus_target('#$1_fullsize\n$1\n$&')
-    assert '\\g<1>_fullsize' in t
-    assert '\\g<0>' in t
-    assert '$&' not in t and '$1' not in t
-    # PAT-5: Deezer '$11200x1200...' with 2 groups → group(1) + literal rest
-    assert pm._sanitize_imagus_target('$11200x1200-000000-95-0-0.jpg', 2) == '\\g<1>1200x1200-000000-95-0-0.jpg'
-    assert pm._sanitize_imagus_target('$2', 2) == '\\g<2>'
-    assert pm._sanitize_imagus_target('$10', 2) == '\\g<1>0'
-    # Escaped $1 stays literal
-    assert pm._sanitize_imagus_target(r'\$1', 2) == r'\$1'
+def test_substitution_follows_the_ecmascript_spec():
+    r"""PAT-3/PAT-5 → A-10/A-12/NF-2/NF-7: the JS replacement semantics.
+
+    The private `\g<n>`-rewriting helper that these assertions used to pin is
+    gone: `get_substitution` is the ECMAScript GetSubstitution shared with the
+    extension (extension/sieve.js), and the vectors in
+    extension/tests/vectors/substitution.json cover it exhaustively — every
+    expected value there is re-derived from V8's own String.replace.
+    """
+    # $& is the whole match (PAT-3), captures are positional
+    m = re.search(r'#(\d+)_', '#42_x')
+    assert get_substitution('$1_fullsize$&', m) == '42_fullsize#42_'
+    # PAT-5 / NF-7: Deezer '$11200x1200…' with 2 groups → group(1) + literal
+    two = re.search(r'^(\d)(\d)$', '12')
+    assert get_substitution('$11200x1200-000000-95-0-0.jpg', two) \
+        == '11200x1200-000000-95-0-0.jpg'
+    assert get_substitution('$2', two) == '2'
+    assert get_substitution('$10', two) == '10'
+    # Out-of-range stays literal — $0 included (it used to be the whole match)
+    assert get_substitution('$0', two) == '$0'
+    assert get_substitution('$99', two) == '$99'
+    # A backslash is literal in a replacement template; the reference resolves
+    assert get_substitution(r'\$1', two) == r'\1'
 
 
 def test_native_dollar_target_sanitized():

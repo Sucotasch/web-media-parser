@@ -162,6 +162,40 @@ check("parseSrcset: data: candidate skipped", parseSrcset("data:image/png;base64
 check("parseSrcset: all-data set is empty", parseSrcset("data:image/png;base64,iVBOR 1x"), null);
 check("parseSrcset: data URI with commas stays one candidate", parseSrcset(`${DATA_URI} 1x, real.jpg 600w`), "real.jpg");
 
+// --- D-03: navigation links are capped, media links are not ---------------
+
+{
+  // 1000 navigation anchors (tag lists, pagination, archives) must not push a
+  // real thumbnail link out of the discovery list. Cap = the desktop app's
+  // DEFAULT_MAX_LINKS_PER_PAGE (200).
+  const nav = [];
+  for (let i = 0; i < 1000; i++) nav.push(anchor(`http://127.0.0.1:9811/tag/page/${i}`));
+  const thumbAnchor = {
+    getAttribute: (name) => (name === "style" ? null : "http://127.0.0.1:9811/gallery/999"),
+    querySelector: (sel) => (sel === "img, picture, video, canvas" ? { tagName: "IMG" } : null),
+  };
+  const out = scanPageMedia(fakeDoc([], nav.concat([thumbAnchor])), BASE);
+  check("D-03: navigation links are capped at 200", out.links.length, 201);
+  check(
+    "D-03: the media-bearing link from the END of the list survives — and leads",
+    out.links[0],
+    "http://127.0.0.1:9811/gallery/999"
+  );
+}
+
+{
+  // Control: media anchors are never capped, however many there are.
+  const thumbs = [];
+  for (let i = 0; i < 300; i++) {
+    thumbs.push({
+      getAttribute: (name) => (name === "style" ? null : `http://127.0.0.1:9811/g/${i}`),
+      querySelector: (sel) => (sel === "img, picture, video, canvas" ? { tagName: "IMG" } : null),
+    });
+  }
+  const out = scanPageMedia(fakeDoc([], thumbs), BASE);
+  check("D-03 control: 300 media links are all kept", out.links.length, 300);
+}
+
 if (failures > 0) {
   console.error(`${failures} failure(s)`);
   process.exit(1);

@@ -81,7 +81,13 @@ async function runSieveUpdate(force = false) {
   if (!force && !updater.shouldProbeLastUpdate(stored.sieveUpdateAttempt)) {
     return { status: "skipped", message: "Sieve check already performed recently" };
   }
-  const result = await updater.updateSieve(stored.sieveRepository, { version: SIEVE_VERSION });
+  // D-01: the update can sit through two URLs × three retries with exponential
+  // backoff — hand it the session keepalive so MV3 does not terminate the
+  // worker in the middle of it (the third keepalive path the audit measured).
+  const result = await updater.updateSieve(stored.sieveRepository, {
+    version: SIEVE_VERSION,
+    keepalive: { acquire: keepaliveAcquire, release: keepaliveRelease },
+  });
   console.info("Sieve update:", result.status, "—", result.message);
   if (result.status === "updated") {
     // New rules in storage — refresh the in-memory regex cache.
@@ -195,26 +201,18 @@ class Semaphore {
   }
 }
 
-// Apply string url transform: replace $1, $2 with regex match groups
+// Apply string url transform: replace $1, $2 with regex match groups.
+//
+// A-10/A-12/NF-2: this used to be a third substitution dialect (descending
+// split/join, its own `$&` handling, no `$$`/`$nn` rules). It now delegates to
+// the ONE spec implementation in sieve.js, shared with the desktop app
+// (`site_pattern_manager.get_substitution`) and driven by the shared vectors in
+// extension/tests/vectors/substitution.json.
 function applyUrlTransform(template, matchGroups) {
   if (!template || !matchGroups) return null;
   try {
-    let result = template;
-    // Replace $1, $2, etc. with captured groups (literal string replacement).
-    // B-2: substitute in DESCENDING order — ascending order corrupts $10
-    // (its $1 substring is replaced first, leaving "(g1)0"). Mirrors the
-    // desktop twin in site_pattern_manager.apply_link_url_transform.
-    for (let i = matchGroups.length - 1; i >= 1; i--) {
-      const placeholder = `$${i}`;
-      if (result.includes(placeholder) && matchGroups[i] !== undefined) {
-        // Use split/join to avoid regex escaping issues with $
-        result = result.split(placeholder).join(matchGroups[i]);
-      }
-    }
-    // $& means full match
-    if (result.includes("$&")) {
-      result = result.split("$&").join(matchGroups[0] || "");
-    }
+    const input = typeof matchGroups.input === "string" ? matchGroups.input : undefined;
+    const result = getSubstitution(template, matchGroups, input);
     return result || null;
   } catch (e) {
     return null;
@@ -266,6 +264,19 @@ function applyResizeUpgrade(url) {
  */
 function classifyPageImages(count) {
   return count === 1 ? "linked-img" : "page-img";
+}
+
+/**
+ * D-05: strip a WordPress/CDN size suffix (`photo-300x200.jpg` → `photo.jpg`).
+ *
+ * The desktop twin has done this since PAT-3 (site_pattern_manager, the
+ * `-\d{2,4}x\d{2,4}` strip) — the extension had no equivalent, so a gallery of
+ * `-1024x768` variants never produced its original here (measured: null).
+ * Only the FIRST suffix is removed, and only directly before the extension.
+ */
+function stripSizeSuffix(url) {
+  if (typeof url !== "string" || !url) return url;
+  return url.replace(/(-\d{2,4}x\d{2,4})(\.(?:jpe?g|png|webp|avif))(?=$|\?)/i, "$2");
 }
 
 // Discovery step 2: cross-scan cache of probe results. A broken, empty or unavailable
@@ -330,6 +341,7 @@ async function discoverFullsize(links, pageUrl, onProgress) {
       };
       let matchedRuleName = null;
       let matchedGroups = null;
+      const originalLinkUrl = linkUrl;
 
       // Find matching sieve rule for this URL
       for (const [name, { linkRegex, resPattern, urlPattern }] of Object.entries(cachedSieveRes)) {
@@ -345,13 +357,11 @@ async function discoverFullsize(links, pageUrl, onProgress) {
             // C-4: data:-templates (e.g. "data:,$&") are no-fetch markers in
             // Imagus, not URLs — fetching them produced https://data:,... garbage.
             if (transformed && !transformed.startsWith("data:")) {
-              // Preserve protocol if template doesn't include it
-              if (!transformed.startsWith("http") && !transformed.startsWith("//")) {
-                const protocol = linkUrl.startsWith("https") ? "https://" : "http://";
-                linkUrl = protocol + transformed;
-              } else {
-                linkUrl = transformed.replace(/^\/\//, "https://");
-              }
+              // NF-1/A-06: one normalizer for every produced URL. The old inline
+              // version kept the link's protocol for a scheme-less template
+              // (often wrong) and forced https:// on a protocol-relative one —
+              // hardcoding https broke http pages.
+              linkUrl = normalizeVariant(transformed, originalLinkUrl);
               // If POST data specified, switch to POST
               if (urlPattern.postData) {
                 fetchOptions.method = "POST";
@@ -550,13 +560,36 @@ async function discoverFullsize(links, pageUrl, onProgress) {
 // same approach as Imagus Mod MD's session keepalive (periodInMinutes 0.5).
 let _keepaliveRefs = 0;
 const KEEPALIVE_ALARM = "wmp-session-keepalive";
+/**
+ * A-13 / NF-9: acquire the keepalive WITHOUT throwing.
+ *
+ * `chrome.alarms.create` returns a Promise on Chrome 111+ and `undefined`
+ * before that, so the old `.catch(...)` on its result threw
+ * ("Cannot read properties of undefined (reading 'catch')") — and because the
+ * refcount was incremented BEFORE the call, the failure left it inflated at 1
+ * forever: the alarm could never be cleared again.
+ * The count is bumped only after the alarm request actually went through.
+ * @returns {boolean} true when this call holds a new reference
+ */
 function keepaliveAcquire() {
+  try {
+    const created = chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+    if (created && typeof created.catch === "function") created.catch(() => {});
+  } catch (e) {
+    console.warn("keepalive: could not arm the session alarm:", e);
+    return false;
+  }
   _keepaliveRefs++;
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
+  return true;
 }
 function keepaliveRelease() {
   _keepaliveRefs = Math.max(0, _keepaliveRefs - 1);
-  if (_keepaliveRefs === 0) chrome.alarms.clear(KEEPALIVE_ALARM).catch(() => {});
+  if (_keepaliveRefs === 0) {
+    try {
+      const cleared = chrome.alarms.clear(KEEPALIVE_ALARM);
+      if (cleared && typeof cleared.catch === "function") cleared.catch(() => {});
+    } catch (e) {}
+  }
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (!alarm || alarm.name !== KEEPALIVE_ALARM) return;
@@ -650,7 +683,22 @@ async function upgradeMediaList(media, pageUrl) {
     const upgraded = applyResizeUpgrade(item.url);
     if (upgraded) {
       out.push(Object.assign({}, item, {
-        original_url: item.url, url: upgraded, transformed: true, source: "sieve-to",
+        original_url: item.url,
+        url: normalizeVariant(upgraded, pageUrl || item.pageUrl || ""),
+        transformed: true, source: "sieve-to",
+      }));
+      continue;
+    }
+
+    // D-05: WordPress/CDN size suffix on the URL itself (`photo-300x200.jpg`)
+    // — the sieve's own rule for it is a JS rule that cannot run here, and the
+    // desktop twin does the same strip (site_pattern_manager step 4).
+    const suffixStripped = stripSizeSuffix(item.url);
+    if (suffixStripped !== item.url) {
+      out.push(Object.assign({}, item, {
+        original_url: item.url,
+        url: normalizeVariant(suffixStripped, pageUrl || item.pageUrl || ""),
+        transformed: true, source: "sieve-to",
       }));
     } else {
       out.push(item);
@@ -660,6 +708,13 @@ async function upgradeMediaList(media, pageUrl) {
 }
 
 async function handleStartScan(tabId) {
+  // A-14: a keyboard command (or a second popup) may already be scanning.
+  // Starting a second pipeline doubled the discovery and let the loser
+  // overwrite scanProgress/scanResult. Answer the caller instead.
+  if (_scanBusy) {
+    return { ok: false, busy: true, error: "A scan is already running" };
+  }
+  _scanBusy = true;
   // tabId is stored in EVERY progress state so stale entries can be matched
   // and cleared per-tab (tabs.onUpdated navigation clear, restoreScanState
   // staleness check). Without it a crashed/abandoned scan left
@@ -724,7 +779,14 @@ async function handleStartScan(tabId) {
         scanResult: result,
         scanProgress: { status: "done", phase: "done", scanned: 1, total: 1, found: media.length, tabId },
       });
-    } catch (e) {}
+    } catch (e) {
+      // D-02: the popup paints from storage, so a failed FINAL write would
+      // leave "Scanning..." on screen forever (the intermediate writes above
+      // all fail the same way, silently). Fall back to the second channel.
+      broadcastScanFinished({ ok: false, error: `Could not store the scan result: ${e.message}` });
+      return { ok: false, error: `Could not store the scan result: ${e.message}` };
+    }
+    broadcastScanFinished({ ok: true, count: media.length });
     return { ok: true, count: media.length };
   } catch (e) {
     console.error("handleStartScan failed:", e);
@@ -732,9 +794,13 @@ async function handleStartScan(tabId) {
       await chrome.storage.local.set({
         scanProgress: { status: "error", phase: "error", error: e.message, tabId },
       });
-    } catch (e2) {}
+    } catch (e2) {
+      // D-02: the error state could not be persisted either — say it out loud.
+      broadcastScanFinished({ ok: false, error: e.message });
+    }
     return { ok: false, error: e.message };
   } finally {
+    _scanBusy = false;
     keepaliveRelease();
   }
 }
@@ -804,6 +870,18 @@ async function resolveUrl(url, referer) {
 }
 
 async function chromeDownload(items, concurrentLimit = 2) {
+  // A-14: a second batch (double-clicked Save, or a command during a batch)
+  // used to interleave its own progress writes with the running one.
+  if (_batches.running) return { saved: 0, busy: true };
+  _batches.running = true;
+  try {
+    return await chromeDownloadBatch(items, concurrentLimit);
+  } finally {
+    _batches.running = false;
+  }
+}
+
+async function chromeDownloadBatch(items, concurrentLimit) {
   return new Promise((resolve) => {
     let saved = 0;
     let started = 0;
@@ -981,7 +1059,45 @@ async function getStatus() {
 
 // --- Keyboard commands ---
 
-let commandBusy = false;
+// A-14: ONE media pipeline at a time. The keyboard command, the popup's scan
+// request and "Scan again" all enter the same work; without this gate a
+// command during an active scan started a SECOND full scan — two discovery
+// passes over the same links, doubled network load, and whichever finished last
+// overwrote scanProgress/scanResult (the popup then showed the loser's media).
+let _scanBusy = false;
+
+// A-14 (download half): a second batch must not start while one is running.
+// A holder object rather than a bare `let` so the extracted-function test can
+// inject and observe the same state (extension/tests/chrome_download_headers.test.mjs).
+const _batches = { running: false };
+
+/**
+ * D-09: every message branch must ANSWER.
+ *
+ * A rejected promise used to leave the caller's `sendMessage` waiting forever
+ * (the popup sat on "Scanning..." / "Saving..." with no way out).
+ */
+function replyWith(promise, sendResponse) {
+  Promise.resolve(promise).then(sendResponse).catch((e) => {
+    try {
+      sendResponse({ ok: false, error: String((e && e.message) || e) });
+    } catch (e2) {}
+  });
+}
+
+/**
+ * D-02: the scan's end must not depend on a SINGLE storage write.
+ *
+ * The popup renders from storage.onChanged, so a failed final write left
+ * "Scanning..." on screen forever. This second channel reports the end even
+ * when that write could not land.
+ */
+function broadcastScanFinished(payload) {
+  try {
+    const sent = chrome.runtime.sendMessage({ action: "scanFinished", ...payload });
+    if (sent && typeof sent.catch === "function") sent.catch(() => {});
+  } catch (e) {}
+}
 
 async function setBadge(text, color) {
   try {
@@ -991,8 +1107,12 @@ async function setBadge(text, color) {
 }
 
 async function commandScanAndProcess(action) {
-  if (commandBusy) return;
-  commandBusy = true;
+  if (_scanBusy) return;   // A-14
+  _scanBusy = true;
+  // D-01: the command path does its own long work (discovery + a whole
+  // download batch) and used to be the one path WITHOUT a keepalive — a
+  // command started on an idle service worker could be terminated mid-flight.
+  keepaliveAcquire();
   try {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
@@ -1044,7 +1164,9 @@ async function commandScanAndProcess(action) {
     await setBadge(`${items.length}`, "#4CAF50");
     const toDownload = items.map(item => ({
       url: item.url,
-      filename: item.url.split("/").pop().split("?")[0] || "",
+      // D-07: Chrome rejects the whole download for a name with a path
+      // separator or a Windows device name ("..%2F..%2Fx.png", "CON.png").
+      filename: sanitizeFilename(item.url.split("/").pop().split("?")[0]),
       referer: response.url || "",
       // ERR-5: link-direct items were already fetched (image/video) during
       // discovery — skip the resolve round-trip so downloads start instantly.
@@ -1054,7 +1176,8 @@ async function commandScanAndProcess(action) {
     setTimeout(() => setBadge(""), 5000);
   }
   } finally {
-    commandBusy = false;
+    keepaliveRelease();
+    _scanBusy = false;
   }
 }
 
@@ -1068,16 +1191,18 @@ chrome.commands?.onCommand?.addListener((command) => {
 
 // Listen for messages from popup and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // D-09: every branch goes through replyWith — a rejected promise must still
+  // answer the caller (the popup used to hang on "Scanning..." forever).
   if (request.action === "download") {
-    sendToDesktop(request.urls, request.one_shot, request.context || {}).then(sendResponse);
+    replyWith(sendToDesktop(request.urls, request.one_shot, request.context || {}), sendResponse);
     return true;
   }
   if (request.action === "discoverFullsize") {
-    discoverFullsize(request.links, request.pageUrl).then(sendResponse);
+    replyWith(discoverFullsize(request.links, request.pageUrl), sendResponse);
     return true;
   }
   if (request.action === "startScan") {
-    handleStartScan(request.tabId).then(sendResponse);
+    replyWith(handleStartScan(request.tabId), sendResponse);
     return true;
   }
   if (request.action === "resetScan") {
@@ -1088,11 +1213,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === "chromeDownload") {
     const limit = request.concurrentLimit || 2;
-    chromeDownload(request.items, limit).then(sendResponse);
+    replyWith(chromeDownload(request.items, limit), sendResponse);
     return true;
   }
   if (request.action === "getContext") {
-    getPageContext(request.tabId).then(sendResponse);
+    replyWith(getPageContext(request.tabId), sendResponse);
     return true;
   }
   if (request.action === "clearBadgeAfter") {
@@ -1102,12 +1227,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
   if (request.action === "getStatus") {
-    getStatus().then(sendResponse);
+    replyWith(getStatus(), sendResponse);
     return true;
   }
   if (request.action === "updateSieve") {
     // The popup's button is an explicit user action — bypass the R-E-12 throttle.
-    runSieveUpdate(true).then((r) => sendResponse(r || { status: "error", message: "updater unavailable" }));
+    replyWith(runSieveUpdate(true).then((r) => r || { status: "error", message: "updater unavailable" }),
+      sendResponse);
     return true;
   }
 });

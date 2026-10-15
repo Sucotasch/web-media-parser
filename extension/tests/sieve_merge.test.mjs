@@ -52,9 +52,9 @@ function check(name, actual, expected) {
 
 check("exported api is complete",
   Object.keys(updater).sort(),
-  ["COLD_START_MIN_INTERVAL_MS", "SIEVE_REPO_URL", "SIEVE_UPDATE_ALARM", "ensureWeeklyAlarm",
-   "jsDelivrMirror", "mergeSieve", "parseStoredSieve", "shouldProbeLastUpdate", "updateSieve",
-   "validRuleCount"].sort());
+  ["COLD_START_MIN_INTERVAL_MS", "MAX_SIEVE_BYTES", "SIEVE_REPO_URL", "SIEVE_UPDATE_ALARM",
+   "ensureWeeklyAlarm", "jsDelivrMirror", "mergeSieve", "parseStoredSieve",
+   "shouldProbeLastUpdate", "updateSieve", "validRuleCount"].sort());
 
 // jsDelivrMirror
 check(
@@ -229,6 +229,79 @@ const priorRules = JSON.stringify({
   });
   check("failure reported", result.status, "error");
   check("failure keeps the stored rules", storage.data.sieveRules, priorRules);
+}
+
+// --- D-06: the response size is bounded BEFORE it is parsed ----------------
+
+{
+  // A body without Content-Length that is over the cap must be refused rather
+  // than JSON.parse'd (measured before the fix: a 20 MiB body was accepted).
+  const huge = "x".repeat(updater.MAX_SIEVE_BYTES + 1);
+  const storage = makeStorage({ sieveRules: priorRules });
+  const up = loadUpdater({ fetchImpl: makeFetch({ status: 200, body: huge }) });
+  const result = await up.updateSieve(undefined, { version: "v", storage: storage.api });
+  check("D-06: an oversized body is refused", /too large/.test(result.message), true);
+  check("D-06: the oversized body changed nothing", storage.data.sieveRules, priorRules);
+}
+{
+  // …and a declared Content-Length over the cap is refused without a body read.
+  let bodyRead = 0;
+  const fetchImpl = async () => ({
+    status: 200,
+    ok: true,
+    headers: { get: (h) => (h.toLowerCase() === "content-length"
+      ? String(updater.MAX_SIEVE_BYTES + 1) : null) },
+    async text() { bodyRead++; return "{}"; },
+  });
+  const storage = makeStorage({ sieveRules: priorRules });
+  const up = loadUpdater({ fetchImpl });
+  const result = await up.updateSieve(undefined, { version: "v", storage: storage.api });
+  check("D-06: a declared oversized body is refused", /too large/.test(result.message), true);
+  check("D-06: …without reading the body", bodyRead, 0);
+}
+{
+  // A normal-sized body still goes through (control).
+  const storage = makeStorage({ sieveRules: priorRules });
+  const up = loadUpdater({ fetchImpl: makeFetch({ status: 200, body: JSON.stringify(BUNDLE) }) });
+  const result = await up.updateSieve(undefined, { version: "v", storage: storage.api });
+  check("D-06 control: a normal sieve still updates", result.status, "updated");
+}
+
+// --- D-01: the caller's keepalive wraps the whole update ------------------
+
+{
+  const events = [];
+  const storage = makeStorage({ sieveRules: priorRules });
+  const up = loadUpdater({ fetchImpl: makeFetch({ status: 200, body: JSON.stringify(BUNDLE) }) });
+  const result = await up.updateSieve(undefined, {
+    version: "v", storage: storage.api,
+    keepalive: {
+      acquire: () => { events.push("acquire"); },
+      release: () => { events.push("release"); },
+    },
+  });
+  check("D-01: the update holds the keepalive for its whole run",
+    [result.status, events], ["updated", ["acquire", "release"]]);
+}
+{
+  const events = [];
+  const storage = makeStorage({ sieveRules: priorRules });
+  const failing = async () => { throw new Error("network down"); };
+  const up = loadUpdater({ fetchImpl: failing });
+  await up.updateSieve(undefined, {
+    version: "v", storage: storage.api,
+    keepalive: {
+      acquire: () => { events.push("acquire"); },
+      release: () => { events.push("release"); },
+    },
+  });
+  check("D-01: the keepalive is released on failure too", events, ["acquire", "release"]);
+}
+{
+  const storage = makeStorage({ sieveRules: priorRules });
+  const up = loadUpdater({ fetchImpl: makeFetch({ status: 304 }) });
+  const result = await up.updateSieve(undefined, { version: "v", storage: storage.api });
+  check("D-01 control: no keepalive injected is fine", result.status, "up-to-date");
 }
 
 if (failures > 0) {

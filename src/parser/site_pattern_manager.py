@@ -17,6 +17,149 @@ from .utils import get_domain
 
 logger = logging.getLogger(__name__)
 
+# Digits are matched explicitly, not with str.isdigit(): Python counts '\u0663'
+# as a digit (and int() accepts it) while ECMAScript does not.
+_DIGITS = "0123456789"
+
+
+def get_substitution(template: str, match: "re.Match") -> str:
+    r"""ECMAScript GetSubstitution — the spec behind `String.prototype.replace`.
+
+    Mirror of `extension/sieve.js`'s `getSubstitution`: the sieve's `to` / `url`
+    templates are JS replacement strings, and the two implementations used to
+    disagree (A-10/A-12/NF-2/NF-7): the extension never substituted `$&`, read
+    `$11200x1200` greedily and erased the whole reference, while Python clamped
+    it to `\g<1>` + the remaining digits but turned `$0` into the whole match.
+
+    - `$$` → a literal `$`
+    - `$&` → the whole match
+    - `` $` `` / `$'` → the text before / after the match
+    - `$n` / `$nn` → capture n; beyond the capture count a TWO-digit reference
+      falls back to its first digit plus the second as literal text
+      (`$11200` with 2 groups = group 1 then `1200`); anything else out of
+      range stays literal (`$99`, `$0`)
+
+    The vectors in `extension/tests/vectors/substitution.json` are run against
+    both this function and the JS one, with every expected value re-derived
+    from V8's own `replace`.
+    """
+    if not isinstance(template, str):
+        return ""
+    # `len(match.groups())` rather than `match.re.groups`: the same object
+    # protocol works for the cross-check's synthetic match (see
+    # tests/test_sieve_cross_impl.py) and for a real re.Match.
+    capture_count = len(match.groups())
+    whole = match.group(0) or ""
+    source = match.string or ""
+    at = match.start()
+
+    out = []
+    i = 0
+    n = len(template)
+    while i < n:
+        ch = template[i]
+        if ch != "$":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = template[i + 1] if i + 1 < n else None
+        if nxt is None:
+            out.append("$")
+            i += 1
+            continue
+        if nxt == "$":
+            out.append("$")
+            i += 2
+            continue
+        if nxt == "&":
+            out.append(whole)
+            i += 2
+            continue
+        if nxt == "`":
+            out.append(source[:at])
+            i += 2
+            continue
+        if nxt == "'":
+            out.append(source[at + len(whole):])
+            i += 2
+            continue
+        if nxt in _DIGITS:
+            digits = nxt
+            if i + 2 < n and template[i + 2] in _DIGITS:
+                digits += template[i + 2]
+            num = int(digits)
+            first = int(digits[0])
+            if 1 <= num <= capture_count:
+                out.append(match.group(num) or "")
+            elif len(digits) == 2 and 1 <= first <= capture_count:
+                # Spec fallback: the first digit still names a real group.
+                out.append((match.group(first) or "") + digits[1])
+            else:
+                out.append("$" + digits)
+            i += 1 + len(digits)
+            continue
+        out.append("$")
+        i += 1
+    return "".join(out)
+
+
+def normalize_variant(variant: str, page_url: str = "") -> str:
+    """NF-1: make a produced variant an absolute URL (extension parity).
+
+    A protocol-relative variant takes the PAGE's scheme (hardcoding https broke
+    http pages and produced `https:////host/path` on some paths — A-06), a
+    scheme-less one is resolved against the page, and anything already carrying
+    a scheme (`http:`, `data:`, `blob:` …) is left untouched.
+    """
+    if not isinstance(variant, str):
+        return ""
+    v = variant.strip()
+    if not v:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*:", v, re.I):
+        return v
+    if not page_url:
+        return v
+    try:
+        return urljoin(page_url, v)
+    except Exception:
+        return v
+
+
+def expand_variants(text: str) -> List[str]:
+    """Imagus `#ext1 ext2#` + newline expansion (twin of sieve.js).
+
+    Resolves every `#…#` block and every template line, recursively, so
+    `/#ext1 ext2#/#jpg png#/` yields four variants and a multi-line `to` yields
+    one per line (A-11).
+    """
+    if not text:
+        return []
+
+    out: List[str] = []
+
+    def expand(line: str) -> None:
+        match = re.search(r'#([^#]+)#', line)
+        if not match:
+            out.append(line)
+            return
+        prefix = line[:match.start()]
+        suffix = line[match.end():]
+        for opt in match.group(1).split():
+            expand(f"{prefix}{opt}{suffix}")
+
+    for raw_line in str(text).split('\n'):
+        line = raw_line.strip()
+        if line:
+            expand(line)
+    return out
+
+
+def apply_substitution_variants(template: str, match: "re.Match") -> List[str]:
+    """Twin of the extension's `applySubstitutionAll`: spec substitution, then
+    `#ext#`/newline expansion. The shared vectors drive both."""
+    return expand_variants(get_substitution(template, match))
+
 
 class SitePatternManager:
     """
@@ -327,12 +470,12 @@ class SitePatternManager:
                         continue  # Can't convert — skip entirely
                 
                 elif isinstance(to_rule, str) and to_rule:
-                    # Simple regex rule — existing logic. PAT-5: pass the img
-                    # regex's group count so $nn references are clamped to the
-                    # groups that actually exist (JS String.replace semantics).
-                    rule_data['to_python'] = self._sanitize_imagus_target(
-                        to_rule, self._regex_group_count(rule_data.get('img', ''))
-                    )
+                    # Simple regex rule. A-10/A-12/NF-2/NF-7: the template is
+                    # kept RAW and substituted at transform time by
+                    # get_substitution (ECMAScript GetSubstitution). It used to
+                    # be pre-translated to \g<n> with a private clamping rule,
+                    # which was a third dialect next to the two JS ones.
+                    rule_data['to_template'] = to_rule
                 
                 # Indexing by domain from 'link' property
                 link_regex = rule_data.get('link', '')
@@ -372,31 +515,6 @@ class SitePatternManager:
             return re.compile(pattern).groups
         except re.error:
             return 0
-
-    def _sanitize_imagus_target(self, target: Any, group_count: int = 0) -> Any:
-        r"""Convert Imagus $1, $2, $& to Python \g<1>, \g<2>, \g<0> syntax.
-
-        Follows JS String.replace semantics: $& is the whole match, and a $nn
-        reference whose number exceeds the regex's group count is split into
-        $n + the remaining digits as literal text (e.g. '$11200x1200' with 2
-        groups becomes group(1) + '1200x1200' — the Deezer rule).
-        """
-        if not isinstance(target, str): return target
-        target = re.sub(r'(?<!\\)\$&', r'\\g<0>', target)
-
-        def _repl(m):
-            digits = m.group(1)
-            n = int(digits)
-            if group_count and n > group_count:
-                # Clamp to the highest valid group, keep extra digits literal.
-                for cut in range(len(digits) - 1, 0, -1):
-                    head = int(digits[:cut])
-                    if head <= group_count:
-                        return f'\\g<{head}>' + digits[cut:]
-                return m.group(0)
-            return f'\\g<{n}>'
-
-        return re.sub(r'(?<!\\)\$(\d+)', _repl, target)
 
     # --- JS rule conversion ---
 
@@ -656,35 +774,11 @@ def _transform(m):
             return match.group(1).replace(r'\.', '.').lower()
         return None
 
-    def _expand_variants(self, text: str) -> List[str]:
-        """Expand Imagus syntax like 'image.#jpg png#' into multiple strings.
+    # A-11: the implementation moved to module level (`expand_variants`) so the
+    # shared vectors and this class use one function; the method stays as the
+    # internal name the transform pipeline calls.
+    _expand_variants = staticmethod(expand_variants)
 
-        Recursively handles multiple #...# blocks to generate all combinations,
-        e.g. '/#ext1 ext2#/#jpg png#/' → 4 variants.
-        """
-        if not text: return []
-
-        lines = text.split('\n')
-        all_variants = []
-
-        def expand_line(line: str) -> List[str]:
-            match = re.search(r'#([^#]+)#', line)
-            if not match:
-                return [line]
-            prefix = line[:match.start()]
-            options = match.group(1).split()
-            suffix = line[match.end():]
-            res = []
-            for opt in options:
-                res.extend(expand_line(f"{prefix}{opt}{suffix}"))
-            return res
-
-        for line in lines:
-            line = line.strip()
-            if line:
-                all_variants.extend(expand_line(line))
-
-        return all_variants
     
     def get_patterns_for_url(self, url: str) -> List[Tuple[str, Dict[str, Any]]]:
         """
@@ -742,11 +836,18 @@ def _transform(m):
         """
         if not source or target is None:
             return url, False
-        target = self._sanitize_imagus_target(target, self._regex_group_count(source))
         try:
-            new_url = re.sub(source, target, url, flags=re.IGNORECASE)
-        except (re.error, IndexError):
+            compiled = re.compile(source, re.IGNORECASE)
+        except re.error:
             logger.debug(f"Bad replace pattern source: {source}")
+            return url, False
+        try:
+            # A-10/A-12: one substitution implementation for the whole project
+            # (JS GetSubstitution via get_substitution). The old \g<n> rewrite
+            # was a third dialect, and `$0` silently became the whole match.
+            new_url = compiled.sub(lambda m: get_substitution(target, m), url)
+        except (IndexError, re.error) as e:
+            logger.debug(f"Bad replace pattern source: {source} ({e})")
             return url, False
         return (new_url, True) if new_url != url else (url, False)
     
@@ -887,27 +988,20 @@ def _transform(m):
                 for v_url in url_variations:
                     match = re.search(img_regex, v_url, re.I)
                     if match:
+                        # NF-1/A-06: every produced variant leaves this loop
+                        # through normalize_variant, so a protocol-relative or
+                        # root-relative result becomes a real URL against the
+                        # page instead of `https:////host/path` (or, on the
+                        # extension side, `file://`).
+                        raw_variants = []
+
                         # Check for JS-converted callable first
                         to_callable = rule.get('to_callable')
                         if to_callable:
                             try:
                                 substituted = to_callable(match)
                                 if substituted and substituted != v_url:
-                                    # Handle newline-separated variants
-                                    for variant in substituted.split('\n'):
-                                        variant = variant.strip()
-                                        if variant and '://' not in variant:
-                                            # A-06: a protocol-relative template
-                                            # startswith '//' and '://' is not in it,
-                                            # so the old code produced
-                                            # https:////host/path.
-                                            if variant.startswith('//'):
-                                                variant = 'https:' + variant
-                                            else:
-                                                scheme = results[0].split('://', 1)[0]
-                                                variant = f"{scheme}://{variant}"
-                                        if variant and variant != v_url:
-                                            sieve_results.append(variant)
+                                    raw_variants = self._expand_variants(substituted)
                                     transformed = True
                                 break
                             except Exception as e:
@@ -924,50 +1018,39 @@ def _transform(m):
                                 groups += [match.group(i) for i in range(1, match.re.groups + 1)]
                                 js_result = self.js_engine.run_js(to_js, groups, source_url)
                                 if js_result:
-                                    variants = self._expand_variants(js_result)
-                                    for variant in variants:
-                                        variant = variant.strip()
-                                        if not variant:
-                                            continue
-                                        if variant.startswith('//'):
-                                            variant = 'https:' + variant
-                                        elif variant and '://' not in variant:
-                                            scheme = results[0].split('://', 1)[0]
-                                            variant = f"{scheme}://{variant}"
-                                        if variant and variant != v_url:
-                                            sieve_results.append(variant)
+                                    raw_variants = self._expand_variants(js_result)
                                     transformed = True
                                 break
                             except Exception as e:
                                 logger.debug(f"Imagus JS (Deno) failed: {e}")
                                 break
 
-                        # Fallback: regex substitution
-                        to_pattern = rule.get('to_python', '')
-                        if not to_pattern: continue
-                        
-                        # Apply substitution on the variation that matched
-                        try:
-                            substituted = re.sub(img_regex, lambda m, pat=to_pattern: m.expand(pat), v_url, flags=re.IGNORECASE)
-                        except Exception as e:
-                            logger.debug(f"re.sub failed with pattern {to_pattern}: {e}")
-                            substituted = re.sub(img_regex, to_pattern, v_url, flags=re.IGNORECASE)
-                        
-                        if v_url != results[0] and '://' not in substituted:
-                            # A-06: 19 shipped rules use a protocol-relative `to`
-                            # (Imgflip-h-p, OfferUp-pp, ...). Without this branch
-                            # the result was https:////host/path.
-                            if substituted.startswith('//'):
-                                substituted = 'https:' + substituted
-                            else:
-                                scheme = results[0].split('://', 1)[0]
-                                substituted = f"{scheme}://{substituted}"
-                            
-                        if substituted != results[0]:
-                            logger.debug(f"Imagus match found: {img_regex} -> {substituted}")
-                            variants = self._expand_variants(substituted)
-                            sieve_results.extend(variants)
-                            transformed = True
+                        # Fallback: regex substitution (ECMAScript semantics)
+                        to_template = rule.get('to_template') or rule.get('to_python', '')
+                        if not to_template:
+                            raw_variants = []
+                        else:
+                            try:
+                                # count=1: JS String.replace without /g replaces
+                                # the FIRST match only — the same as the
+                                # extension's single-match substitution.
+                                substituted = re.sub(
+                                    img_regex,
+                                    lambda m, t=to_template: get_substitution(t, m),
+                                    v_url, count=1, flags=re.IGNORECASE,
+                                )
+                            except Exception as e:
+                                logger.debug(f"re.sub failed with template {to_template}: {e}")
+                                substituted = v_url
+                            if substituted != v_url:
+                                logger.debug(f"Imagus match found: {img_regex} -> {substituted}")
+                                raw_variants = self._expand_variants(substituted)
+                                transformed = True
+
+                        for variant in raw_variants:
+                            variant = normalize_variant(variant, source_url or results[0])
+                            if variant and variant != v_url:
+                                sieve_results.append(variant)
                         break
             except Exception as e: 
                 logger.debug(f"Error in Imagus rule processing: {e}")

@@ -77,6 +77,9 @@ button.save-green:disabled { background: #333; color: #777; cursor: not-allowed;
 button.save-green[data-state="saving"],
 button.save-green[data-state="saving"]:hover { background: #333; color: #777; cursor: not-allowed; }
 button.save-green[data-state="done"] { background: #43a047; color: #fff; }
+/* F-07: the list is capped at 300 rendered rows; this line says how many are
+   hidden and why (the filters are the way to see them). */
+.media-more { padding: 8px 12px; font-size: 11px; color: #999; text-align: center; border-top: 1px solid #333; }
 .hidden { display: none; }
 .error { padding: 10px 14px; color: #ef5350; font-size: 12px; }
 .footer { padding: 6px 14px; border-top: 1px solid #333; display: flex; justify-content: space-between; align-items: center; gap: 10px; }

@@ -5,9 +5,9 @@ One observable outcome per gate; CHECK commands run from the project root, EXPEC
 against the combined output. Format follows `GATES.md`.
 
 **Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met;
-stage 4 — 8/8 met; stage 6 — 1/1 met; stage 7 — 4/4 met (+ the stage sweeps). 0 unmet, 0 abandoned.
-Stage 5 (extension sieve core + popup resilience) is the remaining stage. Measured values below;
-current tree `483 passed / 30 skipped`.**
+stage 4 — 8/8 met; stage 5 — 11/11 met (2 live-Chrome items NOT MEASURED, see G-5-LIVE);
+stage 6 — 1/1 met; stage 7 — 4/4 met (+ the stage sweeps). 0 unmet, 0 abandoned.
+Measured values below; current tree `492 passed / 30 skipped`, node 14/14.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -628,6 +628,145 @@ C-02, C-05 (+NF-6), C-07, C-08. New files `tests/test_gui_pause_nonblocking.py` 
 no-op queue lock, synchronous sieve download). One first attempt was rejected as an equivalent
 mutant (it kept the non-string guard while changing its shape) and was replaced by a mutation that
 really drops the guard before being counted.
+
+---
+
+## Stage 5 — the extension sieve core and "the popup must not hang" (FIXPLAN §3/Этап 5)
+
+A-09, A-10, A-11, A-12, NF-1, NF-2, NF-7 (one substitution + matching + normalization), A-13,
+A-14, D-01, D-02, D-03, D-05, D-06, D-07, D-08, D-09. New suites:
+`extension/tests/substitution.test.mjs`, `extension/tests/background_resilience.test.mjs`,
+`tests/test_sieve_substitution_vectors.py`, `tests/test_sieve_cross_impl.py`, and the shared
+fixture `extension/tests/vectors/substitution.json`. Baseline entering the stage:
+`483 passed / 30 skipped`, node 12/12.
+
+### G-5-1 · A-10 / A-12 / NF-2 / NF-7 · ONE substitution, anchored to the spec
+- CHECK: `node extension/tests/substitution.test.mjs`, `python -m pytest tests/test_sieve_substitution_vectors.py -q`
+- EXPECT: 28 substitution vectors + 5 expansion vectors pass on BOTH sides; the node suite
+  re-derives every expected value with V8's own `String.replace` first, so a hand-edited fixture
+  fails instead of blessing a wrong implementation.
+- RESULT: **MET** — node `ALL PASS`, pytest `5 passed`. `sieve.js getSubstitution` and
+  `site_pattern_manager.get_substitution` are the same ECMAScript GetSubstitution; `background.js`'s
+  private descending-order loop is gone (`applyUrlTransform` delegates), and so is Python's
+  `_sanitize_imagus_target` (`\g<n>` + private clamping). Measured on the audit's own cases:
+  `$11200x1200` with 2 groups → `11200x1200` (was `x1200` in the extension), `$&` → the whole match
+  (was left literal there), `$0` → literal (was the whole match in Python).
+
+### G-5-2 · A-09 / A-11 / NF-1 · both URL forms match, every variant is absolute
+- CHECK: `node extension/tests/sieve_rules.test.mjs`
+- EXPECT: a `^`-anchored rule matches the scheme-stripped form; a full-URL rule still matches
+  first; `//host/...` takes the PAGE's scheme; a root-relative variant resolves against the page;
+  a `data:` result stays `data:`; `#ext#` blocks and multi-line templates expand fully.
+- RESULT: **MET** — `ALL PASS`. `matchRuleUrl` tries the full URL then the stripped twin,
+  `normalizeVariant` runs where variants are born (`applySieveRulesAll`) and at the two other
+  producers (`upgradeMediaList` resize path, `processLink`), and the popup's relative-path handling
+  is replaced by it. The suite's old expectations for relative variants (`["/full/1"]`) were
+  rewritten to absolute URLs — that is the finding, not a test that needed loosening.
+
+### G-5-3 · A-10 · the LIVE rule set: zero divergence between the two implementations
+- CHECK: `python -m pytest tests/test_sieve_cross_impl.py -q`
+- EXPECT: every bundled rule with a plain string `to` produces the same substitution and the same
+  expansion in Python and in JS; the rule count stays in the hundreds.
+- RESULT: **MET** — `4 passed`. 823 rules in `extension/sieve.json`, 815 live (8 carry `off: 1`),
+  **314** carry a string `to` and are compared rule by rule on an identical synthetic match
+  (`WHOLE`, `G1`…`Gn`); 313 of them actually change the template, so the comparison is not vacuous.
+  The 158 JS rules have no string form to compare and are excluded by construction; the rules
+  Python cannot compile at all are counted and asserted to stay under 20 (measured: 1).
+
+### G-5-4 · A-13 / NF-9 / D-01 · the keepalive cannot throw, leak, or be missing
+- CHECK: `node extension/tests/background_resilience.test.mjs -k keepalive` (whole file run below)
+- EXPECT: `alarms.create` returning `undefined` (Chrome < 111) does not throw and counts exactly one
+  reference; a throwing `alarms` API does not throw, reports failure and leaves the refcount at
+  zero; release tolerates a broken `clear()`; the command path holds a keepalive.
+- RESULT: **MET** — `ALL PASS`. The increment moved AFTER the alarm request (the audit's NF-9: the
+  old order left `_keepaliveRefs` inflated at 1 forever), `console.warn` replaces the throw, and
+  `commandScanAndProcess` — the third path, which had none — now brackets its whole body with
+  acquire/release. `sieve_updater.updateSieve` takes the caller's keepalive and releases it in a
+  `finally` (tested for the success, 304 and failure paths).
+
+### G-5-5 · D-09 / D-02 · a failing branch still answers; the popup can always leave "Scanning..."
+- CHECK: `node extension/tests/background_resilience.test.mjs` (replyWith cases) + source pins
+- EXPECT: a rejected promise answers `{ok: false, error}`; no `onMessage` branch calls
+  `.then(sendResponse)` directly; the scan has a second report channel.
+- RESULT: **MET** — `ALL PASS`. `replyWith` wraps all **seven** async branches (the audit said six;
+  the file has seven), the scan's completion and failure both call `broadcastScanFinished`
+  (`chrome.runtime.sendMessage({action:"scanFinished"})`), and the popup listens for it — so a
+  failed final `storage.local.set` (the D-02 case: the write sat under an empty `catch`) can no
+  longer leave the button on "Scanning...".
+
+### G-5-6 · A-14 · one scan, one download batch
+- CHECK: `node extension/tests/background_resilience.test.mjs` (source pins),
+  `node extension/tests/chrome_download_headers.test.mjs` (batch guard, behavioural)
+- EXPECT: `handleStartScan` and the command path refuse to start while `_scanBusy`; the scan
+  releases the flag in `finally`; a second `chromeDownload` while a batch runs returns
+  `{saved: 0, busy: true}` and the first batch still completes.
+- RESULT: **MET** — `ALL PASS` both files. The old `commandBusy` flag only covered the command
+  entry point; the shared `_scanBusy` now covers the popup path too, which used to start a second
+  full scan beside a running one.
+
+### G-5-7 · D-03 · navigation links are capped, media links are not
+- CHECK: `node extension/tests/content_scan.test.mjs`
+- EXPECT: 1000 navigation anchors → 200 collected; a media-bearing anchor from the END of the
+  document still reaches discovery; 300 media anchors are all kept (control).
+- RESULT: **MET** — `ALL PASS`. Cap = the desktop twin's `DEFAULT_MAX_LINKS_PER_PAGE` (200), applied
+  to `linkRest` only; media anchors keep their uncapped, first-in-list position.
+
+### G-5-8 · D-05 · the WordPress/CDN size suffix is stripped here too
+- CHECK: `node extension/tests/upgrade_media.test.mjs`, `node extension/tests/background_resilience.test.mjs`
+- EXPECT: `photo-300x200.jpg` → `photo.jpg` through the REAL `upgradeMediaList` pipeline, with
+  `original_url` kept and `transformed`/`source` set; a query string survives; a name that merely
+  contains digits is untouched.
+- RESULT: **MET** — `ALL PASS` both files. The suffix directly before the extension is removed
+  (same anchor as the desktop twin's step 4); the sieve/JS route for those sites stays unavailable
+  under MV3 CSP, which is why the pure-string twin exists — as it does on the desktop (ERR-7).
+
+### G-5-9 · D-06 · the sieve response is bounded before it is parsed
+- CHECK: `node extension/tests/sieve_merge.test.mjs`
+- EXPECT: a body over `MAX_SIEVE_BYTES` (8 MiB) is refused without `JSON.parse`; a declared
+  `Content-Length` over the cap is refused without reading the body; a normal bundle still updates
+  (control); the stored rules are untouched in both refusal cases.
+- RESULT: **MET** — `ALL PASS`. Measured before the fix (plan §0/NF-…): a 20 MiB body was parsed
+  without complaint.
+
+### G-5-10 · D-07 · a filename Chrome accepts
+- CHECK: `node extension/tests/background_resilience.test.mjs`
+- EXPECT: `..%2F..%2Fx.png` has no separator left and is not empty; `CON.png` is neutralised; a
+  trailing dot/space, control characters and over-long names are handled; a normal name is
+  untouched.
+- RESULT: **MET** — `ALL PASS`. `sanitizeFilename` lives in `shared.js` (loaded by both the popup
+  and the worker) and is applied on both send paths; the percent-decoding happens BEFORE the scrub,
+  so `%2F` cannot smuggle a separator through.
+
+### G-5-11 · D-08 · a dropped rule is reported
+- CHECK: `node extension/tests/sieve_rules.test.mjs`
+- EXPECT: a rule with an invalid `img` regex is dropped, logged at debug level, and the run ends
+  with one aggregate warning naming the count.
+- RESULT: **MET** — `ALL PASS`. `parseSieve` counts `unparsed` and warns once
+  (`"Sieve: 1 rule(s) could not be parsed"`); the suite injects its own console and observes both
+  calls — before this the rule simply vanished.
+
+### G-5-LIVE · the two live-Chrome items — NOT MEASURED
+- CHECK: (plan) "Save (Chrome)" on a page with the 7 `//`-rules, and a forced `storage.local.set`
+  failure, both driving a real browser.
+- EXPECT: a file downloads instead of a `file://` URL; the popup leaves "Scanning..." with an error.
+- RESULT: **NOT RUN** — there is no live Chrome/browser automation in this environment, and the
+  Deno/Chrome halves of earlier stages were reported the same way. The behaviour those two checks
+  exercise is covered structurally instead: NF-1/A-06 (`normalizeVariant`, unit- and
+  vector-tested on both sides, including the 7 protocol-relative templates through the cross-check)
+  and D-02 (the second report channel plus the popup's listener). This is a stated gap, not a pass.
+
+### G-5-FULL · Stage 5 regression sweep
+- CHECK: `python -m pytest tests -q`, `node extension/tests/*.test.mjs`, `node --check` on every
+  extension script, `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401`
+- EXPECT: all green, no new skips, no new lint findings.
+- RESULT: **MET** — Python `492 passed, 30 skipped` (**+9** this stage; the same 30 Deno skips),
+  node **14/14** (12 before; `substitution` and `background_resilience` are new), `node --check`
+  clean on all six extension scripts, ruff reports only the 3 intentional `webpage_parser.py` E402.
+
+**Falsification, stage 5: 11 mutations, all RED** (greedy `$N` in JS, full-URL-only matching,
+unnormalized variants in both languages, throwing `keepaliveAcquire`, one `onMessage` branch without
+`replyWith`, the D-05 call site, the D-07 scrub, the D-03 cap, the D-06 size cap, Python's `$nn`
+fallback, Python's normalizer).
 
 ---
 
