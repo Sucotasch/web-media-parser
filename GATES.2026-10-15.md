@@ -5,9 +5,10 @@ One observable outcome per gate; CHECK commands run from the project root, EXPEC
 against the combined output. Format follows `GATES.md`.
 
 **Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met;
-stage 4 — 8/8 met; stage 5 — 11/11 met (2 live-Chrome items NOT MEASURED, see G-5-LIVE);
-stage 6 — 1/1 met; stage 7 — 4/4 met; stage 8 — 5/5 met (+ the stage sweeps). 0 unmet,
-0 abandoned. Measured values below; current tree `492 passed / 30 skipped`, node 15/15.**
+stage 4 — 8/8 met; stage 5 — 11/11 met (the 2 live-Chrome items were MEASURED later the same day,
+see G-5-LIVE); stage 6 — 1/1 met; stage 7 — 4/4 met; stage 8 — 6/6 met (+ the stage sweeps), plus
+the live browser↔app loop (G-8-LIVE) and one defect it found and fixed live (G-8-5 / NF-11).
+0 unmet, 0 abandoned. Measured values below; current tree `494 passed / 30 skipped`, node 15/15.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -745,15 +746,31 @@ fixture `extension/tests/vectors/substitution.json`. Baseline entering the stage
   (`"Sieve: 1 rule(s) could not be parsed"`); the suite injects its own console and observes both
   calls — before this the rule simply vanished.
 
-### G-5-LIVE · the two live-Chrome items — NOT MEASURED
+### G-5-LIVE · the two live-Chrome items — MEASURED (revised 2026-10-15, later the same day)
 - CHECK: (plan) "Save (Chrome)" on a page with the 7 `//`-rules, and a forced `storage.local.set`
   failure, both driving a real browser.
 - EXPECT: a file downloads instead of a `file://` URL; the popup leaves "Scanning..." with an error.
-- RESULT: **NOT RUN** — there is no live Chrome/browser automation in this environment, and the
-  Deno/Chrome halves of earlier stages were reported the same way. The behaviour those two checks
-  exercise is covered structurally instead: NF-1/A-06 (`normalizeVariant`, unit- and
-  vector-tested on both sides, including the 7 protocol-relative templates through the cross-check)
-  and D-02 (the second report channel plus the popup's listener). This is a stated gap, not a pass.
+- RESULT: **MET** — the earlier NOT-MEASURED entry was wrong: this box has a working browser loop
+  (`ext-dev-loop`, CfT 137.0.7151.119 pinned in `~/.ext-dev-loop/LOCAL.md`) and the runs below were
+  made with it. The two items were re-run live rather than left to structure:
+  - "Save (Chrome)": a local fixture (`http://127.0.0.1:9811`, 3 real 64×64 thumbs) plus a user rule
+    with a `//` template (`to: "//$1full/$2"`) → the popup scan produced
+    `http://127.0.0.1:9811/full/photo{1,2,3}.png` and Save (Chrome) put **3 files on disk**, all
+    `state: complete`, `error: null` — never a `file://` URL (the ERR-2/ERR-3 failure mode).
+  - the shipped `//`-rules: 7 of them live (`slashTemplates: 7` on the bundled 823-rule set; the
+    online updater merged a newer sieve into storage and that set has 12), `Photo-Forum-g` driven
+    through the real `upgradeMediaList()` → exactly
+    `http://photo-forum.net/static/site_pics/a/b.jpg`; no produced URL started with `//` or `file:`.
+    Not exercised: `Imgflip-h-p` (its `link` filter rejects the page shape I fed it — my input, not
+    the product) and `vsco-x-p` after the merge (a different rule matches first).
+  - `storage.local.set` failure: patching the API by assignment does **not** take (verified: the
+    probe write still succeeded), so the failure was driven on the real code paths instead — a
+    genuinely failing scan (a tabId with no content script) → `scanProgress.status = "error"`, the
+    popup showed `Scan failed: Could not establish connection. Receiving end does not exist.` and
+    became usable again; and the D-02 second channel was verified by arming a recorder in the popup
+    and having the SW call `broadcastScanFinished({ok:false, …})` — the popup received it.
+- Transcripts: `d:/tmp/s8_live_run3…6.txt` (23-step script), fixture and steps under
+  `.ext-dev-loop/s8live/` (gitignored).
 
 ### G-5-FULL · Stage 5 regression sweep
 - CHECK: `python -m pytest tests -q`, `node extension/tests/*.test.mjs`, `node --check` on every
@@ -828,11 +845,44 @@ executor pools and constants, a rebuilt `dist/`, and the final sweep. Only F-07 
   `taskkill /F /PID` the port stopped answering (`curl_exit=7`). This is a *startup + API* smoke
   test — an end-to-end crawl through the frozen exe is not automatable here (see G-8-LIVE).
 
-### G-8-LIVE · the human-in-the-loop checks — NOT RUN
-- CHECK: parsing a real gallery through the frozen exe (Stop/Pause mid-task), loading the unpacked
-  extension against it, and the two live-Chrome items from G-5-LIVE.
-- RESULT: **NOT RUN** — no browser automation and no interactive session in this environment. Stated
-  as a gap, not a pass; the earlier stage ledgers report the same limitation.
+### G-8-LIVE · the browser ↔ app loop — MEASURED, and it found a real defect
+- CHECK: load the unpacked extension in a real browser, scan a page, press "Send to App" with the
+  frozen app running, and read the app's own queue (`GET /api/status`, `task_queue.json`).
+- EXPECT: the popup reports no error and the app's queue grows by the scanned task.
+- RESULT: **MET after a fix** — 7-step script, browser exit 0, both asserts green; the popup's
+  "Send to App 3" click left the app with `queue_length: 2` and `task_queue.json` holding the fixture
+  page as a task, whose downloads folder is `127_0_0_1_20261015_194216/`.
+
+### G-8-5 · LIVE DEFECT (new, found by G-8-LIVE, fixed): a port in the task folder killed the task
+- ID: **NF-11** (extension→app path, Windows-only).
+- SYMPTOM: `POST /api/tasks` answers `{"ok": true, "added": 1}` and **nothing is ever queued** — no
+  task in `/api/status`, no `task_queue.json` (before `C-09` would have written one), and the popup
+  shows no error either. Reproduced twice with curl and once from the popup.
+- CAUSE (measured, not guessed — the app's stderr had the traceback the UI never showed):
+  `build_extension_task_payload` built the folder from `url.split("/")[2]`, i.e. the **netloc with
+  the port**: `downloads\127_0_0_1:9811_20261015_193650`. `:` is illegal in a Windows path, so
+  `os.makedirs` in `_apply_extension_task_payload` raised
+  `NotADirectoryError [WinError 267]` **inside the Qt slot** — the payload had already been drained
+  from `_pending_extension_payloads`, so the task vanished silently: PySide6 prints the traceback to
+  stderr, and the frozen `--windowed` build has stderr on `NUL`.
+- FIX: `_safe_domain_folder()` in `src/gui/main_window.py` — drops userinfo, the port and IPv6
+  brackets, then neutralises the reserved characters (`<>:"/\|?*` + control chars) before the
+  existing `.` → `_` mapping; both branches (one-shot and batch) use it. Hosts without a port keep
+  the byte-identical folder name they had before (`example_com_…`).
+- CHECK: `python -m pytest tests/test_parser_lifecycle.py -q -k legal_path`
+- EXPECT: the two new tests (`…_one_shot`, `…_batch`) pass; each builds the payload for a
+  `127.0.0.1:9811` page and then actually creates the folder, which is what the GUI thread does.
+- RESULT: **MET** — both tests were written first and were **RED** on the unfixed tree
+  (`AssertionError: ':' unexpectedly found` / `NotADirectoryError`), green after the fix; full suite
+  `494 passed, 30 skipped`. Live re-verification with the rebuilt `dist/`: the same POST returned
+  `{"ok": true, "added": 1}` **and** `{"active_task": "92cb3615e780", "queue_length": 1}` with the
+  task in `task_queue.json` and **no traceback** in the app's stderr; the popup path then added its
+  own task. The app's crawl of the fixture reported `Images found: 3 … Skipped: 3` — skipped by the
+  app's own 40 KB default, because the fixture PNGs are ~0.5 KB (fixture limitation, not a defect).
+- STILL OPEN (observation, not fixed): the slot has no error channel. Any exception in
+  `_apply_extension_task_payload` still loses the task after the HTTP reply said `ok: true`; NF-11
+  was invisible for exactly that reason. Candidate follow-up: catch in the slot and report back
+  (log + status), so the next such failure is not silent.
 
 ### G-8-FULL · Stage 8 regression sweep
 - CHECK: `python -m pytest tests -q`; every `extension/tests/*.test.mjs`; `node --check` on all six

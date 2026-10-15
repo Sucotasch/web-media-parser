@@ -19,6 +19,7 @@ signal, so the GUI kept showing a zombie "running" task forever.
 import asyncio
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -204,6 +205,38 @@ class TestExtensionPayloadBuffering(unittest.TestCase):
         self.assertIsNone(build_extension_task_payload([], {}, "dl", True))
         self.assertIsNone(build_extension_task_payload(
             [{"url": "ftp://bad"}], {}, "dl", True))
+
+    def test_extension_payload_folder_is_a_legal_path_one_shot(self):
+        """Live s8 finding: a source page carrying a PORT put ':' into the task
+        folder (`127_0_0_1:9811_20261015_193650`). On Windows `os.makedirs`
+        raised NotADirectoryError (WinError 267) inside the GUI slot, so the
+        extension's task was dropped after the HTTP reply had already said
+        ok:true — invisible to the popup."""
+        payload = build_extension_task_payload(
+            [{"url": "http://127.0.0.1:9811/full/photo1.png", "type": "image",
+              "referer": "http://127.0.0.1:9811/index.html"}],
+            settings={}, download_dir="dl", one_shot=True,
+            timestamp="20260101_000000",
+        )
+        folder = payload["task_folder"]
+        for ch in '<>:"/\\|?*':
+            self.assertNotIn(ch, folder, "illegal path character in %r" % folder)
+        self.assertIn("127_0_0_1", folder)
+        # The GUI thread's first act is to create this folder — that is exactly
+        # what failed live, so the test does it too.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, folder))
+
+    def test_extension_payload_folder_is_a_legal_path_batch(self):
+        payload = build_extension_task_payload(
+            [{"url": "http://127.0.0.1:9811/album"}],
+            settings={}, download_dir="dl", one_shot=False,
+            timestamp="20260101_000000",
+        )
+        download_path = payload["tasks"][0][2]
+        self.assertNotIn(":", os.path.basename(download_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, os.path.basename(download_path)))
 
 
 class TestMainTaskEmitsFailedOnPreCrash(unittest.TestCase):

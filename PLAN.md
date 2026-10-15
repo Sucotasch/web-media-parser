@@ -6,13 +6,14 @@ Mod reference: `../Imagus-Mass-Download-Mod/` (MIT badge in README.md, owned by 
 **Discipline:** each item lists the concrete solution (grounded in real code, with line refs), files
 touched, and an acceptance gate (`CHECK` → `EXPECT`) that must pass before the item is done.
 No item starts before its gate is written here. New defects found during work are logged in §8
-immediately, never ignored. Baseline: `7bac98b` (2026-09-09), 265 passed / 30 skipped at that commit; re-measured 2026-10-15 on the current tree: 492 passed / 30 skipped.
+immediately, never ignored. Baseline: `7bac98b` (2026-09-09), 265 passed / 30 skipped at that commit; re-measured 2026-10-15 on the current tree: 494 passed / 30 skipped.
 
 The defect plan built on the 2026-10-15 audit is `Audit/FIXPLAN_2026-10-15.md`; its stages and gates
-live in `GATES.2026-10-15.md` — **stages 0-8 all met** (0 unmet, 0 abandoned); current tree: 492
+live in `GATES.2026-10-15.md` — **stages 0-8 all met** (0 unmet, 0 abandoned); current tree: 494
 passed / 30 skipped, node 15/15, `node --check` clean, the ruff selection green, and `dist/`
-rebuilt + smoke-run from the frozen exe (G-8-4). The two live-Chrome checks stay NOT MEASURED
-(no browser automation here — see G-5-LIVE).
+rebuilt + smoke-run from the frozen exe (G-8-4). The two live-Chrome checks were MEASURED with the
+`ext-dev-loop` harness later the same day (G-5-LIVE), and that loop then found a real defect on the
+extension→app path — NF-11, logged in §8 below and fixed with two regression tests (G-8-5).
 
 ---
 
@@ -248,6 +249,25 @@ Plus one-shot `logger.warning` on first `verify=False` fetch per process (patter
 ---
 
 ## §8 Defect log (new findings during execution — appended, never ignored)
+
+- [2026-10-15, stage 8 live run] **NF-11 · FOUND & FIXED — a port in the task folder silently killed
+  every extension task.** Found by the browser↔app gate (G-8-LIVE), not by any unit test: the popup
+  scanned a local fixture, "Send to App" reported no error, and the app never queued anything.
+  `POST /api/tasks` answered `{"ok": true, "added": 1}` while `/api/status` stayed `queue_length: 0`
+  and no `task_queue.json` appeared. Root cause, read from the app's stderr (invisible in the
+  `--windowed` build, whose stderr is `NUL`): the folder name came from the netloc **with the port**
+  — `downloads\127_0_0_1:9811_20261015_193650` — and `:` is illegal on Windows, so `os.makedirs`
+  inside `_apply_extension_task_payload` raised `NotADirectoryError [WinError 267]` in the Qt slot
+  *after* the payload had been drained: the task was gone, the extension was told `ok: true`.
+  Fixed with `_safe_domain_folder()` (`src/gui/main_window.py`) — userinfo, port and IPv6 brackets
+  dropped, reserved characters neutralised, dot → underscore as before; both payload branches use
+  it. Two regression tests written RED first (`tests/test_parser_lifecycle.py::
+  TestExtensionPayloadBuffering::test_extension_payload_folder_is_a_legal_path_{one_shot,batch}`),
+  green after the fix (494 passed). Live re-verification on the rebuilt `dist/`: the same POST
+  created and auto-started the task (`active_task: 92cb3615e780`, `queue_length: 1`), the popup path
+  added its own task, and the app's crawl reported `Images found: 3`. **Left open deliberately:** the
+  Qt slot still has no error channel, so any future exception there is lost the same silent way —
+  candidate follow-up, not part of this fix.
 
 - [2026-09-09, planning] Audit.md C-2 premise incorrect: Mod's `loop` is recursive re-resolution
   with a bitmask (`loop & 1` link-side, `loop & 2` img-side, ≤5 hops, self-ref protection),

@@ -29,7 +29,7 @@ Extension API: `http://127.0.0.1:19876` (`GET /api/status`, `GET /api/queue`, `P
 
 ## Testing (the only automated gate)
 
-There is **no CI workflow, no `pyproject.toml`/`setup.cfg`/`.flake8`/`.editorconfig`, no typecheck**. Current tree (2026-10-15): **492 passed / 30 skipped**, plus **15/15** Node suites in `extension/tests/*.test.mjs`. Lint is ruff from the `.[lint]` extra: `pip install -e .[lint]` then `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401` (expect exactly the three intentional `webpage_parser.py` E402 lines).
+There is **no CI workflow, no `pyproject.toml`/`setup.cfg`/`.flake8`/`.editorconfig`, no typecheck**. Current tree (2026-10-15): **494 passed / 30 skipped**, plus **15/15** Node suites in `extension/tests/*.test.mjs`. Lint is ruff from the `.[lint]` extra: `pip install -e .[lint]` then `python -m ruff check src/ tests/ --select E722,E402,E741,E731,E401,F401` (expect exactly the three intentional `webpage_parser.py` E402 lines).
 
 - The 30 skips are Deno-dependent (`test_js_engine.py`, `test_gateway_bypass.py`) — they auto-skip when no Deno binary is resolvable. Skipping is the expected green state; do not "fix" the skips. Verify with `python -m pytest tests -q -rs`.
 - Deno resolution order (`src/parser/js_engine/engine.py: find_deno_bin`): `WEB_MEDIA_PARSER_DENO`/`DENO_BIN` env → `deno` PyPI package → `bin/deno.exe` next to the frozen exe → media-downloader's bundled `deno.exe` → `PATH`.

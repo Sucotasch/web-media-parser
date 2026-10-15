@@ -7,6 +7,7 @@ Main window of the application
 
 import os
 import logging
+import re
 import threading
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -42,6 +43,27 @@ from src.app_paths import queue_path
 
 logger = logging.getLogger(__name__)
 
+# Live s8 finding (2026-10-15): a NETLOC is not a filename. The task folder was
+# built from `url.split("/")[2]`, so a page on a port produced
+# `127_0_0_1:9811_20261015_193650` — ':' is illegal in a Windows path, and
+# `os.makedirs` raised NotADirectoryError (WinError 267) inside
+# `_apply_extension_task_payload`. The payload had already been drained, so the
+# task simply vanished while the extension got `ok: true`. Strip the port (and
+# any userinfo/IPv6 brackets) and neutralise the reserved characters.
+_ILLEGAL_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_domain_folder(netloc: str, fallback: str) -> str:
+    """Turn a URL netloc into a path-safe, stable folder component."""
+    host = (netloc or "").rsplit("@", 1)[-1]          # user:pass@host -> host
+    if host.startswith("["):                          # [::1]:8080 -> ::1
+        host = host[1:host.index("]")] if "]" in host[1:] else host.lstrip("[")
+    else:
+        host = host.split(":", 1)[0]                 # host:port -> host
+    host = _ILLEGAL_PATH_CHARS.sub("_", host).replace(".", "_")
+    host = host.strip(" _")
+    return host or fallback
+
 
 def build_extension_task_settings(base_settings, user_agent="", cookies=""):
     """A-2: one-shot settings for an extension task.
@@ -75,7 +97,7 @@ def build_extension_task_payload(urls, settings, download_dir, one_shot=False, t
         source_page = (urls[0].get("referer") or urls[0].get("source") or "")
         ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
         try:
-            domain = source_page.split("/")[2].replace(".", "_") if source_page else "extension"
+            domain = _safe_domain_folder(source_page.split("/")[2], "extension") if source_page else "extension"
         except IndexError:
             domain = "extension"
         task_folder = f"{domain}_{ts}"
@@ -123,7 +145,7 @@ def build_extension_task_payload(urls, settings, download_dir, one_shot=False, t
         if not url or not url.startswith(("http://", "https://")):
             continue
         try:
-            domain = url.split("/")[2].replace(".", "_")
+            domain = _safe_domain_folder(url.split("/")[2], "unknown")
         except IndexError:
             domain = "unknown"
         tasks.append((url, settings, os.path.join(download_dir, f"{domain}_{ts}")))
