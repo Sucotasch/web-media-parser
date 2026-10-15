@@ -5,8 +5,9 @@ One observable outcome per gate; CHECK commands run from the project root, EXPEC
 against the combined output. Format follows `GATES.md`.
 
 **Status: stage 0 — 14/14 met; stage 1 — 13/13 met; stage 2 — 8/8 met; stage 3 — 12/12 met;
-stage 4 — 8/8 met (+ the stage sweeps). 0 unmet, 0 abandoned. Measured values below; current tree
-`455 passed / 30 skipped`.**
+stage 4 — 8/8 met; stage 6 — 1/1 met; stage 7 — 4/4 met (+ the stage sweeps). 0 unmet, 0 abandoned.
+Stage 5 (extension sieve core + popup resilience) is the remaining stage. Measured values below;
+current tree `483 passed / 30 skipped`.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -539,6 +540,94 @@ like the real one).
 
 **Falsification, stage 4: 8 mutations, all RED** (2 offload, blocked write, id check, recycling,
 acc cap, Deno shadow, happy-dom release).
+
+---
+
+## Stage 6 — credentials: one item left, and it is a type check (FIXPLAN §3/Этап 6)
+
+A-02 and D-04 were dropped by product decision (FIXPLAN §2.4 — local trusted contour; filtering
+would break age-gate/authorized sites). C-04 is what remains: the three scalars in the `/api/tasks`
+body were never type-checked. Baseline entering the stage: `455 passed / 30 skipped`.
+
+### G-6-1 · C-04 · the body's scalars are typed and cleaned
+- CHECK: `python -m pytest tests/test_http_server.py -q -k ScalarCleaning`
+- EXPECT: `{"user_agent": 5, "cookies": {"a": "b"}}` returns 200 with both overrides dropped;
+  `one_shot` becomes a real bool; CR/LF cannot be injected through a header value; over-long values
+  are capped at `MAX_SCALAR_LENGTH`.
+- RESULT: **MET** — `4 passed` (`TestScalarCleaning`). The audit's measured `TypeError` is gone:
+  `_clean_header_value`/`_clean_cookie_value` reject non-strings, strip CR/LF and truncate at 512,
+  and `one_shot` is coerced with `bool()`. Mutation (the `isinstance` guard removed) → RED
+  (`AttributeError` on the integer reaches aiohttp as a 500).
+
+---
+
+## Stage 7 — GUI and server (FIXPLAN §3/Этап 7)
+
+C-02, C-05 (+NF-6), C-07, C-08. New files `tests/test_gui_pause_nonblocking.py` (7 tests) and
+`tests/test_queue_thread_safety.py` (9); `test_http_server.py` grew 7 → 15, `test_gui_wiring.py`
+10 → 14.
+
+### G-7-1 · C-05 / NF-6 · the real wire path for large and oversized bodies
+- CHECK: `python -m pytest tests/test_http_server.py -q -k RequestBodySize`
+- EXPECT: a real aiohttp client posts a ~1.1 MiB batch → 200 with all items delivered; a declared
+  17 MiB body → 413 with the size error in the JSON, and the task callback never runs; the chunked
+  (no `Content-Length`) path is answered by the middleware, not by the handler.
+- RESULT: **MET** — `4 passed`. `client_max_size = 16 MiB` plus a middleware that refuses a declared
+  over-limit length BEFORE reading a byte and turns aiohttp's own `HTTPRequestEntityTooLarge` into
+  the same 413. The handler re-raises that exception — its catch-all `except Exception` around
+  `request.json()` was what rewrote the rejection as a misleading `Invalid JSON` 400 (the audit's
+  finding, and the reason the middleware alone would never have fired). Measured batch: 12 000
+  realistic items = 1.17 MiB. Mutation (cap back to 1 MiB) → RED.
+
+### G-7-2 · C-07 · Pause does not block the GUI thread
+- CHECK: `python -m pytest tests/test_gui_pause_nonblocking.py -q`
+- EXPECT: a click whose state save takes 1.0 s returns in < 0.2 s; the task is marked PAUSED and the
+  active slot freed before returning; the save still COMPLETES before the stop is issued; a failed
+  save still stops the task and is reported to the user log.
+- RESULT: **MET** — `7 passed`. `_save_then_stop()` chains `await pm.save_state(...)` and
+  `pm.stop_parsing()` inside ONE coroutine on the parser loop and returns immediately (the old code
+  was `run_coroutine_threadsafe(...).result(timeout=15)` on the GUI thread — the plan's measured
+  5.47 s freeze). The ordering half is asserted, not assumed: `pm.order == ["save", "stop"]`.
+  `closeEvent` still waits on purpose (bounded 5 s) — the process is exiting, so a background save
+  would be lost; that deviation is documented at the call site. Mutation (`.result()` restored) → RED.
+
+### G-7-3 · C-08 · the extension thread and the GUI thread stop interleaving
+- CHECK: `python -m pytest tests/test_queue_thread_safety.py -q`
+- EXPECT: a mutation waits for an in-progress read; `snapshot()` returns `active_task_id`,
+  `queue_length`, `files_downloaded` and `task_ids` from ONE lock acquisition; a signal slot that
+  calls back into the manager from another thread does not deadlock; 4×60 concurrent add/start/clear
+  cycles lose nothing; `/api/status` answers consistently while a writer thread churns the queue.
+- RESULT: **MET** — `9 passed`. `TaskQueueManager` gained an `RLock` (every mutator and both
+  properties), a public `snapshot()`, and the rule that signals are emitted AFTER the lock is
+  released; `MainWindow.get_status` reads through `snapshot()`; the extension payload buffer got its
+  own `threading.Lock` (`_drain_pending_extension_payloads`), replacing a tuple swap that could drop
+  an append. Honest scope note: the 40-request endpoint test is an invariant/smoke test (every
+  response self-consistent, no exceptions) — the DETERMINISTIC detector is
+  `test_a_mutation_waits_for_an_in_progress_read`, and that is the one the falsification uses.
+  Mutation (lock replaced by a no-op) → RED.
+
+### G-7-4 · C-02 · the sieve download leaves the GUI thread
+- CHECK: `python -m pytest tests/test_gui_wiring.py -q -k BackgroundThread`
+- EXPECT: a click whose download takes 1.0 s returns in < 0.2 s, the button is disabled while the
+  worker runs and re-enabled when it reports; the worker runs on a different thread; the jsDelivr
+  retry happens inside the worker; a failure is reported without freezing.
+- RESULT: **MET** — `4 passed`. `_on_sieve_download` now only validates and starts a
+  `threading.Thread`; results arrive over the `sieve_download_status` signal, connected once in
+  `__init__` (`"progress"` keeps the button disabled, `"done"/"error"` re-enables it). The existing
+  C-03 test now waits for that queued signal instead of reading the result synchronously — same
+  assertion, different arrival time. Mutation (synchronous call restored) → RED.
+
+### G-7-FULL · Stage 6-7 regression sweep
+- CHECK: `python -m pytest tests -q`
+- EXPECT: all green, no new skips.
+- RESULT: **MET** — `483 passed, 30 skipped in 42.0s` (**+28** over stage 4's 455; the same 30 Deno
+  skips). The five mutations below were applied one at a time and reverted; `git status` after the
+  sweep shows only the intended files.
+
+**Falsification, stages 6-7: 5 mutations, all RED** (16 MiB cap, C-04 type guard, blocking Pause,
+no-op queue lock, synchronous sieve download). One first attempt was rejected as an equivalent
+mutant (it kept the non-string guard while changing its shape) and was replaced by a mutation that
+really drops the guard before being counted.
 
 ---
 

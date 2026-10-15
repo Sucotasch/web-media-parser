@@ -23,10 +23,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 import json
 import os
 import logging
+import threading
 import src.constants as K
 from src.app_paths import settings_path as _settings_path, get_app_dir
 
@@ -38,8 +39,17 @@ class SettingsDialog(QDialog):
     Dialog for application settings
     """
 
+    # C-02: the sieve download runs in a plain thread (it used to block the GUI
+    # for the full HTTP timeout — measured 2 × 30 s). Results come back over
+    # this signal; the connection is made ONCE in __init__ and never inside the
+    # worker, so repeated clicks cannot pile up duplicate connections.
+    # state: "progress" (keep the button disabled) | "done" | "error"
+    sieve_download_status = Signal(str, str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._sieve_download_thread = None
+        self.sieve_download_status.connect(self._on_sieve_download_status)
         self.setWindowTitle("Settings")
         self.resize(600, 700)
 
@@ -549,11 +559,12 @@ class SettingsDialog(QDialog):
 
     def _on_sieve_download(self):
         """C-1: download the sieve from the repository URL (explicit user click)
-        and apply it to the configured sieve file. Runs synchronously on the
-        GUI thread with a bounded timeout — the download is small (~1-2 MB).
-        """
-        from src.parser.site_pattern_manager import SitePatternManager
+        and apply it to the configured sieve file.
 
+        C-02: the HTTP work happens on a worker thread — a slow or hanging
+        mirror used to freeze the dialog (and, with the retry, the whole app)
+        for the full timeout.
+        """
         url = self.sieve_repo_edit.text().strip()
         if not url:
             self.sieve_status_label.setText("Enter a repository URL first.")
@@ -572,6 +583,20 @@ class SettingsDialog(QDialog):
 
         self.sieve_download_btn.setEnabled(False)
         self.sieve_status_label.setText("Downloading…")
+        # C-02: hand the network work to a thread. A reference is kept so the
+        # thread object cannot be collected while it runs.
+        self._sieve_download_thread = threading.Thread(
+            target=self._download_sieve_worker,
+            args=(url, sieve_path),
+            name="SieveDownload",
+            daemon=True,
+        )
+        self._sieve_download_thread.start()
+
+    def _download_sieve_worker(self, url: str, sieve_path: str) -> None:
+        """C-02 worker: HTTP only. Dialog widgets are touched by the slot."""
+        from src.parser.site_pattern_manager import SitePatternManager
+
         try:
             pm = SitePatternManager(
                 enable_built_in=False, imagus_sieve_path=sieve_path)
@@ -579,12 +604,18 @@ class SettingsDialog(QDialog):
             if not ok and url.startswith("https://raw.githubusercontent.com/"):
                 mirror = pm.jsdelivr_mirror(url)
                 if mirror:
-                    self.sieve_status_label.setText("Primary failed — trying jsDelivr mirror…")
+                    self.sieve_download_status.emit(
+                        "progress", "Primary failed — trying jsDelivr mirror…")
                     ok, msg = pm.download_imagus_from_url(mirror)
-            self.sieve_status_label.setText(msg)
-        except Exception as e:
-            self.sieve_status_label.setText(f"Error: {e}")
-        finally:
+            self.sieve_download_status.emit("done" if ok else "error", msg)
+        except Exception as e:  # noqa: BLE001 - reported to the user, not raised
+            logger.error(f"Sieve download failed: {e}", exc_info=True)
+            self.sieve_download_status.emit("error", f"Error: {e}")
+
+    def _on_sieve_download_status(self, state: str, message: str) -> None:
+        """GUI-thread slot for `sieve_download_status`."""
+        self.sieve_status_label.setText(message)
+        if state != "progress":
             self.sieve_download_btn.setEnabled(True)
 
     def browse_log_file(self):

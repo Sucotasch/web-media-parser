@@ -29,6 +29,8 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -145,6 +147,13 @@ class TestSieveDownloadUsesTheVisiblePath(unittest.TestCase):
 
         with patch("src.parser.site_pattern_manager.SitePatternManager", _FakePatternManager):
             dialog._on_sieve_download()
+            # C-02: the download now runs on a worker thread, so wait for its
+            # queued signal before reading what it did.
+            deadline = time.time() + 5
+            while not seen and time.time() < deadline:
+                self.app.processEvents()
+                time.sleep(0.02)
+            self.assertTrue(seen, "the background download never ran")
 
         self.assertEqual(seen.get("path"), widget_path,
                          "the download used the saved path instead of the visible one")
@@ -161,6 +170,148 @@ class TestSieveDownloadUsesTheVisiblePath(unittest.TestCase):
             dialog._on_sieve_download()
 
         pm.assert_not_called()
+        self.assertIn("sieve file", dialog.sieve_status_label.text().lower())
+
+
+class TestSieveDownloadRunsInABackgroundThread(unittest.TestCase):
+    """C-02: `Download latest` must not run HTTP on the GUI thread.
+
+    Measured before the fix: the click performed up to two 30 s HTTP attempts
+    (primary + jsDelivr mirror) synchronously.
+    """
+
+    MAX_CLICK_SECONDS = 0.2
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"PySide6 unavailable: {e}")
+        try:
+            cls.app = QApplication.instance() or QApplication([])
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"Qt could not initialize: {e}")
+
+    def _dialog(self):
+        from src.gui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog()
+        self.addCleanup(dialog.deleteLater)
+        return dialog
+
+    def _tmpdir(self):
+        path = tempfile.mkdtemp(prefix="wmp_gui_")
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    def _wait_for_final_label(self, dialog, timeout=5.0):
+        """Pump the GUI event loop until the worker's queued signal arrives."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.app.processEvents()
+            if dialog.sieve_download_btn.isEnabled():
+                return dialog.sieve_status_label.text()
+            time.sleep(0.02)
+        self.fail("the download never reported back; the button stayed disabled")
+
+    def _ready_dialog(self, dialog):
+        dialog.imagus_sieve_edit.setText(os.path.join(self._tmpdir(), "sieve.json"))
+        dialog.sieve_repo_edit.setText("https://example.com/sieve.json")
+
+    def test_the_click_returns_immediately_and_reports_later(self):
+        dialog = self._dialog()
+        self._ready_dialog(dialog)
+        threads_seen = []
+
+        class _SlowPatternManager:
+            def __init__(self, enable_built_in=False, imagus_sieve_path=None, **kw):
+                pass
+
+            def download_imagus_from_url(self, url, timeout=None):
+                threads_seen.append(threading.get_ident())
+                time.sleep(1.0)          # stands in for the 30 s HTTP timeout
+                return True, "Downloaded 123 rules"
+
+            def jsdelivr_mirror(self, url):
+                return None
+
+        with patch("src.parser.site_pattern_manager.SitePatternManager",
+                   _SlowPatternManager):
+            started = time.perf_counter()
+            dialog._on_sieve_download()
+            elapsed = time.perf_counter() - started
+
+            self.assertLess(elapsed, self.MAX_CLICK_SECONDS,
+                            f"the click blocked for {elapsed:.2f}s")
+            self.assertFalse(dialog.sieve_download_btn.isEnabled())
+            self.assertIn("download", dialog.sieve_status_label.text().lower())
+            final = self._wait_for_final_label(dialog)
+
+        self.assertEqual(final, "Downloaded 123 rules")
+        self.assertTrue(dialog.sieve_download_btn.isEnabled())
+        self.assertTrue(threads_seen, "the download never ran")
+        self.assertNotEqual(threads_seen[0], threading.get_ident(),
+                            "the download still ran on the GUI thread")
+
+    def test_a_failure_is_reported_and_the_button_comes_back(self):
+        dialog = self._dialog()
+        self._ready_dialog(dialog)
+
+        class _FailingPatternManager:
+            def __init__(self, **kw):
+                pass
+
+            def download_imagus_from_url(self, url, timeout=None):
+                raise RuntimeError("connection reset")
+
+        with patch("src.parser.site_pattern_manager.SitePatternManager",
+                   _FailingPatternManager):
+            dialog._on_sieve_download()
+            final = self._wait_for_final_label(dialog)
+
+        self.assertIn("connection reset", final)
+        self.assertTrue(dialog.sieve_download_btn.isEnabled())
+
+    def test_the_jsdelivr_retry_happens_inside_the_worker(self):
+        dialog = self._dialog()
+        dialog.imagus_sieve_edit.setText(os.path.join(self._tmpdir(), "sieve.json"))
+        raw_url = ("https://raw.githubusercontent.com/x/y/main/sieve.json")
+        dialog.sieve_repo_edit.setText(raw_url)
+        attempts = []
+
+        class _MirrorPatternManager:
+            def __init__(self, **kw):
+                pass
+
+            def download_imagus_from_url(self, url, timeout=None):
+                attempts.append(url)
+                if url == raw_url:
+                    return False, "403 rate limit"
+                return True, "Downloaded from jsDelivr"
+
+            def jsdelivr_mirror(self, url):
+                return "https://cdn.jsdelivr.net/gh/x/y@main/sieve.json"
+
+        with patch("src.parser.site_pattern_manager.SitePatternManager",
+                   _MirrorPatternManager):
+            dialog._on_sieve_download()
+            final = self._wait_for_final_label(dialog)
+
+        self.assertEqual(final, "Downloaded from jsDelivr")
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(attempts[1].startswith("https://cdn.jsdelivr.net/"), attempts)
+
+    def test_a_missing_path_starts_no_thread(self):
+        dialog = self._dialog()
+        dialog.imagus_sieve_edit.setText("")
+        dialog.sieve_repo_edit.setText("https://example.com/sieve.json")
+        dialog._sieve_download_thread = "untouched"
+
+        dialog._on_sieve_download()
+
+        self.assertEqual(dialog._sieve_download_thread, "untouched")
         self.assertIn("sieve file", dialog.sieve_status_label.text().lower())
 
 

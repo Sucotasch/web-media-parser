@@ -20,17 +20,49 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = K.EXTENSION_API_PORT  # single source: src/constants (GUI-8)
 
+# C-04: header/cookie payloads come from a browser extension over loopback, but
+# they still must be strings of sane length with no CR/LF (header injection) and
+# no separators that a cookie jar would reject (`;` starts a new cookie).
+MAX_SCALAR_LENGTH = 512
+
+
+def _clean_header_value(value) -> str:
+    """Return a safe single-line string for a header-ish payload, "" for junk."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.replace("\r", "").replace("\n", "").strip()
+    return cleaned[:MAX_SCALAR_LENGTH]
+
+
+def _clean_cookie_value(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.replace("\r", "").replace("\n", "").strip()
+    # A cookie string carries `; ` between pairs — those are expected. Only
+    # control characters are dropped (CR/LF above, everything else non-printable).
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable() or ch == " ")
+    return cleaned[:MAX_SCALAR_LENGTH]
+
 
 class ExtensionServer:
     """Lightweight HTTP API server for browser extension communication."""
 
+    # C-05/NF-6: aiohttp's default client_max_size is 1 MiB, and going over it
+    # surfaced as a bare `Invalid JSON` 400 — a legitimate large batch (measured:
+    # ~9 800 items reach 1 MiB at 107 B/item) was silently refused. 16 MiB covers
+    # any real batch and still bounds what a hostile local client can allocate.
+    MAX_REQUEST_BODY = 16 * 1024 * 1024
+
     def __init__(self, port: int = DEFAULT_PORT):
         self.port = port
-        self._app = web.Application()
+        self._app = web.Application(client_max_size=self.MAX_REQUEST_BODY)
         self._app.router.add_get("/api/status", self._handle_status)
         self._app.router.add_get("/api/queue", self._handle_queue)
         self._app.router.add_post("/api/tasks", self._handle_add_tasks)
         self._app.router.add_options("/api/tasks", self._handle_cors)  # CORS preflight
+        # C-05: report an oversized body as 413 (the intended status) instead of
+        # letting it surface as "Invalid JSON".
+        self._app.middlewares.append(self._body_size_middleware)
 
         # Callbacks set by MainWindow
         self.add_tasks_callback: Optional[Callable] = None  # (urls: list[dict], one_shot: bool) -> None
@@ -42,6 +74,33 @@ class ExtensionServer:
         # C-01: the last start failure, so the GUI can tell the user why the
         # extension is unreachable (None = started fine / not tried yet).
         self.start_error: Optional[str] = None
+
+    @web.middleware
+    async def _body_size_middleware(self, request, handler):
+        """C-05: a body over MAX_REQUEST_BODY gets 413, not a confusing 400.
+
+        Two entry points on purpose: a declared `Content-Length` is refused
+        before a single body byte is read, and a body without one (chunked) is
+        refused by aiohttp's own limit while it accumulates. The handler has to
+        re-raise that exception — its catch-all `except Exception` around
+        `request.json()` used to turn the size rejection into "Invalid JSON" 400.
+        """
+        declared = request.content_length
+        if declared is not None and declared > self.MAX_REQUEST_BODY:
+            return self._too_large(request, declared)
+        try:
+            return await handler(request)
+        except web.HTTPRequestEntityTooLarge as e:
+            return self._too_large(request, getattr(e, "actual_size", None))
+
+    def _too_large(self, request, actual_size=None):
+        logger.warning(
+            f"Rejected oversized request body from {request.remote} "
+            f"(actual {actual_size} bytes, limit {self.MAX_REQUEST_BODY})")
+        return web.json_response(
+            {"error": f"Request body too large (limit {self.MAX_REQUEST_BODY} bytes)"},
+            status=413, headers=self._cors_headers(request),
+        )
 
     def set_callbacks(self, add_tasks, get_status):
         """Set callbacks for task management (called from GUI thread)."""
@@ -151,6 +210,8 @@ class ExtensionServer:
 
         try:
             body = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise  # C-05: the size middleware answers 413; a 400 would misreport it
         except Exception:
             return web.json_response({"error": "Invalid JSON"}, status=400, headers=self._cors_headers(request))
 
@@ -161,9 +222,15 @@ class ExtensionServer:
             u for u in urls
             if isinstance(u, dict) and isinstance(u.get("url"), str) and u["url"].strip()
         ]
+        # C-04: `urls` was validated item by item while the three scalars were
+        # trusted. Their type is load-bearing: `{"user_agent": 5}` reached
+        # aiohttp's header machinery as a TypeError, and a non-str cookie string
+        # landed in the task snapshot / settings file as-is.
         one_shot = body.get("one_shot", False)
-        user_agent = body.get("user_agent", "")
-        cookies = body.get("cookies", "")
+        if not isinstance(one_shot, bool):
+            one_shot = bool(one_shot)
+        user_agent = _clean_header_value(body.get("user_agent", ""))
+        cookies = _clean_cookie_value(body.get("cookies", ""))
 
         if not urls:
             return web.json_response({"error": "No valid URLs provided"}, status=400, headers=self._cors_headers(request))

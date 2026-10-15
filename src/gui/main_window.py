@@ -163,8 +163,11 @@ class MainWindow(QMainWindow):
         self.task_queue = TaskQueueManager(self.download_dir)
 
         # A-5: payloads computed on the HTTP thread, materialized on the GUI
-        # thread (see _updateUiFromExtension).
+        # thread (see _updateUiFromExtension). C-08: the list is written by the
+        # HTTP thread and drained by the GUI thread, so it has its own lock —
+        # the swap in _drain_pending_extension_payloads must not race an append.
         self._pending_extension_payloads = []
+        self._payload_lock = threading.Lock()
 
         # Periodic timer to update active task stats during download
         self._stats_timer = QTimer(self)
@@ -738,7 +741,8 @@ class MainWindow(QMainWindow):
 
         # A-5 follow-up: drop any unmaterialized extension payloads — the user
         # just asked to clear everything.
-        self._pending_extension_payloads = []
+        with self._payload_lock:
+            self._pending_extension_payloads = []
 
         # Clear task queue.
         # F-02: this used to clear the manager's private queue list and null its
@@ -951,18 +955,9 @@ class MainWindow(QMainWindow):
         active.mark_paused()
         self._update_task_row(active.id)
 
-        # 2. Save State
-        try:
-            if pm.loop and not pm.loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(
-                    pm.save_state(active.download_path), pm.loop
-                )
-                future.result(timeout=15)
-        except Exception as e:
-            self.log_handler.error(f"Error saving state on switch: {e}")
-
-        # 3. Signal stop (non-blocking — task_ended will see PAUSED status)
-        pm.stop_parsing()
+        # 2. C-07: save then stop, both on the parser loop (the GUI thread used
+        #    to block here for up to 15 s before the switch could proceed).
+        self._save_then_stop(pm, active.download_path)
 
         # 4. Free active slot
         self.task_queue.clear_active()
@@ -1060,6 +1055,39 @@ class MainWindow(QMainWindow):
         self.parser_manager.status_updated.connect(self.update_status)
         self.parser_manager.task_ended.connect(self.on_task_ended)
 
+    def _save_then_stop(self, pm, download_path: str) -> None:
+        """C-07: save the session on the parser loop, THEN stop the task.
+
+        The pause path used to be `run_coroutine_threadsafe(...).result(timeout=15)`
+        executed ON the GUI thread — measured 5.47 s of a frozen window while a
+        download was active, which is what "Pause" must never do.
+
+        The save still has to finish before the loop dies: an abandoned
+        `state.pkl` cannot be resumed, so the stop is chained AFTER it inside
+        the loop instead of being fired side by side from the GUI thread. This
+        returns immediately; `task_ended` reports the actual end.
+        """
+        if pm is None:
+            return
+        loop = getattr(pm, "loop", None)
+        if loop is None or loop.is_closed():
+            # No loop to save on (already torn down) — just stop.
+            pm.stop_parsing()
+            return
+
+        async def _save_then_stop_on_loop() -> None:
+            try:
+                await pm.save_state(download_path)
+            except Exception as e:
+                # The task still has to stop (otherwise Pause leaves it
+                # running), but the user must see that the session is lost.
+                self.log_handler.error(f"Error saving state on pause: {e}")
+                logger.error(f"Error saving state on pause: {e}", exc_info=True)
+            finally:
+                pm.stop_parsing()
+
+        asyncio.run_coroutine_threadsafe(_save_then_stop_on_loop(), loop)
+
     def toggle_pause(self):
         """Pause active task or Resume selected task."""
         selected = self._get_selected_task()
@@ -1083,25 +1111,16 @@ class MainWindow(QMainWindow):
         active.mark_paused()
         self._update_task_row(active.id)
 
-        # 2. Save State
-        try:
-            if self.parser_manager.loop and not self.parser_manager.loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(
-                    self.parser_manager.save_state(active.download_path), self.parser_manager.loop
-                )
-                future.result(timeout=15)
-                self.log_handler.info(f"State saved for {active.id}")
-        except Exception as e:
-            self.log_handler.error(f"Error saving state on pause: {e}")
+        # 2. C-07: hand the save (and the stop that follows it) to the parser
+        #    loop — the GUI thread no longer waits for it.
+        self._save_then_stop(self.parser_manager, active.download_path)
 
-        # 3. Signal stop (non-blocking — sets _stop_event via call_soon_threadsafe)
-        self.parser_manager.stop_parsing()
-
-        # 4. Update UI immediately — don't block on thread cleanup
-        #    on_task_ended() will handle parser_thread cleanup asynchronously
+        # 3. Update UI immediately — don't block on thread cleanup.
+        #    on_task_ended() sees the PAUSED status, so it will not overwrite it,
+        #    and it does the parser_thread cleanup asynchronously.
         self.task_queue.clear_active()
         self.update_ui_state(False)
-        self.status_bar.showMessage("Task paused")
+        self.status_bar.showMessage("Pausing… saving state in background")
         self._update_start_button_state()
 
     def stop_parsing(self):
@@ -1259,6 +1278,18 @@ class MainWindow(QMainWindow):
                     self._launch_parser_for_task(next_task)
                     self.status_bar.showMessage(f"Auto-started: {next_task.url}")
 
+    def _drain_pending_extension_payloads(self) -> list:
+        """C-08: atomically take the payloads buffered by the HTTP thread.
+
+        The old `payloads, self._pending_extension_payloads = (list, [])`
+        tuple swap could drop an append that landed between the read and the
+        rebind, and a payload dropped at window close was never materialized.
+        """
+        with self._payload_lock:
+            payloads, self._pending_extension_payloads = (
+                self._pending_extension_payloads, [])
+        return payloads
+
     def _start_extension_server(self):
         """Start the HTTP API server for browser extension communication."""
         def add_tasks_from_extension(urls, one_shot=False, user_agent="", cookies=""):
@@ -1277,7 +1308,8 @@ class MainWindow(QMainWindow):
             payload = build_extension_task_payload(
                 urls, settings, self.download_dir, one_shot=one_shot)
             if payload is not None:
-                self._pending_extension_payloads.append(payload)
+                with self._payload_lock:
+                    self._pending_extension_payloads.append(payload)
                 added = payload["added"]
 
             # GUI-1/A-5: hand the payload to the GUI thread via a signal. The
@@ -1287,11 +1319,15 @@ class MainWindow(QMainWindow):
             return {"added": added}
 
         def get_status():
-            active = self.task_queue.active_task
+            # C-08: this runs on the HTTP thread while the GUI thread mutates
+            # the queue. Three separate reads used to mix states (queue length
+            # from before an insert, active task from after a start); the
+            # manager's lock gives one consistent snapshot instead.
+            snap = self.task_queue.snapshot()
             return {
-                "active_task": active.id if active else None,
-                "queue_length": len(self.task_queue.queue),
-                "files_downloaded": active.stats.get("files_downloaded", 0) if active else 0,
+                "active_task": snap["active_task_id"],
+                "queue_length": snap["queue_length"],
+                "files_downloaded": snap["files_downloaded"],
             }
 
         self.extension_server.set_callbacks(add_tasks_from_extension, get_status)
@@ -1328,9 +1364,7 @@ class MainWindow(QMainWindow):
         # the HTTP thread BEFORE saving the queue — otherwise tasks requested
         # seconds before shutdown are silently lost.
         try:
-            payloads, self._pending_extension_payloads = (
-                self._pending_extension_payloads, [])
-            for payload in payloads:
+            for payload in self._drain_pending_extension_payloads():
                 self._apply_extension_task_payload(payload)
         except Exception as e:
             self.log_handler.error(f"Error materializing extension payloads on close: {e}")
@@ -1348,6 +1382,9 @@ class MainWindow(QMainWindow):
                 active = self.task_queue.active_task
                 if active and pm.loop and not pm.loop.is_closed():
                     self.status_bar.showMessage("Saving state and stopping task...")
+                    # C-07 note: unlike Pause, closing the window MAY block —
+                    # the process is about to exit, so a background save would
+                    # simply be lost. The wait is bounded (5 s).
                     try:
                         future = asyncio.run_coroutine_threadsafe(
                             pm.save_state(active.download_path), pm.loop
@@ -1408,9 +1445,7 @@ class MainWindow(QMainWindow):
         auto-start an extension one-shot task if the queue is idle, then
         refresh the task table (GUI-1 — connected to extension_tasks_added,
         emitted from the HTTP server thread)."""
-        payloads, self._pending_extension_payloads = (
-            self._pending_extension_payloads, [])
-        for payload in payloads:
+        for payload in self._drain_pending_extension_payloads():
             applied_task_id = self._apply_extension_task_payload(payload)
             if payload.get("one_shot") and not task_id:
                 task_id = applied_task_id or ""
