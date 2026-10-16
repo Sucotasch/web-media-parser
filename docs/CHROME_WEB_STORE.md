@@ -112,6 +112,6 @@ Google Web Store requires:
 
 From the project root in PowerShell:
 ```powershell
-Compress-Archive -Path extension\* -DestinationPath WebMediaParser_extension_v1.3.1.zip -Force
+Compress-Archive -Path extension\* -DestinationPath WebMediaParser_extension_v1.4.0.zip -Force
 ```
-Upload `WebMediaParser_extension_v1.3.1.zip` to the [Chrome Developer Dashboard](https://chrome.google.com/webstore/devconsole).
+Upload `WebMediaParser_extension_v1.4.0.zip` to the [Chrome Developer Dashboard](https://chrome.google.com/webstore/devconsole).

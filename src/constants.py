@@ -6,7 +6,7 @@ Global constants for the Web Media Parser application.
 """
 
 # Application version (single source of truth — used by main.py and setup.py)
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 
 # Localhost port for the browser-extension HTTP API (ExtensionServer).
 # Mirrored in extension/background.js API_BASE (JS cannot import Python).
