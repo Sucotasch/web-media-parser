@@ -65,6 +65,51 @@ def _safe_domain_folder(netloc: str, fallback: str) -> str:
     return host or fallback
 
 
+# s8 guard: a folder name Windows refuses must be caught while the payload is
+# still pure — a task materialized later fails silently (NF-11). Today the
+# sanitizer cannot produce such a name, so this cannot fire; it is here so a
+# future regression surfaces as an honest "nothing added" instead of a task
+# that vanishes after the HTTP reply said ok:true.
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _folder_name_is_safe(name: str) -> bool:
+    """True when `name` is a legal, unambiguous Windows path component."""
+    if not name or name != name.strip(" .") or _ILLEGAL_PATH_CHARS.search(name):
+        return False
+    return name.split(".", 1)[0].upper() not in _WINDOWS_RESERVED_NAMES
+
+
+def apply_extension_payloads(payloads, apply_one, on_error):
+    """s8: materialize every buffered extension payload independently.
+
+    The payloads are drained by the GUI thread and each one creates a folder and
+    a queue entry. Before this, ANY exception inside one payload propagated out
+    of the Qt slot: the remaining payloads were lost with it (they had already
+    been drained), and the only trace was a PySide6 traceback on stderr —
+    invisible in a --windowed build, while the extension had been told ok:true
+    (NF-11). One bad payload must not take the batch down.
+
+    Returns `(payload, result)` pairs for the payloads that succeeded (the
+    caller still needs the payload to know whether it was a one-shot);
+    `on_error(payload, exc)` is called once per failure.
+    """
+    applied = []
+    for payload in payloads:
+        try:
+            applied.append((payload, apply_one(payload)))
+        except Exception as e:  # noqa: BLE001 — isolation is the point of this loop
+            try:
+                on_error(payload, e)
+            except Exception:
+                logger.exception("extension payload error handler failed")
+    return applied
+
+
 def build_extension_task_settings(base_settings, user_agent="", cookies=""):
     """A-2: one-shot settings for an extension task.
 
@@ -101,6 +146,9 @@ def build_extension_task_payload(urls, settings, download_dir, one_shot=False, t
         except IndexError:
             domain = "extension"
         task_folder = f"{domain}_{ts}"
+        if not _folder_name_is_safe(task_folder):
+            logger.error(f"Refusing an uncreatable task folder name: {task_folder!r}")
+            return None
         download_path = os.path.join(download_dir, task_folder)
         items = []
         for item in urls:
@@ -148,7 +196,11 @@ def build_extension_task_payload(urls, settings, download_dir, one_shot=False, t
             domain = _safe_domain_folder(url.split("/")[2], "unknown")
         except IndexError:
             domain = "unknown"
-        tasks.append((url, settings, os.path.join(download_dir, f"{domain}_{ts}")))
+        folder = f"{domain}_{ts}"
+        if not _folder_name_is_safe(folder):
+            logger.error(f"Skipping an uncreatable task folder name: {folder!r}")
+            continue
+        tasks.append((url, settings, os.path.join(download_dir, folder)))
     if not tasks:
         return None
     return {"one_shot": False, "tasks": tasks, "added": len(tasks)}
@@ -1316,7 +1368,6 @@ class MainWindow(QMainWindow):
         """Start the HTTP API server for browser extension communication."""
         def add_tasks_from_extension(urls, one_shot=False, user_agent="", cookies=""):
             """Callback: add tasks from extension to queue. Runs in HTTP thread."""
-            added = 0
             auto_start_id = ""  # one-shot task to auto-start on the GUI thread (GUI-1)
             # A-2: build an independent copy — the dialog's live settings dict
             # must never be mutated from the HTTP thread.
@@ -1329,16 +1380,21 @@ class MainWindow(QMainWindow):
             # materialization happens in _apply_extension_task_payload.
             payload = build_extension_task_payload(
                 urls, settings, self.download_dir, one_shot=one_shot)
-            if payload is not None:
-                with self._payload_lock:
-                    self._pending_extension_payloads.append(payload)
-                added = payload["added"]
+            if payload is None:
+                # s8: nothing usable — do NOT claim success. The handler merges
+                # this dict over its own {"ok": True}, and the popup already
+                # renders resp.error; before this the badge said "✓ Sent to app"
+                # for a request that queued nothing.
+                logger.warning(f"Extension request produced no task ({len(urls)} item(s))")
+                return {"ok": False, "added": 0, "error": "Nothing usable to send"}
+            with self._payload_lock:
+                self._pending_extension_payloads.append(payload)
 
             # GUI-1/A-5: hand the payload to the GUI thread via a signal. The
             # aiohttp worker thread has no Qt event loop and must not mutate
             # TaskQueueManager directly.
             self.extension_tasks_added.emit(auto_start_id)
-            return {"added": added}
+            return {"added": payload["added"]}
 
         def get_status():
             # C-08: this runs on the HTTP thread while the GUI thread mutates
@@ -1467,8 +1523,21 @@ class MainWindow(QMainWindow):
         auto-start an extension one-shot task if the queue is idle, then
         refresh the task table (GUI-1 — connected to extension_tasks_added,
         emitted from the HTTP server thread)."""
-        for payload in self._drain_pending_extension_payloads():
-            applied_task_id = self._apply_extension_task_payload(payload)
+        def _on_payload_error(payload, exc):
+            # s8: the payload is gone by now (it was drained), so this message is
+            # the only record the user gets. Keep it in the GUI log AND on screen.
+            detail = payload.get("task_folder") or payload.get("task_url")
+            if not detail:
+                tasks = payload.get("tasks") or []
+                detail = f"{len(tasks)} task(s)" if tasks else "?"
+            self.log_handler.error(f"Extension task was not created ({detail}): {exc}")
+            self.status_bar.showMessage(f"Extension task failed: {exc}", 8000)
+
+        for payload, applied_task_id in apply_extension_payloads(
+            self._drain_pending_extension_payloads(),
+            self._apply_extension_task_payload,
+            _on_payload_error,
+        ):
             if payload.get("one_shot") and not task_id:
                 task_id = applied_task_id or ""
         if task_id and self.task_queue.active_task is None:

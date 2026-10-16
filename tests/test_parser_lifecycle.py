@@ -28,7 +28,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from src.parser.parser_manager import ParserManager
 from src.parser.priority_url_queue import PriorityURLQueue
-from src.gui.main_window import build_extension_task_settings, build_extension_task_payload
+from src.gui.main_window import (
+    apply_extension_payloads, build_extension_task_settings,
+    build_extension_task_payload, _folder_name_is_safe,
+)
 from src import constants as K
 
 from helpers import MockGUILogHandler
@@ -237,6 +240,64 @@ class TestExtensionPayloadBuffering(unittest.TestCase):
         self.assertNotIn(":", os.path.basename(download_path))
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, os.path.basename(download_path)))
+
+
+class TestExtensionPayloadIsolation(unittest.TestCase):
+    """s8: a payload that fails to materialize must not silently take the rest
+    of the drained batch with it (it used to raise out of the Qt slot, leaving
+    only a stderr traceback while the extension had been told ok:true)."""
+
+    def test_one_failed_payload_keeps_the_others(self):
+        payloads = [{"tag": "a"}, {"tag": "boom"}, {"tag": "c"}]
+        applied, errors = [], []
+
+        def apply_one(payload):
+            if payload["tag"] == "boom":
+                raise NotADirectoryError(267, "not a directory")
+            applied.append(payload["tag"])
+            return payload["tag"].upper()
+
+        result = apply_extension_payloads(
+            payloads, apply_one, lambda p, e: errors.append((p["tag"], type(e))))
+
+        self.assertEqual(applied, ["a", "c"], "the healthy payloads must still run")
+        self.assertEqual([p["tag"] for p, _ in result], ["a", "c"])
+        self.assertEqual([r for _, r in result], ["A", "C"])
+        self.assertEqual(errors, [("boom", NotADirectoryError)])
+
+    def test_a_broken_error_handler_still_does_not_break_the_batch(self):
+        def apply_one(payload):
+            raise ValueError("materialization failed")
+
+        def on_error(payload, exc):
+            raise RuntimeError("the error handler is broken too")
+
+        # Defined here rather than asserted on a mock: the point is only that
+        # the batch returns normally and no exception escapes to the caller.
+        self.assertEqual(
+            apply_extension_payloads([{"tag": "a"}, {"tag": "b"}],
+                                     apply_one, on_error),
+            [])
+
+    def test_folder_guard_rejects_names_windows_cannot_create(self):
+        for bad in ["", "  ", "trailing .", "a|b", 'a:b', "a\\b", "con", "NUL", "lpt1"]:
+            self.assertFalse(_folder_name_is_safe(bad), f"accepted {bad!r}")
+        for good in ["example_com_20260101_000000", "127_0_0_1_20260101_000000",
+                     "console_1", "_x_"]:
+            self.assertTrue(_folder_name_is_safe(good), f"rejected {good!r}")
+
+    def test_payload_is_none_when_the_folder_guard_cannot_be_satisfied(self):
+        # The sanitizer cannot produce an illegal component today — the guard is
+        # a provocation: patch it to return one and the payload must refuse to
+        # be built, so the HTTP reply stops claiming ok:true for a task that
+        # would vanish at materialization (NF-11).
+        with patch("src.gui.main_window._safe_domain_folder", return_value="bad:name"):
+            self.assertIsNone(build_extension_task_payload(
+                [{"url": "https://img.example/a.jpg", "referer": "https://page.example/g"}],
+                {}, "dl", one_shot=True, timestamp="20260101_000000"))
+            self.assertIsNone(build_extension_task_payload(
+                [{"url": "https://page.example/g"}],
+                {}, "dl", one_shot=False, timestamp="20260101_000000"))
 
 
 class TestMainTaskEmitsFailedOnPreCrash(unittest.TestCase):

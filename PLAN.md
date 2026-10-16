@@ -9,7 +9,7 @@ No item starts before its gate is written here. New defects found during work ar
 immediately, never ignored. Baseline: `7bac98b` (2026-09-09), 265 passed / 30 skipped at that commit; re-measured 2026-10-15 on the current tree: 494 passed / 30 skipped.
 
 The defect plan built on the 2026-10-15 audit is `Audit/FIXPLAN_2026-10-15.md`; its stages and gates
-live in `GATES.2026-10-15.md` — **stages 0-8 all met** (0 unmet, 0 abandoned); current tree: 494
+live in `GATES.2026-10-15.md` — **stages 0-8 all met** (0 unmet, 0 abandoned); current tree: 498
 passed / 30 skipped, node 15/15, `node --check` clean, the ruff selection green, and `dist/`
 rebuilt + smoke-run from the frozen exe (G-8-4). The two live-Chrome checks were MEASURED with the
 `ext-dev-loop` harness later the same day (G-5-LIVE), and that loop then found a real defect on the
@@ -265,9 +265,10 @@ Plus one-shot `logger.warning` on first `verify=False` fetch per process (patter
   TestExtensionPayloadBuffering::test_extension_payload_folder_is_a_legal_path_{one_shot,batch}`),
   green after the fix (494 passed). Live re-verification on the rebuilt `dist/`: the same POST
   created and auto-started the task (`active_task: 92cb3615e780`, `queue_length: 1`), the popup path
-  added its own task, and the app's crawl reported `Images found: 3`. **Left open deliberately:** the
-  Qt slot still has no error channel, so any future exception there is lost the same silent way —
-  candidate follow-up, not part of this fix.
+  added its own task, and the app's crawl reported `Images found: 3`. **Was left open deliberately:** the
+  Qt slot still had no error channel, so any future exception there would be lost the same silent way —
+  closed on 2026-10-16 by G-8-6 (slot-level isolation + in-app error report + `ok:false` when nothing
+  was queued + a pure `_folder_name_is_safe` guard; live-measured, 498 passed / 30 skipped).
 
 - [2026-09-09, planning] Audit.md C-2 premise incorrect: Mod's `loop` is recursive re-resolution
   with a bitmask (`loop & 1` link-side, `loop & 2` img-side, ≤5 hops, self-ref protection),

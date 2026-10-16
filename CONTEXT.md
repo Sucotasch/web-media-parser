@@ -218,7 +218,7 @@ web-media-parser/
 ## 8. Тесты
 
 ```bash
-python -m pytest tests -q    # 494 passed, 30 skipped (2026-10-15)
+python -m pytest tests -q    # 498 passed, 30 skipped (2026-10-16)
 for f in extension/tests/*.test.mjs; do node "$f"; done   # 15/15 ALL PASS
 
 > **Что лежит в state-файле (A-02, продуктовое решение 2026-10-15).** `last_session.pkl` — обычный pickle в каталоге загрузки: он содержит очереди URL/загрузок, статистику, health домена и **cookie, выученные на gateway/age-gate страницах** (в открытом виде). Шифрования и фильтрации кредов здесь нет намеренно: контур локальный и доверенный (однопользовательский инструмент, cookie из браузера самого пользователя), а вырезание cookie при персисте ломало бы resume на age-gate/авторизованных сайтах (`Close window` → Pause + save queue → перезапуск вернул бы consent-страницу). Не выкладывайте каталог загрузок в публичный архив/репозиторий.

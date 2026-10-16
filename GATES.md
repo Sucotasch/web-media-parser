@@ -1,6 +1,6 @@
 # GATES.md — Fix & Feature Execution Ledger (2026-09-09)
 
-Baseline: `7bac98b` (2026-09-09) — 265 passed / 30 skipped at that commit; the same command on the 2026-10-15 tree is **494 passed / 30 skipped** (E-06: the number was originally quoted without a date). Each gate = one observable outcome.
+Baseline: `7bac98b` (2026-09-09) — 265 passed / 30 skipped at that commit; the same command on the 2026-10-16 tree is **498 passed / 30 skipped** (E-06: the number was originally quoted without a date). Each gate = one observable outcome.
 > E-07 (2026-10-15): three pairs below were unrunnable as written (they named a file
 > that never contained the test, expected `1 passed` where the file has 3, and used a
 > ruff selection that misses `E401`). They are corrected in place; the tree at that

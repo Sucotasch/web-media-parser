@@ -8,7 +8,7 @@ against the combined output. Format follows `GATES.md`.
 stage 4 — 8/8 met; stage 5 — 11/11 met (the 2 live-Chrome items were MEASURED later the same day,
 see G-5-LIVE); stage 6 — 1/1 met; stage 7 — 4/4 met; stage 8 — 6/6 met (+ the stage sweeps), plus
 the live browser↔app loop (G-8-LIVE) and one defect it found and fixed live (G-8-5 / NF-11).
-0 unmet, 0 abandoned. Measured values below; current tree `494 passed / 30 skipped`, node 15/15.**
+0 unmet, 0 abandoned. Measured values below; current tree `498 passed / 30 skipped`, node 15/15.**
 
 Stage 0 is gates-and-tests only (FIXPLAN_2026-10-15 §3/Этап 0): no production behaviour is
 changed, so every item below is either a new test, a packaging rule, or a doc correction.
@@ -879,10 +879,59 @@ executor pools and constants, a rebuilt `dist/`, and the final sweep. Only F-07 
   task in `task_queue.json` and **no traceback** in the app's stderr; the popup path then added its
   own task. The app's crawl of the fixture reported `Images found: 3 … Skipped: 3` — skipped by the
   app's own 40 KB default, because the fixture PNGs are ~0.5 KB (fixture limitation, not a defect).
-- STILL OPEN (observation, not fixed): the slot has no error channel. Any exception in
-  `_apply_extension_task_payload` still loses the task after the HTTP reply said `ok: true`; NF-11
-  was invisible for exactly that reason. Candidate follow-up: catch in the slot and report back
-  (log + status), so the next such failure is not silent.
+- WAS OPEN (observation at the time): the slot had no error channel — any exception in
+  `_apply_extension_task_payload` lost the task while the HTTP reply had already said `ok: true`.
+  That was the reason NF-11 stayed invisible for a whole session. Closed by **G-8-6** below.
+
+### G-8-6 · NF-11 closure — the slot has an error channel (2026-10-16)
+- ID: **NF-11 (residual) / s8**. The sanitizer fix (G-8-5) removed the *known* way to make the
+  folder uncreatable; it did not change the fact that the Qt slot was the only place the failure
+  could appear — `_updateUiFromExtension` was connected to `extension_tasks_added` with **no error
+  channel**, so a raise there (a) printed a PySide6 traceback to stderr, which the frozen
+  `--windowed` build discards, and (b) still told the extension `ok: true`.
+- DECISION (this is the design, not an accident): the slot now reports the failure in-app
+  (GUI log + status bar), and the HTTP reply stops claiming success when the request produced **no
+  task at all**. A full acknowledgement contract (the HTTP reply waiting for GUI-thread
+  materialization) is deliberately **not** built: it would make the payload carry an event, force
+  the aiohttp handler to wait on the GUI thread, and add a close-window/timing decision list — for
+  a loop where the same human is looking at the app that now shows the error. Trigger to revisit:
+  an unattended extension-only workflow (no visible app).
+- FIX: `src/gui/main_window.py` — (1) `apply_extension_payloads()` materializes each drained
+  payload in its own `try/except`, so one bad payload no longer takes the rest of the batch with it;
+  (2) the slot's `on_error` writes `Extension task was not created (<folder>): <reason>` to the GUI
+  log and the status bar; (3) `add_tasks_from_extension` returns `{"ok": false, "error": …}` when
+  the payload is `None` (the handler spreads it over its own `{"ok": true}`), and the popup already
+  renders `resp.error`; (4) `_folder_name_is_safe()` guards both payload branches — a pure
+  invariant check (illegal characters, Windows reserved device names) that cannot fire while the
+  sanitizer is correct.
+- CHECK: `python -m pytest tests/test_parser_lifecycle.py tests/test_gui_wiring.py tests/test_http_server.py tests/test_queue_thread_safety.py -q`
+- EXPECT: green, including the four new `TestExtensionPayloadIsolation` tests (one failing payload
+  leaves the others applied; a broken error handler still cannot escape; the guard rejects
+  `con`/`lpt1`/`a:b`/`trailing .`/empty; a patched sanitizer that returns `bad:name` makes
+  `build_extension_task_payload` return `None` for both branches).
+- RESULT: **MET** — `56 passed` (exit 0); full suite `498 passed, 30 skipped` (was 494/30; +4).
+  Live on the **source** app (`python main.py`, port 19876, a scratch download dir):
+  (a) nothing usable (`ftp://` only) → `{"ok": false, "added": 0, "error": "Nothing usable to
+  send"}` — before this change the same request answered `{"ok": true, "added": 0}`;
+  (b) happy path `{"ok": true, "added": 1}`, folder `127_0_0_1_20261015_201220` created, task in
+  `/api/status` — no regression;
+  (c) with the download dir replaced by a **file** (deterministic `WinError 3` in `os.makedirs`),
+  the POST still answers `ok: true` (the accepted limit of this design) but the app log now carries
+  `ERROR - Extension task was not created (127_0_0_1_20261015_201232): [WinError 3] …` and the app
+  stays up with its queue intact (failed task absent, `queue_length` unchanged);
+  (d) two POSTs back-to-back while broken → **two** independent error lines, i.e. the second payload
+  is no longer lost with the first — the exact regression class this closes;
+  (e) after restoring the dir, another POST returns `ok: true` and creates its folder.
+- LIMIT (stated, not implied):
+  1. The extension still cannot learn that **materialization** failed — A is a visibility fix, not an
+     acknowledgement; only the app shows the reason. `ok:false` covers the narrower case
+     "the request produced no task at all".
+  2. The popup renders that case (`popup.js:641` for `one_shot:false`, `:685` for `one_shot:true` —
+     both test `resp.error` before `resp.ok`; verified by reading the code plus the live response
+     body from (a), not by clicking the popup). The **keyboard** path does not: `background.js`
+     `send-desktop` ignores `sendToDesktop()`'s result and always badges a green `✓`. It sends the
+     active tab's URL, so the only way to reach the new refusal there is a non-`http(s)` tab; the
+     stale success badge on that path is pre-existing and untouched by this change.
 
 ### G-8-FULL · Stage 8 regression sweep
 - CHECK: `python -m pytest tests -q`; every `extension/tests/*.test.mjs`; `node --check` on all six
