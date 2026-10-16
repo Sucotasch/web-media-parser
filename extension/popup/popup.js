@@ -28,6 +28,18 @@ const domainFilter = document.getElementById("domain-filter");
 const sourceFilter = document.getElementById("source-filter");
 const chromeDownloadBtn = document.getElementById("chrome-download-btn");
 const chromeCountSpan = document.getElementById("chrome-count");
+
+// ERR-9: a bucket item whose URL was PROVEN not to be media (404/410, or a 2xx
+// text/* answer) is not part of "Full size": the count on the buttons and what
+// Chrome saves must describe the same set. Measured on reactor.cc/post/6382634:
+// 9 promised rows included i.li.ru/ext/.../disney_33.jpg (404 text/html) and the
+// save ended "Saved 8 of 9 (1 failed)". "unknown" is deliberately NOT filtered —
+// that is a probe that could not answer (403/timeout), which is what
+// hotlink-protected hosts return for real images; dropping those would lose
+// real media silently.
+function isNotMedia(item) {
+  return !!item && item.mediaVerdict === "not-media";
+}
 const deepParseWarning = document.getElementById("deep-parse-warning");
 const concurrentLimitInput = document.getElementById("concurrent-limit");
 
@@ -198,7 +210,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
       // "media found"; surface that count too so the numbers mean something (Errors.txt #2).
       scanBtn.textContent = p.phase === "links" && p.total > 0
         ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
-        : "Scanning...";
+        : p.phase === "verify"
+          ? "Checking media..."
+          : "Scanning...";
     } else if (p.status === "error") {
       showError(`Scan failed: ${p.error || "unknown error"}`);
       scanBtn.disabled = false;
@@ -227,9 +241,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
 function applyScanResult(result) {
   mediaItems.length = 0;
   mediaItems.push(...result.media);
-  pageInfoDiv.textContent = result.title || result.pageUrl || "";
+  // ERR-9: explain the verification in one line — a shorter list than before
+  // must read as "these were checked out", not as missing media.
+  const v = result.verdicts || null;
+  const vParts = [];
+  if (v && v.notMedia) vParts.push(`${v.notMedia} non-media hidden`);
+  if (v && v.unknown) vParts.push(`${v.unknown} unconfirmed`);
+  const vNote = vParts.join(" \u00B7 ");
+  pageInfoDiv.textContent = [result.title || result.pageUrl || "", vNote].filter(Boolean).join(" \u00B7 ");
   // The line is ellipsized at 480px; keep the full value reachable.
-  pageInfoDiv.title = [result.title, result.pageUrl].filter(Boolean).join("\n");
+  pageInfoDiv.title = [result.title, result.pageUrl, vNote].filter(Boolean).join("\n");
   pageInfoDiv.classList.remove("hidden");
   populateDomainFilter();
   // Fallback to "all" if no fullsize sources found
@@ -320,7 +341,9 @@ async function restoreScanState() {
       scanBtn.disabled = true;
       scanBtn.textContent = p.phase === "links" && p.total > 0
         ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
-        : "Scanning...";
+        : p.phase === "verify"
+          ? "Checking media..."
+          : "Scanning...";
     }
     if (stored.scanResult && stored.scanResult.tabId === (tab && tab.id)) {
       applyScanResult(stored.scanResult);
@@ -365,7 +388,7 @@ function renderMediaList() {
 
   const filtered = mediaItems.filter((item) => {
     if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
-    if (activeSourceFilter === "fullsize" && !FULLSIZE_SOURCES.has(item.source)) return false;
+    if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
     if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
     return true;
   });
@@ -466,6 +489,17 @@ function renderMediaList() {
       metaDiv.appendChild(sourceSpan);
     }
 
+    // ERR-9: the probe could not answer (403/timeout/no content-type). The row
+    // stays — it may well be real media behind hotlink protection — but it must
+    // not look confirmed.
+    if (item.mediaVerdict === "unknown") {
+      const unknownSpan = document.createElement("span");
+      unknownSpan.className = "verdict-unknown";
+      unknownSpan.textContent = " \u00B7 ?";
+      unknownSpan.title = "Not confirmed as media: the host did not answer the check";
+      metaDiv.appendChild(unknownSpan);
+    }
+
     // Domain tag
     const domainSpan = document.createElement("span");
     domainSpan.className = "domain-tag";
@@ -515,7 +549,7 @@ function updateCount() {
 
   const total = mediaItems.filter((item) => {
     if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
-    if (activeSourceFilter === "fullsize" && !FULLSIZE_SOURCES.has(item.source)) return false;
+    if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
     if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
     return true;
   }).length;
@@ -570,7 +604,9 @@ chromeDownloadBtn.addEventListener("click", async () => {
           // ERR-5: "link-direct" items were network-verified during the scan
           // (processLink fetched them and saw image/video) — the background
           // skips the resolve round-trip so downloads start immediately.
-          verified: item.source === "link-direct",
+          // ERR-9: items the scan verified as media carry `verified: true` —
+          // the background then skips its resolve round-trip entirely.
+          verified: item.verified === true || item.source === "link-direct",
         });
       }
     });

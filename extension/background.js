@@ -773,7 +773,23 @@ async function handleStartScan(tabId) {
       media = [...bestByUrl.values()];
     }
 
-    const result = { media, pageUrl, title: response.title || pageUrl, tabId, ts: Date.now() };
+    // ERR-9: check the full-size bucket before it is stored, so the popup's
+    // count and the Saved X of Y line describe the same set. Only the bucket
+    // is probed (never the Thumbnails bucket) and the whole pass is bounded by
+    // VERIFY_BUDGET_MS — measured at 1.15 s for a 9-candidate bucket with the
+    // image Accept, versus 8.3 s when the probe still sent "text/html".
+    progress.phase = "verify";
+    try { await chrome.storage.local.set({ scanProgress: { ...progress } }); } catch (e) {}
+    let verdicts = { verified: 0, notMedia: 0, unknown: 0 };
+    try {
+      verdicts = await verifyFullsizeBucket(media, pageUrl);
+    } catch (e) {
+      // A verification failure must never lose the scan: items simply keep
+      // their "unknown" verdict and stay in the list.
+      console.warn("Media verification failed:", e);
+    }
+
+    const result = { media, pageUrl, title: response.title || pageUrl, tabId, ts: Date.now(), verdicts };
     try {
       await chrome.storage.local.set({
         scanResult: result,
@@ -812,7 +828,14 @@ async function resolveUrl(url, referer) {
     // ERR-1: same hotlink-protection bypass as processLink — the referer
     // (originating page) is required to resolve full-size URLs on hosts
     // that 302 referer-less requests to an HTML page.
-    const headers = { "Accept": "text/html" };
+    // ERR-9: a browser requests an image with an image Accept — this probe used
+    // to send "text/html", and media CDNs answered with a tarpit / HTML shell.
+    // Measured on reactor.cc (live SW, same URL): HEAD with text/html timed out
+    // at 4 s (or returned 200 text/html), while the same HEAD with an image
+    // Accept answered 200 image/jpeg in 96-633 ms. The GET fallback below keeps
+    // text/html on purpose: its job is to fetch an HTML shell and pull the
+    // full-size URL out of it via the sieve res patterns.
+    const headers = { "Accept": VERIFY_ACCEPT };
     if (referer) headers["Referer"] = referer;
 
     // ERR-5: HEAD-first. The old code did a full GET here — which downloaded
@@ -837,8 +860,12 @@ async function resolveUrl(url, referer) {
 
     // HEAD inconclusive (HTML shell / no content-type / 405 / network error):
     // fall back to GET and sieve res extraction (original behavior).
+    // The GET's job is to fetch an HTML shell and pull the full-size URL out of
+    // it, so IT asks for HTML — the image Accept belongs to the HEAD media check
+    // above only (a shell that is asked for an image may answer 406/nothing).
+    const getHeaders = Object.assign({}, headers, { "Accept": "text/html" });
     const resp = await fetch(url, {
-      headers,
+      headers: getHeaders,
       signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) return url;
@@ -867,6 +894,103 @@ async function resolveUrl(url, referer) {
     }
   } catch (e) {}
   return url;
+}
+
+// --- Media verification (ERR-9) -------------------------------------------------
+//
+// The popup's "Full size" bucket is built from HOW a URL was discovered
+// (FULLSIZE_SOURCES), never from whether the URL actually serves a media file.
+// Measured on reactor.cc/post/6382634: the bucket held 9 rows — 8 real
+// full-size JPEGs plus i.li.ru/ext/.../disney_33.jpg, an image URL that answers
+// 404 text/html — so the popup promised 9 files and Chrome saved 8. This probes
+// the bucket once, before the result is stored, and records a verdict per item.
+//
+// THREE-VALUED on purpose: "not-media" is only claimed when a response really
+// says so (text/* content-type on a 2xx, or 404/410). 403/405/429/5xx, a
+// timeout and a network error stay "unknown" and are KEPT — those are exactly
+// the answers hotlink-protected hosts (hath.network and friends) give for real
+// images, and a two-valued gate would delete real media from the list.
+
+/**
+ * One probe: does this URL serve a media file?
+ *
+ * @param {string} url
+ * @param {string} [referer] — the page the URL came from (hotlink protection)
+ * @returns {Promise<{verdict: "media"|"not-media"|"unknown", finalUrl: string}>}
+ */
+async function verifyMediaUrl(url, referer) {
+  const headers = { "Accept": VERIFY_ACCEPT };
+  if (referer) headers["Referer"] = referer;
+  try {
+    const resp = await fetch(url, {
+      method: "HEAD",
+      headers,
+      signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
+    });
+    const finalUrl = resp.url || url;
+    const ct = (resp.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (resp.ok) {
+      if (/^(image|video|audio)\//.test(ct)) return { verdict: "media", finalUrl };
+      // A page, not a file. `text/*` covers the HTML shell the measured 404
+      // case and the tarpit pages both return.
+      if (ct.startsWith("text/")) return { verdict: "not-media", finalUrl };
+      // No content-type, or an exotic one (octet-stream, application/json):
+      // not enough to promise, not enough to drop.
+      return { verdict: "unknown", finalUrl };
+    }
+    // 404/410: the URL is dead this run — the measured disney_33.jpg case.
+    if (resp.status === 404 || resp.status === 410) return { verdict: "not-media", finalUrl };
+    // Everything else (403/405/429/5xx) is inconclusive, never "not media".
+    return { verdict: "unknown", finalUrl };
+  } catch (e) {
+    return { verdict: "unknown", finalUrl: url };
+  }
+}
+
+/**
+ * Verify the full-size bucket of a scan result in place.
+ *
+ * Only bucket items (FULLSIZE_SOURCES) are probed — the Thumbnails bucket is
+ * never network-checked, so a page full of grid images costs nothing extra.
+ * Bounded twice: VERIFY_CONCURRENCY parallel probes and a VERIFY_BUDGET_MS wall
+ * so a slow host can never drag the scan. Items left when the budget runs out
+ * keep the "unknown" verdict (kept, not dropped).
+ *
+ * @param {Array<object>} items — scan media items, annotated in place
+ * @param {string} pageUrl
+ * @returns {Promise<{verified: number, notMedia: number, unknown: number}>}
+ */
+async function verifyFullsizeBucket(items, pageUrl) {
+  const bucket = (items || []).filter((i) => i && FULLSIZE_SOURCES.has(i.source));
+  const summary = { verified: 0, notMedia: 0, unknown: 0 };
+  if (bucket.length === 0) return summary;
+  const deadline = Date.now() + VERIFY_BUDGET_MS;
+  for (let i = 0; i < bucket.length; i += VERIFY_CONCURRENCY) {
+    if (Date.now() >= deadline) break;
+    const slice = bucket.slice(i, i + VERIFY_CONCURRENCY);
+    const results = await Promise.all(
+      slice.map((item) => verifyMediaUrl(item.url, pageUrl || item.pageUrl || ""))
+    );
+    results.forEach((res, k) => {
+      const item = slice[k];
+      item.mediaVerdict = res.verdict;
+      if (res.verdict === "media") {
+        // ERR-5 flag: chromeDownloadBatch skips resolveUrl for these, so a
+        // verified item costs no extra round-trip when the user saves it.
+        item.verified = true;
+      }
+    });
+  }
+  for (const item of bucket) {
+    if (item.mediaVerdict === "media") summary.verified++;
+    else if (item.mediaVerdict === "not-media") summary.notMedia++;
+    else {
+      // Budget ran out, or the probe was inconclusive: say so, keep the item.
+      item.mediaVerdict = "unknown";
+      summary.unknown++;
+    }
+  }
+  return summary;
 }
 
 async function chromeDownload(items, concurrentLimit = 2) {
@@ -1159,6 +1283,13 @@ async function commandScanAndProcess(action) {
 
   const fullsize = media.filter(m => FULLSIZE_SOURCES.has(m.source));
   const items = fullsize.length > 0 ? fullsize : media;
+  // ERR-9: same verification as the popup path, so the badge count this command
+  // announces matches what chrome.downloads will actually save.
+  try {
+    await verifyFullsizeBucket(items, response.url);
+  } catch (e) {
+    console.warn("Media verification failed:", e);
+  }
 
   if (action === "save-chrome") {
     await setBadge(`${items.length}`, "#4CAF50");

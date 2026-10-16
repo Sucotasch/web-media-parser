@@ -181,6 +181,79 @@ def _popen_kwargs():
     return kwargs
 
 
+# --- worker memory ----------------------------------------------------------
+
+_WIN_MEM_API = None
+
+
+def _windows_mem_api():
+    """Lazy (ctypes, PROCESS_MEMORY_COUNTERS, psapi) trio.
+
+    Wrapped in a function so the module imports on every platform and only a
+    Windows run pays for the ctypes setup.
+    """
+    global _WIN_MEM_API
+    if _WIN_MEM_API is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        _WIN_MEM_API = (ctypes, PROCESS_MEMORY_COUNTERS, psapi)
+    return _WIN_MEM_API
+
+
+def child_rss_mb(proc):
+    """Resident memory of a worker process in MB, or None when unreadable.
+
+    Errors.txt (2): the DOM worker's footprint grows with every parsed document
+    and does not shrink (happyDOM.close() releases nothing meaningful — an
+    explicit globalThis.gc() after close left 1.1 MB/call of growth on a 3 KB
+    page), so the recycling decision needs a real memory reading rather than a
+    call count. Fail-open: an unreadable value leaves the count rule in charge.
+
+    Windows reads the child handle subprocess already holds
+    (GetProcessMemoryInfo); Linux reads /proc/<pid>/statm. Any other platform —
+    and any error — returns None.
+    """
+    if proc is None:
+        return None
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return None
+    try:
+        if _is_windows():
+            ctypes, counters_cls, psapi = _windows_mem_api()
+            handle = getattr(proc, "_handle", None)
+            if not handle:
+                return None
+            counters = counters_cls()
+            counters.cb = ctypes.sizeof(counters_cls)
+            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return None
+            return counters.WorkingSetSize / (1024 * 1024)
+        with open(f"/proc/{pid}/statm", "r") as fh:
+            pages = int(fh.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _find_deno_cache_dir():
     """Bundled DENO_DIR with vendored npm deps (happy-dom) for the DOM worker.
 
@@ -239,8 +312,10 @@ class DenoJsEngine:
         try:
             from src import constants as K
             self._max_requests = getattr(K, "JS_WORKER_MAX_REQUESTS", 200)
+            self._max_rss_mb = getattr(K, "JS_WORKER_MAX_RSS_MB", 256)
         except Exception:
             self._max_requests = 200
+            self._max_rss_mb = 256
 
     # --- availability ---------------------------------------------------
 
@@ -544,11 +619,25 @@ class DenoJsEngine:
 
         The next call pays one cold spawn (~300 ms) and starts from a fresh
         process, which is what bounds resident memory on long galleries.
+
+        Errors.txt (2): a call count alone does not bound memory. The DOM
+        worker holds one parsed document per call and 200 calls of a 40 KB page
+        measured 1.4 GB in the child; the worker is therefore also retired once
+        its own resident memory reaches K.JS_WORKER_MAX_RSS_MB. Fail-open: an
+        unreadable reading leaves the count rule in charge.
         """
         count = getattr(self, "_" + counter_attr + "_calls") + 1
         setattr(self, "_" + counter_attr + "_calls", count)
         if self._max_requests and count >= self._max_requests:
             logger.debug("Recycling the %s worker after %d calls", counter_attr, count)
+            setattr(self, "_" + counter_attr + "_calls", 0)
+            killer()
+            return
+        rss = child_rss_mb(getattr(self, "_" + counter_attr + "_proc", None))
+        if rss is not None and self._max_rss_mb and rss >= self._max_rss_mb:
+            logger.info(
+                f"Recycling the {counter_attr} worker: {rss:.0f} MB resident "
+                f"(budget {self._max_rss_mb} MB) after {count} call(s)")
             setattr(self, "_" + counter_attr + "_calls", 0)
             killer()
 

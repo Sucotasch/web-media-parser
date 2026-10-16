@@ -34,7 +34,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.parser.js_engine.engine import DenoJsEngine
+from src.parser.js_engine.engine import DenoJsEngine, child_rss_mb
 
 
 class _RecordingStdin:
@@ -563,6 +563,63 @@ class TestWorkerRecycling(unittest.TestCase):
                 self.assertEqual(engine.run_js("c", []), "a")
 
         self.assertEqual(popen.call_count, 1)
+
+    def test_worker_is_recycled_when_its_memory_reaches_the_budget(self):
+        """Errors.txt (2): a CALL count cannot bound memory.
+
+        The DOM worker keeps one parsed document per call (measured: 1.4 MB/call
+        on a 4 KB page, 13 MB/call on a 40 KB one), so 200 calls of a real page
+        put 1.4 GB into the child. The worker must be retired on its own
+        resident size, long before the call budget.
+        """
+        proc = _FakeProc(lines=[_response("a")] * 3)
+        engine = _engine()
+        engine._max_requests = 0        # count rule off: only memory can recycle
+        engine._max_rss_mb = 256
+
+        with patch("src.parser.js_engine.engine.subprocess.Popen",
+                   return_value=proc) as popen, \
+                patch("src.parser.js_engine.engine.child_rss_mb",
+                      return_value=300.0):
+            self.assertEqual(engine.run_js("c1", []), "a")
+            self.assertGreaterEqual(proc.terminate_calls, 1,
+                                    "a worker over its memory budget must be retired")
+            self.assertEqual(engine.run_js("c2", []), "a")
+
+        self.assertEqual(popen.call_count, 2, "the next call needs a fresh worker")
+
+    def test_an_unreadable_memory_reading_keeps_the_count_rule_only(self):
+        """Control: fail-open — no reading must never mean "recycle every call"."""
+        proc = _FakeProc(lines=[_response("a")] * 3)
+        engine = _engine()
+        engine._max_requests = 0
+
+        with patch("src.parser.js_engine.engine.subprocess.Popen",
+                   return_value=proc), \
+                patch("src.parser.js_engine.engine.child_rss_mb", return_value=None):
+            for _ in range(3):
+                self.assertEqual(engine.run_js("c", []), "a")
+
+        self.assertEqual(proc.terminate_calls, 0)
+
+
+class TestChildMemoryReading(unittest.TestCase):
+    """The helper the memory budget depends on."""
+
+    def test_reads_a_real_child_process(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        try:
+            rss = child_rss_mb(proc)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        if rss is None:
+            self.skipTest("no readable resident memory for a child on this platform")
+        self.assertGreater(rss, 1.0, "a running Python child is more than 1 MB resident")
+
+    def test_unreadable_inputs_return_none(self):
+        self.assertIsNone(child_rss_mb(None))
+        self.assertIsNone(child_rss_mb(object()))
 
 
 class TestWorkerSourceGuards(unittest.TestCase):

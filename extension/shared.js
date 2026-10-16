@@ -84,3 +84,22 @@ const DISCOVER_BACKOFF_MAX_MS = 30000;
 const DISCOVER_CACHE_TTL_MS = 900000;
 const DISCOVER_CACHE_MAX = 300;
 const DISCOVER_CACHE_KEY = "discoverCache";
+
+// --- Media verification (ERR-9) -------------------------------------------------
+// The popup's "Full size" bucket says a URL was DISCOVERED as full-size; it never
+// said the URL serves a media file. Measured on reactor.cc/post/6382634: 9 rows in
+// the bucket, one of them i.li.ru/ext/.../disney_33.jpg answering 404 text/html —
+// the popup promised 9 files and Chrome saved 8. background.js probes the bucket
+// once and records mediaVerdict per item.
+
+// What a browser sends when it loads an <img>. Probes MUST use this: with
+// "text/html" these hosts tarpit the request (measured: HEAD timed out at 4 s, or
+// answered 200 text/html; the same URL with an image Accept answered 200
+// image/jpeg in 96-633 ms).
+const VERIFY_ACCEPT = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+// Parallel probes, per-probe timeout, and the wall budget for the whole bucket.
+// Measured: 9 candidates at concurrency 4 finished in 1.15 s; the budget keeps a
+// hanging host from dragging the scan (leftovers stay "unknown" and are kept).
+const VERIFY_CONCURRENCY = 4;
+const VERIFY_TIMEOUT_MS = 4000;
+const VERIFY_BUDGET_MS = 8000;

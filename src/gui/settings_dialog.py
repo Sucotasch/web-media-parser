@@ -203,6 +203,28 @@ class SettingsDialog(QDialog):
         )
         parser_grid.addWidget(self.filter_hidden_links_check, 12, 1)
 
+        # P4: chunked sync of excavation with download throughput. The parser
+        # stops starting pages above the high watermark and resumes at the low
+        # one, so the download backlog cannot grow without bound.
+        parser_grid.addWidget(QLabel("Pause Crawl at Downloads:"), 13, 0)
+        self.backlog_hwm_spin = QSpinBox()
+        self.backlog_hwm_spin.setRange(0, 100000)
+        self.backlog_hwm_spin.setToolTip(
+            "Stop starting new pages while this many files are waiting to download "
+            "(0 = never throttle the crawl). Excavation resumes when the backlog falls "
+            "to the resume level below."
+        )
+        parser_grid.addWidget(self.backlog_hwm_spin, 13, 1)
+
+        parser_grid.addWidget(QLabel("Resume Crawl at Downloads:"), 14, 0)
+        self.backlog_lwm_spin = QSpinBox()
+        self.backlog_lwm_spin.setRange(0, 100000)
+        self.backlog_lwm_spin.setToolTip(
+            "Resume starting new pages once the download backlog has drained to this "
+            "many files (must be below the pause level)."
+        )
+        parser_grid.addWidget(self.backlog_lwm_spin, 14, 1)
+
         parser_layout.addWidget(parser_group)
 
         # Filters tab
@@ -717,6 +739,12 @@ class SettingsDialog(QDialog):
         # Parser settings
         self.search_depth_spin.setValue(self.settings.get("search_depth", 3))
         self.page_limit_spin.setValue(self.settings.get("page_limit", 1000))
+        self.backlog_hwm_spin.setValue(
+            self.settings.get(K.SETTING_CRAWL_BACKLOG_HWM, K.DEFAULT_CRAWL_BACKLOG_HWM)
+        )
+        self.backlog_lwm_spin.setValue(
+            self.settings.get(K.SETTING_CRAWL_BACKLOG_LWM, K.DEFAULT_CRAWL_BACKLOG_LWM)
+        )
         self.page_timeout_spin.setValue(self.settings.get("page_timeout", 30))
         self.stay_in_domain_check.setChecked(self.settings.get("stay_in_domain", True))
         self.process_js_check.setChecked(self.settings.get("process_js", True))
@@ -827,6 +855,7 @@ class SettingsDialog(QDialog):
         # the typed text and applies it to the widget's value first.
         for spin in (
             self.search_depth_spin, self.page_limit_spin, self.page_timeout_spin,
+            self.backlog_hwm_spin, self.backlog_lwm_spin,
             self.min_image_width_spin, self.min_image_height_spin,
             self.min_image_size_spin, self.min_video_size_spin,
             self.max_file_size_spin,
@@ -838,6 +867,8 @@ class SettingsDialog(QDialog):
         # Parser settings (GUI-8: keys via K.* — single source of truth)
         settings[K.SETTING_SEARCH_DEPTH] = self.search_depth_spin.value()
         settings[K.SETTING_PAGE_LIMIT] = self.page_limit_spin.value()
+        settings[K.SETTING_CRAWL_BACKLOG_HWM] = self.backlog_hwm_spin.value()
+        settings[K.SETTING_CRAWL_BACKLOG_LWM] = self.backlog_lwm_spin.value()
         settings[K.SETTING_PAGE_TIMEOUT] = self.page_timeout_spin.value()
         settings[K.SETTING_STAY_IN_DOMAIN] = self.stay_in_domain_check.isChecked()
         settings[K.SETTING_PROCESS_JS] = self.process_js_check.isChecked()
@@ -947,6 +978,8 @@ class SettingsDialog(QDialog):
         clamps = {
             "search_depth": (0, 10),
             "page_limit": (0, 10000),  # 0 = unlimited (matches UI tooltip)
+            "crawl_backlog_hwm": (0, 100000),  # P4 gate: 0 = off
+            "crawl_backlog_lwm": (0, 100000),
             "page_timeout": (5, 600),
             "timeout": (1, 600),
             "retry_count": (0, 20),

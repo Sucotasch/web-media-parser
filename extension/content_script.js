@@ -16,22 +16,91 @@
     const links = [];      // anchors that PRESENT media - real discovery candidates
     const linkRest = [];   // other page links, probed only with budget left over
 
-    const JUNK_PATTERNS = [
-      /\/l-stat\./i, /\/userpic/i, /\/avatar/i, /\/logo[._-]|logo\./i,
-      /\/favicon/i, /\/emoji/i, /\/gravatar/i, /\/icon[s]?\//i,
-      /ljcounter/i, /\/blank\./i, /\/spacer\./i, /\/pixel\./i,
-      /1x1\./i, /\/spinner/i, /\/loading/i, /\.svg([?#]|$)/i,
-      /\/button[s]?\//i, /\/badge/i, /\/arrow/i,
-      /\/(nav|menu|search|cart|share|social|widget|advert|tracker)\b/i,
-      /\/(prev|next|close|expand|collapse|play|pause|mute|volume)\b/i,
-      /\$\{/i, // un-interpolated template placeholder (e.g. products/${imgSrc})
+    // Junk matches on TOKENS, never as a substring of an arbitrary filename.
+    // Errors.txt (reactor.cc): the old /\/arrow/i tested the whole URL, so every
+    // /pics/post/full/Arrow-SG-…jpeg — the fullsize targets the page itself
+    // carries in its anchor hrefs — was dropped, and the popup showed only
+    // unrelated linked-img hits from the link probe. Same class of bug for
+    // /\/badge/i, /\/avatar/i, /\/loading/i … and for the \b patterns, which cut
+    // Play-Station-5.jpg and Search-and-rescue.jpg.
+    // Tokens follow the desktop classifier (src/parser/utils.py: split on
+    // non-word characters, compare WHOLE tokens) rather than prefixes.
+    const JUNK_TOKENS = new Set([
+      // icons / chrome / placeholders
+      "icon", "icons", "logo", "logos", "favicon", "favicons", "badge", "badges",
+      "button", "buttons", "emoji", "emojis", "arrow", "arrows", "spinner",
+      "spinners", "loading", "blank", "spacer", "spacers", "pixel", "pixels",
+      "1x1", "2x2", "3x3",
+      // avatars / user pictures
+      "avatar", "avatars", "userpic", "userpics", "gravatar", "ljcounter",
+      // site chrome segments
+      "nav", "navigation", "menu", "search", "cart", "share", "social",
+      "widget", "advert", "tracker",
+      "prev", "next", "close", "expand", "collapse", "play", "pause",
+      "mute", "volume",
+    ]);
+
+    // Host LABELS are matched whole too: "l-stat.livejournal.com" and
+    // "l-userpic.livejournal.com" are counter/userpic hosts, while
+    // "img10.reactor.cc" is not. (The old substring patterns flagged whole hosts
+    // by accident, which is how a legit CDN could be dropped.)
+    const JUNK_HOST_LABELS = new Set([
+      "l-stat", "l-userpic", "userpic", "userpics", "avatar", "avatars",
+      "ljcounter",
+    ]);
+
+    // A URL-wide substring test is safe for these two: neither can be a prefix
+    // of a content filename.
+    const JUNK_URL_PATTERNS = [
+      /\$\{/i,             // un-interpolated template placeholder (products/${imgSrc})
+      /\.svg([?#]|$)/i,    // SVG is vector chrome (icons/logos), never scraped media
       // EXT-8: no hard format drop here — GIF/PNG/ICO filtering belongs to the
       // desktop app's format allowlist (which keeps .png ON by default). A
       // gallery with PNG art was invisible to "Save (Chrome)" otherwise.
     ];
 
+    // Unicode-aware split, like Python's \w: a Cyrillic filename must yield
+    // tokens (and therefore be KEPT), not split into nothing.
+    const TOKEN_SPLIT = /[^\p{L}\p{N}]+/u;
+
+    function tokens(text) {
+      return (text || "").toLowerCase().split(TOKEN_SPLIT).filter(Boolean);
+    }
+
+    function isJunkToken(token) {
+      return JUNK_TOKENS.has(token);
+    }
+
     function isJunkUrl(url) {
-      return JUNK_PATTERNS.some(p => p.test(url));
+      if (JUNK_URL_PATTERNS.some(p => p.test(url))) return true;
+      let parsed;
+      try { parsed = new URL(url); } catch (e) { return false; }
+
+      // Host label: one junk label is enough.
+      const hostLabels = (parsed.hostname || "").toLowerCase().split(".");
+      if (hostLabels.some(l => JUNK_HOST_LABELS.has(l))) return true;
+
+      // Decoded, so a non-Latin name yields real tokens instead of percent
+      // escapes (a Cyrillic content name must be judged on its own words).
+      let rawPath = parsed.pathname || "";
+      try { rawPath = decodeURIComponent(rawPath); } catch (e) { /* keep it encoded */ }
+
+      // Directory segments: `.../icons/x.png`, `.../images/avatar/1.jpg`.
+      const segments = rawPath.split("/").filter(Boolean);
+      const file = segments.length > 0 ? segments[segments.length - 1] : "";
+      const dirs = segments.slice(0, -1);
+      if (dirs.some(seg => tokens(seg).some(isJunkToken))) return true;
+
+      // Filename: junk only when the WHOLE name is chrome — "arrow.png",
+      // "spacer-2x2.gif", "logo_2.png" — never a content name that merely
+      // contains the word ("Arrow-SG-Arrow-Marzetti-SG-(TAM)-….jpeg",
+      // "Play-Station-5.jpg"). Digits are neutral, so numbering can't rescue a
+      // chrome name, but a purely numeric name is never junk on its own.
+      const stem = file.replace(/\.[a-z0-9]+$/i, "");
+      const fileTokens = tokens(stem);
+      if (fileTokens.length === 0) return false;
+      return fileTokens.some(isJunkToken)
+        && fileTokens.every(t => isJunkToken(t) || /^\d+$/.test(t));
     }
 
     function toAbsolute(url) {
@@ -53,6 +122,8 @@
       seen.add(url);
       media.push({ url, type, pageUrl: baseUrl, ...attrs });
     }
+
+    const IMAGE_FILE_RE = /\.(jpe?g|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i;
 
     // D-03: parity with the desktop app's DEFAULT_MAX_LINKS_PER_PAGE (200), and
     // ONLY for navigation links. A page with 1000 nav anchors (tag lists, page
@@ -123,7 +194,14 @@
       if (parentA) {
         const href = parentA.getAttribute("href");
         if (href && href !== "#" && !href.startsWith("javascript:")) {
-          addLink(href);
+          // Errors.txt (secondary): when the parent anchor IS the media file
+          // (<a href="…/pics/post/full/….jpeg"><img src="…thumbnail….jpeg"></a>)
+          // the a[href] pass below already collects it as media with
+          // source "a-link" (a FULLSIZE_SOURCE). Adding it here as well made the
+          // background probe the image URL as a PAGE, spending discovery budget
+          // on a file that can never contain links.
+          const absHref = toAbsolute(href);
+          if (!absHref || !IMAGE_FILE_RE.test(absHref)) addLink(href);
         }
       }
     });
@@ -135,7 +213,7 @@
       const fullHref = toAbsolute(href);
       if (!fullHref || fullHref === baseUrl) return;
       // Check if link looks like it points to an image file
-      if (/\.(jpe?g|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i.test(fullHref)) {
+      if (IMAGE_FILE_RE.test(fullHref)) {
         addMedia(fullHref, "image", { source: "a-link" });
       } else {
         addLink(fullHref, presentsMedia(a));

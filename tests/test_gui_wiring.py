@@ -24,6 +24,7 @@ C-09 (the signals the debounce listens to) is asserted at runtime.
 
 import asyncio
 import io
+import logging
 import os
 import shutil
 import socket
@@ -31,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest.mock import patch
 
@@ -342,6 +344,88 @@ class TestMainWindowWiring(unittest.TestCase):
         self.assertIn("extension_server_failed = Signal(str)", self.source)
         self.assertIn("self.extension_server_failed.emit(", self.source)
         self.assertIn("QMessageBox.warning(self, \"Extension API unavailable\"", self.source)
+
+    def _method_body(self, signature):
+        start = self.source.index(signature)
+        end = self.source.index("\n    def ", start + len(signature))
+        return self.source[start:end]
+
+    def test_user_text_url_paths_build_the_folder_through_the_sanitizer(self):
+        # NF-11 (url field, 2026-10-16): the URL field and the CSV import are USER
+        # text, and both built the folder name inline with
+        # `url.split("/")[2].replace(".", "_")` — so a port went into
+        # os.makedirs, Start did nothing, and one CSV row with a port aborted the
+        # whole import. The rule now lives in one pure function (runtime-asserted
+        # in test_parser_lifecycle); pin the three call sites here because
+        # instantiating MainWindow binds port 19876 and rewrites the real queue.
+        for signature in ("def _start_from_url_input(self):",
+                          "def add_task_to_queue(self):",
+                          "def _import_history_csv(self):"):
+            body = self._method_body(signature)
+            self.assertIn("task_folder = task_folder_from_url(", body,
+                          f"{signature} does not sanitize its folder name")
+            self.assertIn("if task_folder is None:", body,
+                          f"{signature} would use an unusable folder name")
+
+
+class TestLogViewIsABoundedWindow(unittest.TestCase):
+    """Errors.txt (2): the GUI log view must not grow for the whole session.
+
+    The 5 000-record message_history made the log look bounded, but the
+    QTextEdit document kept every line ever logged (GUI/root logger are on
+    DEBUG). Measured before the fix with the real handler: 200 000 appended
+    records = +118 MB RSS while tracemalloc stayed flat at 1.6 MB — a
+    QTextDocument lives in Qt's C++ heap, which no Python profiler sees.
+
+    MainWindow itself cannot be instantiated here (it binds port 19876 and
+    rewrites the real task_queue.json), so the production path is exercised
+    through the same method it uses: setup_logging() on a widget owner.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"PySide6 unavailable: {e}")
+        try:
+            cls.app = QApplication.instance() or QApplication([])
+        except Exception as e:  # pragma: no cover - depends on environment
+            raise unittest.SkipTest(f"Qt could not initialize: {e}")
+
+    def _logging_setup(self):
+        """Run MainWindow.setup_logging against a bare log widget."""
+        from PySide6.QtWidgets import QTextEdit
+
+        from src.gui.main_window import MainWindow
+
+        stub = types.SimpleNamespace(log_text=QTextEdit())
+        MainWindow.setup_logging(stub)
+        self.addCleanup(logging.getLogger().removeHandler, stub.log_handler)
+        return stub
+
+    def test_the_real_setup_logging_path_caps_the_document(self):
+        stub = self._logging_setup()
+
+        self.assertEqual(stub.log_text.document().maximumBlockCount(),
+                         K.GUI_LOG_MAX_BLOCKS,
+                         "the log document is left uncapped and grows forever")
+
+    def test_the_view_stops_growing_after_the_cap(self):
+        stub = self._logging_setup()
+        log = logging.getLogger("wmp.test.log_window")
+        log.setLevel(logging.DEBUG)
+
+        for i in range(K.GUI_LOG_MAX_BLOCKS * 2 + 100):
+            log.debug(f"parsed page {i}: https://img10.reactor.cc/pics/post/full/x{i}.jpeg")
+
+        self.assertLessEqual(stub.log_text.document().blockCount(), K.GUI_LOG_MAX_BLOCKS,
+                             "the log document kept more lines than the history window")
+
+        # Re-applying the level filters must not resurrect the whole session.
+        stub.log_handler.reapply_filters()
+        self.assertLessEqual(stub.log_text.document().blockCount(), K.GUI_LOG_MAX_BLOCKS)
 
 
 class TestQueueSignalsThatDriveAutosave(unittest.TestCase):

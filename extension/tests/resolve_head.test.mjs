@@ -47,14 +47,30 @@ function check(name, actual, expected) {
 const PAGE = "https://pr.reactor.cc/post/6064303";
 const FULL_URL = "https://img10.reactor.cc/pics/post/full/Candyball-8862774.jpeg";
 
+// ERR-9: the HEAD probe now sends the browser image Accept, which lives in
+// shared.js (single source) — read the real constant instead of duplicating the
+// literal here, or this guard would pass against a string nobody ships.
+const sharedSrc = readFileSync(join(here, "..", "shared.js"), "utf8");
+const acceptMatch = /const VERIFY_ACCEPT = ("[^"]*");/.exec(sharedSrc);
+if (!acceptMatch) {
+  console.error("FAIL: VERIFY_ACCEPT not found in shared.js");
+  process.exit(1);
+}
+const VERIFY_ACCEPT = JSON.parse(acceptMatch[1]);
+if (/text\/html/.test(VERIFY_ACCEPT)) {
+  console.error("FAIL: VERIFY_ACCEPT must not be an HTML Accept");
+  process.exit(1);
+}
+
 function makeResolveUrl(fetchImpl) {
   return new Function(
-    "fetch", "cachedSieveRes", "AbortSignal",
+    "fetch", "cachedSieveRes", "AbortSignal", "VERIFY_ACCEPT",
     `return (${src.slice(start, end)})`
   )(
     fetchImpl,
     {}, // empty sieve — no res patterns to hit
-    { timeout: () => ({}) } // fake AbortSignal for standalone execution
+    { timeout: () => ({}) }, // fake AbortSignal for standalone execution
+    VERIFY_ACCEPT
   );
 }
 
@@ -133,6 +149,40 @@ function makeResolveUrl(fetchImpl) {
   const resolveUrl = makeResolveUrl(fetchImpl);
   await resolveUrl(FULL_URL, PAGE);
   check("HEAD probe carries Referer", seenHeaders && seenHeaders["Referer"], PAGE);
+}
+
+// 6. ERR-9: the HEAD probe must ask for an IMAGE, not for HTML. Measured live:
+//    with "text/html" these hosts tarpit the probe (HEAD timed out at 4 s, or
+//    answered 200 text/html); the same HEAD with an image Accept answered
+//    200 image/jpeg in 96-633 ms.
+{
+  let headAccept = null;
+  const fetchImpl = async (url, opts) => {
+    if ((opts && opts.method) === "HEAD") {
+      headAccept = opts.headers && opts.headers["Accept"];
+      return { ok: true, headers: new Map([["content-type", "image/jpeg"]]) };
+    }
+    return { ok: true, headers: new Map([["content-type", "image/jpeg"]]), text: async () => "" };
+  };
+  const resolveUrl = makeResolveUrl(fetchImpl);
+  await resolveUrl(FULL_URL, PAGE);
+  check("HEAD probe sends the image Accept", headAccept, VERIFY_ACCEPT);
+}
+
+// 7. ERR-9: the GET fallback keeps text/html on purpose — its job is to fetch an
+//    HTML shell and pull the full-size URL out of it.
+{
+  let getAccept = null;
+  const fetchImpl = async (url, opts) => {
+    if ((opts && opts.method) === "HEAD") {
+      return { ok: true, headers: new Map([["content-type", "text/html"]]) };
+    }
+    getAccept = opts.headers && opts.headers["Accept"];
+    return { ok: true, headers: new Map([["content-type", "text/html"]]), text: async () => "<html></html>" };
+  };
+  const resolveUrl = makeResolveUrl(fetchImpl);
+  await resolveUrl(FULL_URL, PAGE);
+  check("GET (shell) fallback keeps text/html", getAccept, "text/html");
 }
 
 if (failures > 0) {

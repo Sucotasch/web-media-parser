@@ -95,11 +95,24 @@ class AsyncClientManager:
         """
         if self._session is None or self._session.closed:
             logger.info("Creating new aiohttp.ClientSession.")
-            # aiohttp handles brotli automatically when installed; no custom
-            # connector is needed (removed dead connector_args branch).
+            # DL-8: an EXPLICIT threaded resolver. aiohttp picks the c-ares
+            # (aiodns) resolver whenever that optional package is importable,
+            # and on a network where the async resolver cannot reach a
+            # nameserver every request dies as a CONNECT timeout at the connect
+            # cap instead of a resolution error. Measured on this machine:
+            # aiohttp 5/5 ConnectionTimeoutError at the 5 s cap (also for
+            # example.com, also for a literal-IP URL) while requests fetched the
+            # same page 5/5 in 532-655 ms and the OS resolver answered in 45 ms;
+            # with ThreadedResolver aiohttp answered 200 in 632 ms. The threaded
+            # resolver uses the OS resolver — the same one requests/urllib3 uses —
+            # so the engine behaves identically whether or not aiodns is
+            # installed (the frozen build does not ship it, the dev venv does).
+            # aiohttp handles brotli automatically when installed.
+            connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
             self._session = aiohttp.ClientSession(
                 timeout=self._timeout_config,
                 headers=self._get_default_headers(),
+                connector=connector,
             )
             self._apply_extension_cookies(self._session)
             logger.info(f"New aiohttp.ClientSession created. Brotli enabled in session: {HAS_BROTLI and self._session.headers.get('Accept-Encoding','').lower().startswith('gzip, deflate, br')}")

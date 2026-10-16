@@ -250,6 +250,65 @@ Plus one-shot `logger.warning` on first `verify=False` fetch per process (patter
 
 ## §8 Defect log (new findings during execution — appended, never ignored)
 
+- [2026-10-16, live test of the s8 build → `Errors.txt`] **BUG-E1 · FIXED — the extension's junk
+  filter ate content filenames.** `extension/content_script.js` held `JUNK_PATTERNS` tested against
+  the WHOLE URL, including `\/\/arrow/i`. On https://reactor.cc/post/6382634 the page carries each
+  thumbnail as `<a href="//img10.reactor.cc/pics/post/full/Arrow-…jpeg"><img src="…/pics/post/Arrow-…jpeg"></a>`,
+  so both the thumbnail and the fullsize URL were dropped: the popup showed only unrelated
+  `linked-img` hits from the link probe, and Send to App with *Page only* inherited the empty list.
+  Fixed by replacing the substring list with token matching that mirrors the desktop classifier
+  (`src/parser/utils.py` `_matches_ad_keyword`): host labels and DIRECTORY segments match one whole
+  junk token, a FILENAME is junk only when its whole stem is chrome (`arrow.png`, `spacer-2x2.gif`,
+  `logo_2.png` — digits neutral), so `Arrow-SG-…jpeg`, `Play-Station-5.jpg`, `Search-and-rescue.jpg`,
+  `photo-avatar-1.jpg`, `pixel-art-500.jpg` and Cyrillic names survive. Secondary item from the same
+  report: a parent anchor that IS the image file is no longer added as a discovery link (it was
+  probed as a page). Measured on the saved real page HTML with the real scanner: **0 → 8**
+  `/pics/post/full/` URLs (all 8 from the report), and image files in the probe list 8 → 0.
+  Regression tests: `extension/tests/content_scan.test.mjs` (reactor fixture + 13 junk URLs still
+  dropped + 6 content names kept).
+- [2026-10-16, live test of the s8 build → `Errors.txt`] **BUG-E2 · FIXED — the GUI log document grew
+  for the whole session.** RSS climbed 80 → 850 MB in minutes. `GUILogHandler.message_history` is a
+  5 000-record deque, but the `QTextEdit` document had no `setMaximumBlockCount`, while the root and
+  GUI loggers sit at DEBUG — so every parser/downloader line stayed in the widget. Measured through
+  the production handler (Windows, `GetProcessMemoryInfo` + tracemalloc): 200 000 records = **+118 MB
+  RSS**, while the Python heap stayed flat at 1.6 MB — the document lives in Qt's C++ heap, which is
+  why no Python profiler and no deque limit ever showed it. Fix: `GUI_LOG_MAX_BLOCKS = 5000`
+  (`src/constants.py`) applied by `GUILogHandler.__init__` (`src/gui/log_handler.py`), so widget and
+  history are the same window. Same measurement after the fix: **+5.4 MB** (blockCount stops at
+  5 000); control run with the cap force-disabled reproduces +118.1 MB, and `reapply_filters()`
+  cannot refill it. Regression tests: `tests/test_gui_wiring.py::TestLogViewIsABoundedWindow`
+  (2 tests, verified RED against the pre-fix handler: `maximumBlockCount() == 0`).
+  **The widget was not the whole 80 → 850 MB.** The user's own dist log (13 min of crawling,
+  09:22–09:35) holds 60 566 records, peak 6 321/min — at 0.59 KB/record that is ~3.6 MB/min, so the
+  widget explains tens of MB, not hundreds. A live crawl from source (real `ParserManager` + the real
+  GUI/file handlers, local 60-page fixture, 25 918 records) grew 31.6 MB total = 1.22 MB per 1000
+  records, half of it the widget, and stayed flat for 3 min after completion; the app is also flat
+  while idle. **The rest was the Deno child.** `js_engine = deno` in the user's settings: the
+  happy-dom DOM worker (`dom_worker.js`) retains one parsed document per call and `happyDOM.close()`
+  does not release it — measured per call: **1.4 MB on a 4 KB page, 13 MB on a 40 KB one** (real
+  pages are 50–200 KB), i.e. ~1.4 GB in the child after 100 calls. An explicit `globalThis.gc()`
+  after close left 1.1 MB/call (so it is retention, not uncollected garbage) and worker.js (no DOM)
+  is a steady 32 MB — the COUNT cap (`JS_WORKER_MAX_REQUESTS = 200`) therefore bounded nothing.
+  Fixed with a memory budget: `K.JS_WORKER_MAX_RSS_MB = 256` + `child_rss_mb()` (GetProcessMemoryInfo
+  on the child handle, /proc on Linux, fail-open elsewhere) consulted by `_recycle_if_due` after every
+  call, so any worker is retired on its own resident size (covers the DOM and gateway workers).
+  Measured after: the same 40 KB workload recycles every ~12 calls and the child peaks at 273 MB
+  (was 1 395 MB at 100 calls); the 4 KB workload is unaffected (worker.js never reaches the budget).
+  Cost: cold spawn is 545 ms vs 5.8 ms per steady call, so the worst DOM case pays ~24% wall time
+  (165 ms/call) for a 5x memory reduction. Regression tests: `tests/test_js_engine_lifecycle.py::
+  TestWorkerRecycling` (memory-triggered recycle + fail-open control) and `TestChildMemoryReading`.
+  Suites after all four changes: 504 passed / 30 skipped, and 534 passed with the dist `deno.exe`
+  on PATH (the Deno-dependent suites run instead of skipping).
+  **Long-run answer (measured 2026-10-16, endless local fixture, depth 25):** 8 minutes of crawling
+  crawled 44 061 pages and grew RSS 89.5 → 160.3 MB (+70 MB, ~1 kB/page marginal and still
+  decelerating); the same crawl with the logging path silenced (root at WARNING, 1 record total) grew
+  +66 MB — so the residue is crawl bookkeeping (processed/seen URL sets, queue contexts, connection
+  pools), not logs and not the capped widget. The `widget MB` column is the point of comparison: the
+  same 846 169 records would have put ~490 MB into the uncapped log document. Idle RSS is flat
+  (2.5 min) and RSS stays where it stopped after a crawl ends. A crawl that finds downloadable media
+  stops itself at `page_limit` (1000 source pages with downloads, both shipped settings) and then
+  stops growing; only a link-only crawl keeps accumulating, at roughly 1 kB per page.
+
 - [2026-10-15, stage 8 live run] **NF-11 · FOUND & FIXED — a port in the task folder silently killed
   every extension task.** Found by the browser↔app gate (G-8-LIVE), not by any unit test: the popup
   scanned a local fixture, "Send to App" reported no error, and the app never queued anything.

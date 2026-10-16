@@ -67,6 +67,15 @@ MAX_FILENAME_LENGTH = 200 # Max length for sanitized filenames (excluding extens
 # UI & Dialog Defaults
 DEFAULT_SAVE_PATH = "downloads" # Default download directory base name
 
+# GUI log view: how many log lines the widget keeps. It matches the handler's
+# message_history window so the view and the history cannot disagree. The
+# document MUST be capped: at GUI DEBUG level the parsers feed thousands of
+# records per minute and an uncapped QTextEdit document grows for the whole
+# session (measured on Windows: +118 MB RSS per 200 000 appended records, with a
+# flat Python heap — the document lives in Qt's C++ heap, so tracemalloc shows
+# nothing). See Errors.txt bug 2.
+GUI_LOG_MAX_BLOCKS = 5000
+
 # Parser Behavior
 DEFAULT_STAY_IN_DOMAIN = True
 DEFAULT_PROCESS_JS = True       # Whether to attempt static JS analysis and other advanced content extraction
@@ -93,6 +102,36 @@ DEFAULT_STOP_WORDS = [
 # Crawl limits
 DEFAULT_MAX_LINKS_PER_PAGE = 200  # Cap links per page to prevent queue explosion on menu-heavy pages
 
+# REMOVED 2026-10-16 (rolled back): a `max_pending_urls` ceiling that REJECTED
+# excavation links once the frontier was full. It was the wrong instrument twice
+# over — it capped a queue that was never the bottleneck (measured: the URL
+# frontier sat at ~300-1000 entries while the download backlog grew 113 -> 936 and
+# 57 -> 2303), and it lost links irreversibly for the run, because the source page
+# is already processed and is not re-expanded (at a cap of 50 the crawl refused
+# 15 278 links in 60 s on the fixture). A crawler must be able to run long without
+# dropping discovered work; load is controlled by the backlog gate below instead.
+
+# P4 / Errors.txt (2) — the actual load control: synchronise "excavating new"
+# with "what we can download", in chunks. Measured reason (my own 2026-10-16 runs):
+#   reactor.cc, 67 s   : found +6.0/s  vs downloaded +2.8/s  -> download backlog +181
+#   reactor.cc, 64 s   : found +15.9/s vs downloaded +2.6/s  -> backlog 113 -> 936 (+12/s)
+#   fixture,    149 s  : found +22.6/s vs downloaded +7.5/s  -> backlog 57 -> 2303 (+15/s)
+# The backlog grew monotonically in every run: page excavation (which also triggers
+# every link/media discovery) ran at full speed while the downloader could only
+# consume a fraction of it, so requests, queue entries and RSS all accumulated.
+# Rule: while the download backlog is >= CRAWL_BACKLOG_HWM, the parser stops
+# STARTING new pages; it resumes once the backlog has drained to CRAWL_BACKLOG_LWM.
+# The gate is on the DOWNLOAD queue (drained by downloader workers on their own),
+# never on the URL frontier — pending URLs only shrink when a parser worker pops
+# one, so a watermark there would freeze the crawl with nothing left to drain it.
+# 0 disables the gate (old behaviour, for users who want maximum crawl speed).
+DEFAULT_CRAWL_BACKLOG_HWM = 1000   # pause excavating at this many queued downloads
+DEFAULT_CRAWL_BACKLOG_LWM = 200     # resume once it has drained to this many
+# Safety valve: a jammed/hung downloader must not freeze the crawl forever. If the
+# backlog does not move for this long while gated, excavation resumes with a warning.
+CRAWL_BACKLOG_STALL_TIMEOUT = 60    # seconds without any change in backlog depth
+CRAWL_BACKLOG_POLL_SECONDS = 0.5    # gate poll interval
+
 # Guards against pathological URL growth (e.g. urljoin of relative vBulletin
 # "threads/..." links on a base URL without a trailing slash appends the same
 # segment forever: threads/threads/threads/...). URLs beyond these bounds are
@@ -118,6 +157,16 @@ MAX_SEEN_URLS = 100000
 # B-17 (2026-10-15): a Deno worker is retired after this many calls, so the
 # parsed documents it holds cannot accumulate for a whole task run.
 JS_WORKER_MAX_REQUESTS = 200
+
+# Errors.txt (2), measured 2026-10-16: a call COUNT cannot bound memory. The
+# happy-dom DOM worker retains one parsed document per call — 1.4 MB/call on a
+# 4 KB page and 13 MB/call on a 40 KB one (real pages run 50-200 KB), so the
+# 200-call window above allowed a deno.exe child of 1.4 GB (measured with a
+# 40 KB document: 237 MB after 10 calls, 1.4 GB after 100). The worker is now
+# also retired as soon as its resident memory reaches this budget, which keeps
+# the peak at the budget plus one call's growth instead of the count times the
+# page size. worker.js (no DOM) sits at a steady ~32 MB and never hits it.
+JS_WORKER_MAX_RSS_MB = 256
 
 # A-16/B-02 (2026-10-15): worker threads for the dedicated JS-rule pool (sieve
 # `to`/`res` rules). Downloads and HTML parsing have their own pools sized by
@@ -314,6 +363,9 @@ SETTING_STOP_WORDS = "stop_words"
 SETTING_MAX_DOWNLOAD_SPEED = "max_download_speed" # in KB/s, 0 for unlimited
 SETTING_PAGE_TIMEOUT = "page_timeout" # Timeout for page loading/parsing
 SETTING_PAGE_LIMIT = "page_limit" # Stop after N pages with downloads (0 = unlimited)
+# P4 backlog gate: pause page excavation at HWM, resume at LWM (0 = gate off).
+SETTING_CRAWL_BACKLOG_HWM = "crawl_backlog_hwm"
+SETTING_CRAWL_BACKLOG_LWM = "crawl_backlog_lwm"
 SETTING_ENABLED_IMAGE_FORMATS = "enabled_image_formats"
 SETTING_ENABLED_VIDEO_FORMATS = "enabled_video_formats"
 SETTING_ENABLED_AUDIO_FORMATS = "enabled_audio_formats"
@@ -353,6 +405,8 @@ DEFAULT_SETTINGS_VALUES = {
     SETTING_FILTER_JUNK: True,  # P2-lite junk classifier (precision-first + allowlist)
     SETTING_FILTER_HIDDEN_LINKS: DEFAULT_FILTER_HIDDEN_LINKS,
     SETTING_PAGE_LIMIT: 1000,  # 0 = unlimited (matches the dialog tooltip)
+    SETTING_CRAWL_BACKLOG_HWM: DEFAULT_CRAWL_BACKLOG_HWM,
+    SETTING_CRAWL_BACKLOG_LWM: DEFAULT_CRAWL_BACKLOG_LWM,
     SETTING_STOP_WORDS: DEFAULT_STOP_WORDS,
     SETTING_MAX_DOWNLOAD_SPEED: 0, # KB/s
     SETTING_PROXY: "",  # F-01: was dialog-only

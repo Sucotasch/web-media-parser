@@ -85,6 +85,12 @@ const anchor = (href) => ({
   querySelector: () => null,
 });
 
+// The reactor.cc markup (Errors.txt): an anchor that WRAPS the thumbnail image.
+const imgAnchor = (href) => ({
+  getAttribute: (name) => (name === "style" ? null : href),
+  querySelector: (sel) => (sel === "img, picture, video, canvas" ? { tagName: "IMG" } : null),
+});
+
 // --- R-E-7 (NEW-1): a data: placeholder is not media ----------------------
 
 {
@@ -161,6 +167,75 @@ check("parseSrcset: w beats x", parseSrcset("a.jpg 1.5x, b.jpg 600w"), "b.jpg");
 check("parseSrcset: data: candidate skipped", parseSrcset("data:image/png;base64,iVBOR 1x, b.jpg 600w"), "b.jpg");
 check("parseSrcset: all-data set is empty", parseSrcset("data:image/png;base64,iVBOR 1x"), null);
 check("parseSrcset: data URI with commas stays one candidate", parseSrcset(`${DATA_URI} 1x, real.jpg 600w`), "real.jpg");
+
+// --- Errors.txt (reactor.cc): junk patterns must not eat content filenames ---
+//
+// The page wraps each thumbnail in an anchor pointing straight at the fullsize
+// file: <a href="//img10.reactor.cc/pics/post/full/Arrow-….jpeg"><img
+// src="…/pics/post/Arrow-….jpeg"></a>. The old JUNK_PATTERNS held /\/arrow/i,
+// tested against the WHOLE URL, so both URLs were dropped and the popup showed
+// only unrelated linked-img hits from the link probe.
+{
+  const THUMB = "https://img10.reactor.cc/pics/post/Arrow-SG-Arrow-Marzetti-SG-%28TAM%29-"
+    + "%D0%9A%D0%BB%D1%83%D0%B1-%D0%BB%D1%8E%D0%B1%D0%B8%D1%82%D0%B5%D0%BB%D0%B5%D0%B9-TAM-9489969.jpeg";
+  const FULL = "https://img10.reactor.cc/pics/post/full/Arrow-SG-Arrow-Marzetti-SG-%28TAM%29-"
+    + "%D0%9A%D0%BB%D1%83%D0%B1-%D0%BB%D1%8E%D0%B1%D0%B8%D1%82%D0%B5%D0%BB%D0%B5%D0%B9-TAM-9489969.jpeg";
+
+  // The anchor href is protocol-relative in the real markup.
+  const a = imgAnchor(FULL.replace("https:", "//"));
+  const thumbnail = img({ src: THUMB, closest: (sel) => (sel === "a[href]" ? a : null) });
+  const out = scanPageMedia(fakeDoc([thumbnail], [a]), "https://reactor.cc/post/6382634");
+
+  check(
+    "reactor.cc: the thumbnail AND the /full/ href are both collected",
+    out.media.map((m) => [m.url, m.source]),
+    [[THUMB, "img"], [FULL, "a-link"]]
+  );
+  check(
+    "reactor.cc: the fullsize URL is not probed as a page",
+    out.links,
+    []
+  );
+}
+
+// Real junk must still be dropped — the fix may not turn the filter off.
+{
+  const JUNK = [
+    "http://127.0.0.1:9811/avatar/user1.png",
+    "http://127.0.0.1:9811/logo.png",
+    "http://127.0.0.1:9811/icons/arrow.png",
+    "http://127.0.0.1:9811/media/arrow.png",
+    "http://127.0.0.1:9811/img/spacer-2x2.gif",
+    "http://127.0.0.1:9811/static/loading.gif",
+    "http://127.0.0.1:9811/img/blank.png",
+    "http://127.0.0.1:9811/ui/next.jpg",
+    "http://127.0.0.1:9811/tools/1x1.png",
+    "http://127.0.0.1:9811/badge.png",
+    "http://127.0.0.1:9811/logo/2.png",
+    "https://l-userpic.livejournal.com/123456/photo.jpg",
+    "https://example.com/icons8-official-gmail.svg",
+  ];
+  for (const url of JUNK) {
+    const out = scanPageMedia(fakeDoc([img({ src: url })]), BASE);
+    check(`junk still dropped: ${url}`, out.media.map((m) => m.url), []);
+  }
+}
+
+// Content filenames that merely CONTAIN a junk word must survive.
+{
+  const KEPT = [
+    "http://127.0.0.1:9811/media/Play-Station-5.jpg",
+    "http://127.0.0.1:9811/media/Search-and-rescue.jpg",
+    "http://127.0.0.1:9811/gallery/photo-avatar-1.jpg",
+    "http://127.0.0.1:9811/media/pixel-art-500.jpg",
+    "http://127.0.0.1:9811/pics/post/%D0%BA%D0%BB%D1%83%D0%B1-%D0%BB%D1%8E%D0%B1%D0%B8%D1%82%D0%B5%D0%BB%D0%B5%D0%B9-9489969.jpeg",
+    "http://127.0.0.1:9811/media/500.png",
+  ];
+  for (const url of KEPT) {
+    const out = scanPageMedia(fakeDoc([img({ src: url })]), BASE);
+    check(`content name kept: ${url}`, out.media.map((m) => m.url), [url]);
+  }
+}
 
 // --- D-03: navigation links are capped, media links are not ---------------
 

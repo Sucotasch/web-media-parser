@@ -84,6 +84,10 @@ class TestAsyncClientManager(unittest.TestCase):
             self.assertIn("headers", kwargs)
             self.assertEqual(kwargs["headers"], expected_headers)
             
+            # DL-8: and with the explicit threaded-resolver connector.
+            self.assertIn("connector", kwargs)
+            self.assertIsInstance(kwargs["connector"]._resolver, aiohttp.ThreadedResolver)
+
             # Check timeout (aiohttp.ClientTimeout objects might not be directly comparable if defaults differ subtly)
             self.assertIn("timeout", kwargs)
             actual_timeout = kwargs["timeout"]
@@ -121,6 +125,30 @@ class TestAsyncClientManager(unittest.TestCase):
         asyncio.run(_test())
 
     # --- Phase 4 (DL) ---
+
+    def test_session_uses_threaded_resolver(self):
+        """DL-8: the shared session must not resolve through the optional
+        aiodns/c-ares resolver.
+
+        Measured: with aiodns importable, aiohttp's default connector timed out
+        5/5 on connect (at the 5 s cap, for two hosts and even for a literal-IP
+        URL) while requests and the OS resolver were fine; passing a
+        ThreadedResolver answered 200 in 632 ms. The engine must not depend on
+        whether that optional package happens to be installed.
+        """
+        manager = AsyncClientManager(settings={})
+
+        async def _test():
+            session = await manager.get_session()
+            try:
+                # `_resolver` is the only way to see which resolver the connector
+                # actually holds; it is stable across aiohttp 3.x.
+                self.assertIsInstance(session.connector._resolver, aiohttp.ThreadedResolver)
+            finally:
+                await manager.close()
+
+        asyncio.run(_test())
+
 
     def test_default_headers_never_include_cookie_header(self):
         """DL-7: extension cookies must not become a session-level Cookie header

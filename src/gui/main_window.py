@@ -84,6 +84,30 @@ def _folder_name_is_safe(name: str) -> bool:
     return name.split(".", 1)[0].upper() not in _WINDOWS_RESERVED_NAMES
 
 
+def task_folder_from_url(url: str, timestamp: str, fallback: str = "site"):
+    """Download-folder name for a URL typed into the URL field.
+
+    The netloc here is USER TEXT, not a hostname we produced. The URL-input path
+    used to build the name itself (`url.split("/")[2].replace(".", "_")`), which
+    passes a port, userinfo or an IPv6 literal through untouched: nothing in
+    `127.0.0.1:9845`, `localhost:8080`, `user:pass@host` or `[::1]:8080` is legal
+    in a Windows path component, so `os.makedirs()` raised
+    `NotADirectoryError` ([WinError 267]) and Start did nothing for every such
+    address (measured 2026-10-16: the exception escaped `start_parsing()`).
+
+    Same rule the extension payloads already use: sanitise with
+    `_safe_domain_folder`, then verify with `_folder_name_is_safe`. Returns None
+    when the name still cannot be made legal, so the caller refuses loudly
+    instead of starting a task whose folder would never exist.
+    """
+    try:
+        netloc = url.split("/")[2]
+    except IndexError:
+        netloc = ""
+    folder = f"{_safe_domain_folder(netloc, fallback)}_{timestamp}"
+    return folder if _folder_name_is_safe(folder) else None
+
+
 def apply_extension_payloads(payloads, apply_one, on_error):
     """s8: materialize every buffered extension payload independently.
 
@@ -597,8 +621,13 @@ class MainWindow(QMainWindow):
 
         # Create download folder and fix settings snapshot at add-time
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        domain = url.split("/")[2].replace(".", "_")
-        task_folder = f"{domain}_{timestamp}"
+        task_folder = task_folder_from_url(url, timestamp)
+        if task_folder is None:
+            logger.error(f"Refusing an uncreatable task folder name for {url!r}")
+            self.log_handler.error(
+                f"Cannot add: no usable download folder name for {url}"
+            )
+            return
         download_path = os.path.join(self.download_dir, task_folder)
         os.makedirs(download_path, exist_ok=True)
 
@@ -934,11 +963,13 @@ class MainWindow(QMainWindow):
 
                     # Otherwise create new folder and queue for download
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    try:
-                        domain = url.split("/")[2].replace(".", "_")
-                    except IndexError:
-                        domain = "unknown"
-                    task_folder = f"{domain}_{timestamp}"
+                    task_folder = task_folder_from_url(url, timestamp, fallback="unknown")
+                    if task_folder is None:
+                        # A row that cannot name a folder must cost only that row,
+                        # not the whole import (the URLs here are file text too).
+                        logger.error(f"Skipping an uncreatable folder name for {url!r}")
+                        skipped += 1
+                        continue
                     download_path = os.path.join(self.download_dir, task_folder)
                     os.makedirs(download_path, exist_ok=True)
 
@@ -1096,10 +1127,18 @@ class MainWindow(QMainWindow):
             self.log_handler.info("Pausing active task before starting new one")
             self._pause_current_for_switch()
 
-        # Create download folder with timestamp
+        # Create download folder with timestamp. NF-11 for this path: the netloc
+        # is user text — a port / userinfo / IPv6 literal in it is not a legal
+        # Windows folder name, and the old inline `split("/")[2].replace(".", "_")`
+        # let those straight through to makedirs().
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        domain = url.split("/")[2].replace(".", "_")
-        task_folder = f"{domain}_{timestamp}"
+        task_folder = task_folder_from_url(url, timestamp)
+        if task_folder is None:
+            logger.error(f"Refusing an uncreatable task folder name for {url!r}")
+            self.log_handler.error(
+                f"Cannot start: no usable download folder name for {url}"
+            )
+            return
         download_path = os.path.join(self.download_dir, task_folder)
         os.makedirs(download_path, exist_ok=True)
 

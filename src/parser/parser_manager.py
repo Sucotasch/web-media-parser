@@ -88,6 +88,22 @@ class ParserManager(QObject):
 
         self.max_depth = self.settings.get(K.SETTING_SEARCH_DEPTH, K.DEFAULT_SEARCH_DEPTH)
         self.page_limit = self.settings.get("page_limit", 1000)
+        # P4: chunked synchronisation of excavation with download throughput.
+        # `backlog_hwm` = pause starting new pages at this many queued downloads,
+        # `backlog_lwm` = resume once it has drained to this many. 0 = gate off.
+        self.backlog_hwm = self._read_int_setting(K.SETTING_CRAWL_BACKLOG_HWM, K.DEFAULT_CRAWL_BACKLOG_HWM)
+        self.backlog_lwm = self._read_int_setting(K.SETTING_CRAWL_BACKLOG_LWM, K.DEFAULT_CRAWL_BACKLOG_LWM)
+        if self.backlog_hwm > 0 and self.backlog_lwm >= self.backlog_hwm:
+            # A low watermark at/above the high one would make the gate release
+            # itself the instant it engages (resume <= pause), i.e. no throttling
+            # at all. Fall back to a fifth of the high watermark.
+            logger.warning(
+                f"crawl_backlog_lwm ({self.backlog_lwm}) >= crawl_backlog_hwm "
+                f"({self.backlog_hwm}) — using {max(1, self.backlog_hwm // 5)} as the resume level"
+            )
+            self.backlog_lwm = max(1, self.backlog_hwm // 5)
+        self.backlog_pauses = 0            # how many times excavation was gated
+        self.backlog_pause_seconds = 0.0   # total time spent gated (stats/logs)
         
         self.domain_health = {}
         self.quarantined_domains = set()
@@ -552,6 +568,75 @@ class ParserManager(QObject):
         logger.debug("All queues empty, waiting for completion signal.")
         return False
 
+    async def _await_download_capacity(self) -> None:
+        """P4: hold off excavation while the download backlog is full.
+
+        Excavating a page is what creates MORE work (links to follow, media to
+        download), while downloads drain at a fixed rate — measured on reactor.cc
+        and on the fixture: media are found 2-6x faster than they are downloaded,
+        so the backlog, the requests behind it and RSS all grew monotonically for
+        as long as the run lasted. This gate chunks the two: above HWM the parser
+        stops *starting* pages until the downloaders have drained the backlog to
+        LWM.
+
+        Deliberately gated on the DOWNLOAD queue, never on the URL frontier:
+        pending URLs only shrink when a parser worker pops one, and those workers
+        are exactly what a frontier watermark would suspend — the crawl would sit
+        frozen with nothing able to reduce the count. Downloader workers drain the
+        download queue on their own, so this gate always releases.
+        """
+        hwm = self.backlog_hwm
+        if hwm <= 0 or self.download_queue is None:
+            return
+        if self.download_queue.qsize() < hwm:
+            return
+
+        logger.info(
+            f"Download backlog {self.download_queue.qsize()} >= {hwm}: pausing page "
+            f"excavation until it drains to {self.backlog_lwm}"
+        )
+        self.backlog_pauses += 1
+        waited = 0.0
+        last_depth = self.download_queue.qsize()
+        unchanged_for = 0.0
+        while not self._stop_event.is_set():
+            await asyncio.sleep(K.CRAWL_BACKLOG_POLL_SECONDS)
+            waited += K.CRAWL_BACKLOG_POLL_SECONDS
+            depth = self.download_queue.qsize()
+            if depth != last_depth:
+                last_depth = depth
+                unchanged_for = 0.0
+            else:
+                unchanged_for += K.CRAWL_BACKLOG_POLL_SECONDS
+            if depth <= self.backlog_lwm:
+                self.backlog_pause_seconds += waited
+                logger.info(
+                    f"Download backlog drained to {depth}: resuming page excavation "
+                    f"(paused {waited:.0f}s)"
+                )
+                return
+            if unchanged_for >= K.CRAWL_BACKLOG_STALL_TIMEOUT:
+                # Safety valve: a jammed downloader (hung connection, dead host)
+                # must not freeze the crawl for the rest of the task.
+                self.backlog_pause_seconds += waited
+                logger.warning(
+                    f"Download backlog stuck at {depth} for {unchanged_for:.0f}s — "
+                    f"resuming excavation anyway (nothing to download might still be runnable)"
+                )
+                return
+        self.backlog_pause_seconds += waited
+
+    def _read_int_setting(self, key: str, default: int) -> int:
+        """Tolerant int read for settings handed in as JSON (None/"abc" -> default)."""
+        raw = self.settings.get(key, default)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid integer setting {key}={raw!r} — using {default}")
+            return default
+
     async def _get_next_url_to_parse(self) -> Optional[Tuple[str, int, str, Dict[str, Any]]]:
         try:
             return await self.url_queue.get(timeout=0.5) 
@@ -961,6 +1046,10 @@ class ParserManager(QObject):
                 # All work is done, but keep the worker alive until stop is requested
                 await asyncio.sleep(1.0)
                 continue
+            # P4: don't excavate new pages while the downloader is behind.
+            await self._await_download_capacity()
+            if self._stop_event.is_set():
+                break
             url_data = await self._get_next_url_to_parse()
             if not url_data:
                 await asyncio.sleep(0.1) 

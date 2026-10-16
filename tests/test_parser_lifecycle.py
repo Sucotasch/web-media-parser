@@ -30,7 +30,7 @@ from src.parser.parser_manager import ParserManager
 from src.parser.priority_url_queue import PriorityURLQueue
 from src.gui.main_window import (
     apply_extension_payloads, build_extension_task_settings,
-    build_extension_task_payload, _folder_name_is_safe,
+    build_extension_task_payload, _folder_name_is_safe, task_folder_from_url,
 )
 from src import constants as K
 
@@ -330,6 +330,60 @@ class TestMainTaskEmitsFailedOnPreCrash(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(emitted, ["failed"])
+
+
+class TestUrlInputFolderName(unittest.TestCase):
+    """The URL field is user text: a netloc with a port / userinfo / IPv6 literal
+    used to be pasted into the folder name verbatim, so `os.makedirs` raised
+    NotADirectoryError (WinError 267) and Start silently did nothing
+    (measured 2026-10-16 — the exception escaped out of start_parsing).
+
+    The folder is built by `task_folder_from_url`, the same
+    sanitise-then-verify rule the extension payloads already use, and the name
+    is created for real here because creating it is the caller's first act.
+    """
+
+    TS = "20261016_120000"
+
+    def _folder_that_creates(self, url):
+        folder = task_folder_from_url(url, self.TS)
+        self.assertIsNotNone(folder, f"no folder name produced for {url!r}")
+        self.assertTrue(_folder_name_is_safe(folder), f"illegal name {folder!r}")
+        self.assertNotIn(":", folder)
+        self.assertTrue(folder.endswith("_" + self.TS))
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, folder))
+        return folder
+
+    def test_addresses_with_a_port_get_a_creatable_folder(self):
+        for url in ("http://127.0.0.1:9845/album",
+                    "https://localhost:8080/post/1",
+                    "http://192.168.1.7:3000/",
+                    "http://example.com:8080/a"):
+            self._folder_that_creates(url)
+
+    def test_userinfo_and_ipv6_literals_are_neutralised(self):
+        self.assertTrue(self._folder_that_creates("http://user:pass@example.com/p")
+                        .startswith("example_com_"))
+        self._folder_that_creates("http://[::1]:8080/p")
+
+    def test_the_hostname_is_still_the_folder_name(self):
+        # Unchanged for the addresses that always worked.
+        self.assertEqual(task_folder_from_url("https://reactor.cc/post/6382634", self.TS),
+                         f"reactor_cc_{self.TS}")
+        self.assertEqual(task_folder_from_url("https://www.sub.example.co.uk/a", self.TS),
+                         f"www_sub_example_co_uk_{self.TS}")
+
+    def test_a_name_that_cannot_be_made_legal_is_refused_not_raised(self):
+        # The sanitizer cannot produce an illegal component today — this pins the
+        # refusal so the caller stops before makedirs instead of starting a task
+        # whose folder never appears.
+        with patch("src.gui.main_window._safe_domain_folder", return_value="bad:name"):
+            self.assertIsNone(task_folder_from_url("https://example.com/a", self.TS))
+
+    def test_a_url_without_a_netloc_falls_back_instead_of_raising(self):
+        # "https://" alone reaches here after the scheme is prepended.
+        self.assertEqual(task_folder_from_url("https://", self.TS), f"site_{self.TS}")
 
 
 if __name__ == "__main__":

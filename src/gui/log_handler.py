@@ -9,6 +9,8 @@ import html
 import logging
 from PySide6.QtCore import Signal, Slot, QObject
 
+from src import constants as K
+
 
 class LogFilter:
     """
@@ -46,6 +48,14 @@ class GUILogHandler(QObject, logging.Handler):
         self.text_edit = text_edit
         self.text_edit.setReadOnly(True)
         self.text_edit.setAcceptRichText(True)
+        # Errors.txt (2): the widget is a ROLLING window, not an ever-growing
+        # document. message_history keeps the last 5000 records, but the
+        # QTextEdit document kept every line for the whole session — at GUI
+        # DEBUG level that is the parser's whole output (measured: +118 MB RSS
+        # per 200 000 appended records, while the Python heap stayed flat at
+        # 1.6 MB, because a QTextDocument lives in Qt's C++ heap). Same window
+        # for both, so the view can never claim more than the history holds.
+        self.text_edit.document().setMaximumBlockCount(K.GUI_LOG_MAX_BLOCKS)
         self.log_signal.connect(self._append_log)
         self.clear_signal.connect(self._clear_log)
         
