@@ -350,3 +350,30 @@ class TestUrlInflationGuard:
             return not q.empty()
 
         assert asyncio.run(main())
+
+
+class TestSanitizeSearchDepth:
+    def _sanitize(self, settings):
+        from src.gui.settings_dialog import SettingsDialog
+        return SettingsDialog.sanitize_settings(settings)
+
+    def test_search_depth_unlimited_preserved(self):
+        out = self._sanitize({"search_depth": -1})
+        assert out["search_depth"] == -1
+
+    def test_search_depth_zero_preserved(self):
+        out = self._sanitize({"search_depth": 0})
+        assert out["search_depth"] == 0
+
+    def test_search_depth_normal_range(self):
+        out = self._sanitize({"search_depth": 5})
+        assert out["search_depth"] == 5
+        out = self._sanitize({"search_depth": 10})
+        assert out["search_depth"] == 10
+
+    def test_search_depth_clamped_extremes(self):
+        out = self._sanitize({"search_depth": -10})
+        assert out["search_depth"] == -1
+        out = self._sanitize({"search_depth": 25})
+        assert out["search_depth"] == 10
+

@@ -460,3 +460,46 @@ class TestQueueSignalsThatDriveAutosave(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".tmp"))
             fresh = TaskQueueManager(base_download_dir=d)
             self.assertEqual(fresh.load(path), 1)
+
+
+class TestSearchDepthComboWiring(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            from PySide6.QtWidgets import QApplication
+        except Exception as e:
+            raise unittest.SkipTest(f"PySide6 unavailable: {e}")
+        try:
+            cls.app = QApplication.instance() or QApplication([])
+        except Exception as e:
+            raise unittest.SkipTest(f"Qt could not initialize: {e}")
+
+    def test_search_depth_combo_values_and_roundtrip(self):
+        from src.gui.settings_dialog import SettingsDialog
+        dialog = SettingsDialog()
+        self.addCleanup(dialog.deleteLater)
+
+        # Check items in combo: 0..10 and -1
+        data_values = [dialog.search_depth_combo.itemData(i) for i in range(dialog.search_depth_combo.count())]
+        self.assertIn(0, data_values)
+        self.assertIn(3, data_values)
+        self.assertIn(10, data_values)
+        self.assertIn(-1, data_values)
+
+        # Test setting -1 (Unlimited)
+        dialog.settings[K.SETTING_SEARCH_DEPTH] = -1
+        dialog.apply_settings_to_ui()
+        self.assertEqual(dialog.search_depth_combo.currentData(), -1)
+
+        saved = dialog.get_settings_from_ui()
+        self.assertEqual(saved[K.SETTING_SEARCH_DEPTH], -1)
+
+        # Test setting 0 (Start page only)
+        dialog.settings[K.SETTING_SEARCH_DEPTH] = 0
+        dialog.apply_settings_to_ui()
+        self.assertEqual(dialog.search_depth_combo.currentData(), 0)
+
+        saved = dialog.get_settings_from_ui()
+        self.assertEqual(saved[K.SETTING_SEARCH_DEPTH], 0)
+

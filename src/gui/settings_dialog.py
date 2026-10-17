@@ -96,10 +96,19 @@ class SettingsDialog(QDialog):
 
         # Search depth
         parser_grid.addWidget(QLabel("Search Depth:"), 0, 0)
-        self.search_depth_spin = QSpinBox()
-        self.search_depth_spin.setRange(0, 10)
-        self.search_depth_spin.setToolTip("Maximum link depth for parsing")
-        parser_grid.addWidget(self.search_depth_spin, 0, 1)
+        self.search_depth_combo = QComboBox()
+        self.search_depth_combo.addItem("0 (Start page only)", 0)
+        self.search_depth_combo.addItem("1", 1)
+        self.search_depth_combo.addItem("2", 2)
+        self.search_depth_combo.addItem("3 (Default)", 3)
+        for d in range(4, 11):
+            self.search_depth_combo.addItem(str(d), d)
+        self.search_depth_combo.addItem("Unlimited", -1)
+        self.search_depth_combo.setToolTip(
+            "Maximum link depth for parsing (0 = start page only, Unlimited = no depth limit; "
+            "recommend enabling 'Stay in Domain' with Unlimited)"
+        )
+        parser_grid.addWidget(self.search_depth_combo, 0, 1)
 
         # Content limit (pages from which files were downloaded)
         parser_grid.addWidget(QLabel("Content Limit:"), 1, 0)
@@ -737,7 +746,13 @@ class SettingsDialog(QDialog):
         Apply loaded settings to UI elements (all tooltips and labels in English)
         """
         # Parser settings
-        self.search_depth_spin.setValue(self.settings.get("search_depth", 3))
+        depth_val = self.settings.get("search_depth", K.DEFAULT_SEARCH_DEPTH)
+        idx = self.search_depth_combo.findData(depth_val)
+        if idx >= 0:
+            self.search_depth_combo.setCurrentIndex(idx)
+        else:
+            default_idx = self.search_depth_combo.findData(K.DEFAULT_SEARCH_DEPTH)
+            self.search_depth_combo.setCurrentIndex(default_idx if default_idx >= 0 else 0)
         self.page_limit_spin.setValue(self.settings.get("page_limit", 1000))
         self.backlog_hwm_spin.setValue(
             self.settings.get(K.SETTING_CRAWL_BACKLOG_HWM, K.DEFAULT_CRAWL_BACKLOG_HWM)
@@ -854,7 +869,7 @@ class SettingsDialog(QDialog):
         # previous setting, e.g. page_timeout 30). interpretText() validates
         # the typed text and applies it to the widget's value first.
         for spin in (
-            self.search_depth_spin, self.page_limit_spin, self.page_timeout_spin,
+            self.page_limit_spin, self.page_timeout_spin,
             self.backlog_hwm_spin, self.backlog_lwm_spin,
             self.min_image_width_spin, self.min_image_height_spin,
             self.min_image_size_spin, self.min_video_size_spin,
@@ -865,7 +880,8 @@ class SettingsDialog(QDialog):
             spin.interpretText()
 
         # Parser settings (GUI-8: keys via K.* — single source of truth)
-        settings[K.SETTING_SEARCH_DEPTH] = self.search_depth_spin.value()
+        depth_val = self.search_depth_combo.currentData()
+        settings[K.SETTING_SEARCH_DEPTH] = depth_val if depth_val is not None else K.DEFAULT_SEARCH_DEPTH
         settings[K.SETTING_PAGE_LIMIT] = self.page_limit_spin.value()
         settings[K.SETTING_CRAWL_BACKLOG_HWM] = self.backlog_hwm_spin.value()
         settings[K.SETTING_CRAWL_BACKLOG_LWM] = self.backlog_lwm_spin.value()
@@ -976,7 +992,7 @@ class SettingsDialog(QDialog):
     def sanitize_settings(settings: dict) -> dict:
         """Clamp all numeric settings to safe ranges and strip dangerous chars from strings."""
         clamps = {
-            "search_depth": (0, 10),
+            "search_depth": (-1, 10),
             "page_limit": (0, 10000),  # 0 = unlimited (matches UI tooltip)
             "crawl_backlog_hwm": (0, 100000),  # P4 gate: 0 = off
             "crawl_backlog_lwm": (0, 100000),

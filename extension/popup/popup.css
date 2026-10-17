@@ -8,15 +8,21 @@ h1 { font-size: 14px; font-weight: 600; }
 .status.offline:hover { background: #b71c1c; }
 .status.saving { background: #0277bd; color: #fff; }
 #scan-section { padding: 12px 14px; }
+.scan-buttons { display: flex; gap: 8px; width: 100%; }
+.scan-buttons #scan-btn { flex: 1.15; }
+.scan-buttons #deep-crawl-btn { flex: 1; }
 button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
 button.primary { background: #1976d2; color: #fff; }
+button.secondary { background: #262626; color: #90caf9; border: 1px solid #3d3d3d; border-radius: 4px; padding: 8px 12px; font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap; }
+button.secondary:hover { background: #303030; border-color: #555; color: #bbdefb; }
+button.secondary:disabled { background: #202020; color: #555; border-color: #2e2e2e; cursor: not-allowed; }
 button.full-width { width: 100%; }
 button.primary:hover { background: #1565c0; }
 button:disabled, button.primary:disabled { background: #333; color: #777; cursor: not-allowed; }
 /* One visible focus treatment for every control. Without it a button kept the UA
    ring (a near-black 1px outline on the blue primary button here = invisible) and
    the selects had `outline: none` with only a 1px border tint as the cue. */
-button:focus-visible, select:focus-visible, input:focus-visible {
+button:focus-visible, select:focus-visible, input:focus-visible, .media-item .url:focus-visible {
   outline: 2px solid #64b5f6;
   outline-offset: 1px;
 }
@@ -43,7 +49,24 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .media-item .thumb-glyph { font-size: 20px; color: #666; }
 .media-item .thumb-img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .media-item .info { flex: 1; min-width: 0; }
-.media-item .url { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.media-item .url {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.15s;
+  border-radius: 2px;
+}
+.media-item .url:hover {
+  color: #90caf9;
+  text-decoration: underline;
+}
+.media-item .url.copied {
+  color: #4caf50;
+  font-weight: 500;
+  text-decoration: none;
+}
 .media-item .meta { font-size: 11px; color: #888; margin-top: 2px; }
 .media-item .meta .type-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-size: 10px; font-weight: 600; }
 .type-image { background: #1565c0; color: #fff; }
@@ -60,8 +83,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
    The row is now a single line, the two labels keep their own width and their side, and
    the buttons are pinned right without shrinking. popup.js keeps the transient labels
    SHORTER than the steady ones so nothing can ever grow into the row. */
-.actions { display: flex; align-items: center; padding: 10px 0 0; flex-wrap: nowrap; gap: 6px 8px; }
-.deep-parse-warning { width: 100%; font-size: 11px; color: #ffb74d; padding: 4px 0 0; }
+.actions { display: flex; align-items: center; justify-content: space-between; padding: 10px 0 0; flex-wrap: nowrap; gap: 8px; }
+.actions-left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .concurrent-limit-input { width: 45px; margin-inline-start: 6px; }
 .actions-buttons { display: flex; gap: 8px; margin-inline-start: auto; flex-shrink: 0; }
 .actions label { font-size: 12px; color: #aaa; flex-shrink: 0; white-space: nowrap; }

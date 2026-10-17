@@ -951,12 +951,12 @@ class ParserManager(QObject):
             return
 
         # Depth gate: excavation (following page links to find new content)
-        # stops at max_depth. Media lookups (direct media URLs + from_image
-        # thumbnail→fullsize transitions) are never depth-limited — the same
-        # exemption philosophy as stay-in-domain: a gallery reached deep must
-        # still yield its viewer pages and fullsize images instead of dying as
-        # a silent dead end.
-        can_follow_excavation = depth < self.max_depth
+        # stops at max_depth (or continues indefinitely if max_depth < 0, e.g. -1).
+        # Media lookups (direct media URLs + from_image thumbnail→fullsize
+        # transitions) are never depth-limited — the same exemption philosophy
+        # as stay-in-domain: a gallery reached deep must still yield its viewer
+        # pages and fullsize images instead of dying as a silent dead end.
+        can_follow_excavation = (self.max_depth < 0) or (depth < self.max_depth)
         urls_to_queue = []
         if isinstance(links_data, dict): # From WebpageParser
             for disc_url, link_ctx in links_data.items(): urls_to_queue.append((disc_url, link_ctx))
@@ -1131,7 +1131,7 @@ class ParserManager(QObject):
                 if is_webpage_url(abs_url) and not is_media_url(abs_url):
                     logger.debug(f"Treating as webpage rather than media: {abs_url}")
                     assumed_depth_for_media_webpage = 1 
-                    if assumed_depth_for_media_webpage < self.max_depth:
+                    if self.max_depth < 0 or assumed_depth_for_media_webpage < self.max_depth:
                         ctx = {"source_url": source_url, "start_url": self.start_url, "from_media_item": True, "media_context": attrs, "priority": 5.0}
                         await self.url_queue.put(abs_url, assumed_depth_for_media_webpage, self.start_url, ctx)
                     continue

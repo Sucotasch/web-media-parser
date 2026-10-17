@@ -186,6 +186,38 @@ class TestProcessResultsDepthGate(unittest.TestCase):
         self.assertIn("https://www.pictoa.com/albums/start-1.html/54376303.html", queued)
         self.assertIn("https://www.pictoa.com/c/brunette-14", queued)
 
+    def test_unlimited_depth_allows_excavation_at_any_depth(self):
+        pm = self._make_manager(depth=-1)
+        links_data = {
+            "https://www.pictoa.com/albums/start-1.html/54376303.html": {
+                "from_image": True, "thumbnail_url": "https://t1.pictoa.com/t.jpg"},
+            "https://www.pictoa.com/c/brunette-14": {"text": "tag"},
+        }
+        asyncio.run(pm._process_parser_results(
+            url="https://www.pictoa.com/albums/start-1.html", depth=10,
+            links_data=links_data, media_files=[],
+            original_url_context={"start_url": "https://www.pictoa.com/albums/start-1.html"},
+        ))
+        queued = [c[0][0] for c in pm.url_queue.put.call_args_list]
+        self.assertIn("https://www.pictoa.com/albums/start-1.html/54376303.html", queued)
+        self.assertIn("https://www.pictoa.com/c/brunette-14", queued)
+
+    def test_zero_depth_stops_excavation_at_start_page(self):
+        pm = self._make_manager(depth=0)
+        links_data = {
+            "https://www.pictoa.com/albums/start-1.html/54376303.html": {
+                "from_image": True, "thumbnail_url": "https://t1.pictoa.com/t.jpg"},
+            "https://www.pictoa.com/c/brunette-14": {"text": "tag"},
+        }
+        asyncio.run(pm._process_parser_results(
+            url="https://www.pictoa.com/albums/start-1.html", depth=0,
+            links_data=links_data, media_files=[],
+            original_url_context={"start_url": "https://www.pictoa.com/albums/start-1.html"},
+        ))
+        queued = [c[0][0] for c in pm.url_queue.put.call_args_list]
+        self.assertIn("https://www.pictoa.com/albums/start-1.html/54376303.html", queued)
+        self.assertNotIn("https://www.pictoa.com/c/brunette-14", queued)
+
 
 class TestSameGalleryPriority(unittest.TestCase):
     """F5: structural same-gallery boost — the current gallery drains before

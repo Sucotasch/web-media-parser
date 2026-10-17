@@ -12,9 +12,10 @@ let concurrentLimit = 2;
 
 // DOM elements
 const scanBtn = document.getElementById("scan-btn");
+const deepCrawlBtn = document.getElementById("deep-crawl-btn");
+const copyLinksBtn = document.getElementById("copy-links-btn");
 const downloadBtn = document.getElementById("download-btn");
 const selectAllCheckbox = document.getElementById("select-all");
-const oneShotCheckbox = document.getElementById("one-shot");
 const mediaList = document.getElementById("media-list");
 const countSpan = document.getElementById("count");
 // #selected-count / #chrome-count are NOT cached: their spans are rewritten by
@@ -40,7 +41,6 @@ const chromeCountSpan = document.getElementById("chrome-count");
 function isNotMedia(item) {
   return !!item && item.mediaVerdict === "not-media";
 }
-const deepParseWarning = document.getElementById("deep-parse-warning");
 const concurrentLimitInput = document.getElementById("concurrent-limit");
 
 // Errors.txt #3 (popup closed and re-opened): the two module filter variables were only
@@ -53,22 +53,17 @@ const concurrentLimitInput = document.getElementById("concurrent-limit");
 // the user sees — start from it, and `change` keeps the pair in sync afterwards.
 activeDomainFilter = domainFilter.value;
 activeSourceFilter = sourceFilter.value;
+let isAppConnected = false;
 
-function updateOneShotMode() {
-  const isDeepParse = !oneShotCheckbox.checked;
-  deepParseWarning.classList.toggle("hidden", !isDeepParse);
-  chromeDownloadBtn.disabled = isDeepParse || getVisibleCheckboxes().length === 0;
-  // The "Download N" counter lived in a <span> that `textContent = "Parse Page"`
-  // DELETED, and the reference to it kept pointing at the detached node: one
-  // toggle of "Page only" and the button showed a bare "Download" for the rest
-  // of the popup's life (measured). Rebuild the span and re-count instead.
-  downloadBtn.innerHTML = isDeepParse ? "Parse Page" : 'Send to App <span id="selected-count">0</span>';
-  downloadBtn.disabled = false;
-  concurrentLimitInput.disabled = isDeepParse;
+function updateAppButtonsState() {
+  if (deepCrawlBtn) {
+    deepCrawlBtn.disabled = !isAppConnected;
+    deepCrawlBtn.title = isAppConnected
+      ? "Send page URL to desktop app for recursive deep link traversal"
+      : "Desktop app not running — click Disconnected above to set up";
+  }
   updateCount();
 }
-
-oneShotCheckbox.addEventListener("change", updateOneShotMode);
 
 // --- Connection check ---
 
@@ -82,12 +77,16 @@ async function checkConnection() {
       statusDiv.className = "status online";
       // "Q: 2 | D: 5" is the product's own shorthand - spell it out on hover.
       statusDiv.title = "Desktop app connected — Q: queued tasks, D: files downloaded";
+      isAppConnected = true;
+      updateAppButtonsState();
       return true;
     }
   } catch (e) {}
   statusDiv.textContent = "Disconnected";
   statusDiv.className = "status offline";
   statusDiv.title = "Desktop app not running — click to view setup guide & download";
+  isAppConnected = false;
+  updateAppButtonsState();
   return false;
 }
 
@@ -433,9 +432,20 @@ function renderMediaList() {
     const thumb = document.createElement("button");
     thumb.type = "button";
     thumb.className = "thumb";
-    thumb.title = "Open in a new tab";
+    thumb.title = "Open in a background tab next to this page";
     thumb.setAttribute("aria-label", `Open ${item.url} in a new tab`);
-    thumb.addEventListener("click", () => { chrome.tabs.create({ url: item.url }); });
+    thumb.addEventListener("click", async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        chrome.tabs.create({
+          url: item.url,
+          index: tab ? tab.index + 1 : undefined,
+          active: false,
+        });
+      } catch (e) {
+        chrome.tabs.create({ url: item.url, active: false });
+      }
+    });
 
     const glyph = document.createElement("span");
     glyph.className = "thumb-glyph";
@@ -468,7 +478,47 @@ function renderMediaList() {
     const urlDiv = document.createElement("div");
     urlDiv.className = "url";
     urlDiv.textContent = item.url;
-    urlDiv.title = item.url;
+    urlDiv.title = `Click to copy link:\n${item.url}`;
+    urlDiv.setAttribute("role", "button");
+    urlDiv.setAttribute("tabindex", "0");
+    urlDiv.setAttribute("aria-label", `Copy link ${item.url}`);
+
+    const copyUrl = async () => {
+      // Don't copy if user was selecting/dragging text with mouse
+      const selection = window.getSelection() ? window.getSelection().toString() : "";
+      if (selection.length > 0) return;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(item.url);
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = item.url;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+        }
+        urlDiv.classList.add("copied");
+        const originalText = item.url;
+        urlDiv.textContent = "\u2713 Copied to clipboard!";
+        setTimeout(() => {
+          urlDiv.classList.remove("copied");
+          urlDiv.textContent = originalText;
+        }, 1200);
+      } catch (err) {
+        showError(`Failed to copy: ${err.message}`);
+      }
+    };
+
+    urlDiv.addEventListener("click", copyUrl);
+    urlDiv.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        copyUrl();
+      }
+    });
 
     const metaDiv = document.createElement("div");
     metaDiv.className = "meta";
@@ -565,16 +615,16 @@ function updateCount() {
   const noneSelected = checkedCount === 0;
   // A disabled control without a reason reads as a broken one: keep the button
   // in place and say what is missing on hover.
-  downloadBtn.disabled = noneSelected;
-  downloadBtn.title = noneSelected
-    ? "Select at least one item first"
-    : "Send the selected items to the desktop app queue";
-  chromeDownloadBtn.disabled = !oneShotCheckbox.checked || noneSelected;
-  chromeDownloadBtn.title = !oneShotCheckbox.checked
-    ? "Available only with Page only ticked"
+  downloadBtn.disabled = noneSelected || !isAppConnected;
+  downloadBtn.title = !isAppConnected
+    ? "Desktop app not running"
     : noneSelected
       ? "Select at least one item first"
-      : "Save the selected files with Chrome's own downloader";
+      : "Download selected items in desktop app";
+  chromeDownloadBtn.disabled = noneSelected;
+  chromeDownloadBtn.title = noneSelected
+    ? "Select at least one item first"
+    : "Save selected files with Chrome's own downloader";
   selectAllCheckbox.checked = checkedCount === total && total > 0;
 }
 
@@ -653,24 +703,30 @@ chromeDownloadBtn.addEventListener("click", async () => {
   }
 });
 
-// --- Download ---
+// --- Deep Crawl handler ---
 
-downloadBtn.addEventListener("click", async () => {
-  const oneShot = oneShotCheckbox.checked;
+async function sendDeepCrawl(triggerBtn) {
+  const btn = triggerBtn || deepCrawlBtn;
+  if (!btn) return;
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = "Sending...";
+  await chrome.action.setBadgeText({ text: "..." });
+  await chrome.action.setBadgeBackgroundColor({ color: "#2196F3" });
 
-  if (!oneShot) {
-    // Deep parse: just send the page URL to desktop, no scan needed
-    downloadBtn.disabled = true;
-    downloadBtn.innerHTML = "Sending...";
-    await chrome.action.setBadgeText({ text: "..." });
-    await chrome.action.setBadgeBackgroundColor({ color: "#2196F3" });
+  try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const pageUrl = tab ? tab.url : "";
     let context = {};
     try { context = await chrome.runtime.sendMessage({ action: "getContext", tabId: tab?.id }); } catch (e) {}
-    const resp = await chrome.runtime.sendMessage({ action: "download", urls: [{ url: pageUrl }], one_shot: false, context });
+    const resp = await chrome.runtime.sendMessage({
+      action: "download",
+      urls: [{ url: pageUrl }],
+      one_shot: false,
+      context
+    });
     if (resp && resp.ok) {
-      downloadBtn.innerHTML = "\u2713 Sent to app";
+      btn.innerHTML = "\u2713 Sent to app";
       await chrome.action.setBadgeText({ text: "\u2713" });
       await chrome.action.setBadgeBackgroundColor({ color: "#4CAF50" });
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
@@ -680,16 +736,98 @@ downloadBtn.addEventListener("click", async () => {
       await chrome.action.setBadgeBackgroundColor({ color: "#F44336" });
       chrome.runtime.sendMessage({ action: "clearBadgeAfter", delay: 3000 });
     }
-    setTimeout(() => {
-      downloadBtn.innerHTML = !oneShotCheckbox.checked ? "Parse Page" : 'Send to App <span id="selected-count">0</span>';
-      downloadBtn.disabled = false;
-      updateCount();
-    }, 1500);
-    await checkConnection();
-    return;
+  } catch (e) {
+    showError(`Failed to send: ${e.message}`);
   }
 
-  // Page only: scan first, then send selected items
+  setTimeout(() => {
+    btn.innerHTML = originalHtml;
+    btn.disabled = !isAppConnected;
+  }, 1500);
+  await checkConnection();
+}
+
+if (deepCrawlBtn) {
+  deepCrawlBtn.addEventListener("click", () => sendDeepCrawl(deepCrawlBtn));
+}
+
+// --- Copy / Export Media Links ---
+
+function getExportUrls() {
+  const checkedBoxes = mediaList.querySelectorAll("input[type='checkbox']:checked");
+  const urls = [];
+  if (checkedBoxes.length > 0) {
+    checkedBoxes.forEach((cb) => {
+      const item = mediaItems[parseInt(cb.dataset.index)];
+      if (item && item.url) urls.push(item.url);
+    });
+  } else {
+    // If nothing checked, take all items currently matching visible filters
+    mediaItems.forEach((item) => {
+      if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return;
+      if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return;
+      if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return;
+      if (item.url) urls.push(item.url);
+    });
+  }
+  return urls;
+}
+
+if (copyLinksBtn) {
+  copyLinksBtn.addEventListener("click", async (e) => {
+    const urls = getExportUrls();
+    if (urls.length === 0) {
+      showError("No media URLs to copy");
+      return;
+    }
+
+    const text = urls.join("\n");
+
+    // If Ctrl or Shift is held, save as .txt file via Chrome downloads
+    if (e.ctrlKey || e.shiftKey) {
+      try {
+        const blob = new Blob([text], { type: "text/plain" });
+        const blobUrl = URL.createObjectURL(blob);
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const host = tab?.url ? extractDomain(tab.url) : "media";
+        chrome.downloads.download({
+          url: blobUrl,
+          filename: `${host}_links.txt`,
+          saveAs: false,
+        });
+        const origText = copyLinksBtn.textContent;
+        copyLinksBtn.textContent = `\u2713 Saved ${urls.length}`;
+        setTimeout(() => { copyLinksBtn.textContent = origText; }, 1500);
+        return;
+      } catch (err) {}
+    }
+
+    // Default: copy directly to clipboard
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      const origText = copyLinksBtn.textContent;
+      copyLinksBtn.textContent = `\u2713 Copied ${urls.length}`;
+      setTimeout(() => { copyLinksBtn.textContent = origText; }, 1500);
+    } catch (err) {
+      showError(`Could not copy links: ${err.message}`);
+    }
+  });
+}
+
+// --- Download Selected Media to Desktop App ---
+
+downloadBtn.addEventListener("click", async () => {
   const selected = [];
   mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
     const item = mediaItems[parseInt(cb.dataset.index)];
@@ -723,7 +861,7 @@ downloadBtn.addEventListener("click", async () => {
   } else if (resp && resp.ok) {
     downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
-      downloadBtn.innerHTML = 'Send to App <span id="selected-count">0</span>';
+      downloadBtn.innerHTML = 'Download in App <span id="selected-count">0</span>';
       downloadBtn.disabled = false;
       updateCount();
     }, 1500);

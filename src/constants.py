@@ -25,6 +25,7 @@ DEFAULT_CONNECT_TIMEOUT = 20 # Timeout for establishing a connection
 DEFAULT_SOCK_READ_TIMEOUT = DEFAULT_PAGE_TIMEOUT # Timeout for reading from a socket
 
 DEFAULT_SEARCH_DEPTH = 3
+UNLIMITED_SEARCH_DEPTH = -1
 DEFAULT_PARSER_THREADS = 4
 DEFAULT_DOWNLOADER_THREADS = 8
 DEFAULT_THREADS_PER_FILE = 1 # For multi-threaded download of a single file
@@ -304,7 +305,7 @@ MAX_PATH_COMPONENTS_FOR_SUBDIR = 2
 MAX_SUBDIR_COMPONENT_LENGTH = 50
 
 # Default settings keys (matching SettingsDialog) - useful for consistency
-SETTING_SEARCH_DEPTH = "search_depth"
+SETTING_SEARCH_DEPTH = "search_depth"  # Link depth for parsing (0 = start page only, -1 = unlimited)
 SETTING_PARSER_THREADS = "parser_threads"
 SETTING_DOWNLOADER_THREADS = "downloader_threads"
 SETTING_THREADS_PER_FILE = "threads_per_file"

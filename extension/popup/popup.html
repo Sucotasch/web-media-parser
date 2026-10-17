@@ -11,7 +11,10 @@
   </div>
 
   <div id="scan-section">
-    <button id="scan-btn" class="primary full-width">Scan This Page</button>
+    <div class="scan-buttons">
+      <button id="scan-btn" class="primary">Scan This Page</button>
+      <button id="deep-crawl-btn" class="secondary" title="Send page URL to desktop app for recursive deep link traversal">Crawl Site in App ↗</button>
+    </div>
     <div id="page-info" class="hidden"></div>
   </div>
 
@@ -34,23 +37,23 @@
     <div id="media-list"></div>
 
     <div class="actions">
-      <label><input type="checkbox" id="one-shot" checked> Page only</label>
-      <label class="concurrent-limit-label" for="concurrent-limit"
-             title="How many files Chrome saves at the same time">Parallel:
-        <input type="number" id="concurrent-limit" class="concurrent-limit-input"
-               min="1" max="10" value="2" aria-label="Parallel Chrome downloads">
-      </label>
-      <div id="deep-parse-warning" class="deep-parse-warning hidden">
-        Deep parse: page URL sent to desktop app for full discovery. Chrome Save unavailable.
+      <div class="actions-left">
+        <label class="concurrent-limit-label" for="concurrent-limit"
+               title="How many files Chrome saves at the same time">Parallel:
+          <input type="number" id="concurrent-limit" class="concurrent-limit-input"
+                 min="1" max="10" value="2" aria-label="Parallel Chrome downloads">
+        </label>
+        <button type="button" id="copy-links-btn" class="link-btn"
+                title="Copy selected (or all) media URLs to clipboard (Ctrl+Click to download .txt)">Copy Links</button>
       </div>
       <div class="actions-buttons">
         <button id="download-btn" class="primary" disabled
                 title="Send the selected items to the desktop app queue">
-          Send to App <span id="selected-count">0</span>
+          Download in App <span id="selected-count">0</span>
         </button>
         <button id="chrome-download-btn" class="save-green" disabled
                 title="Save the selected files with Chrome's own downloader">
-          Save (Chrome) <span id="chrome-count">0</span>
+          Save in Chrome <span id="chrome-count">0</span>
         </button>
       </div>
     </div>

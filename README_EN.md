@@ -186,7 +186,7 @@ Files are organized by the source page domain and up to 2 path components:
 ### Parsing
 | Setting | Default | Description |
 |---|---|---|
-| Search Depth | 3 | Link traversal depth (0 = starting page only) |
+| Search Depth | 3 | Link traversal depth (0 = starting page only, Unlimited = no limit) |
 | Page Limit | 1000 | Stop crawl after N source pages with downloads (0 = unlimited) |
 | Page Timeout | 30 sec | Timeout per page request (5–600s) |
 | Stay in Domain | ✓ | Restrict crawling to the initial domain |
