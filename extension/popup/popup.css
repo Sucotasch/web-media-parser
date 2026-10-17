@@ -1,5 +1,5 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { width: 480px; height: 560px; display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; background: #1a1a1a; color: #e0e0e0; overflow: hidden; }
+body { width: 500px; height: 560px; display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; background: #1a1a1a; color: #e0e0e0; overflow: hidden; }
 .header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #333; }
 h1 { font-size: 14px; font-weight: 600; }
 .status { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
@@ -11,6 +11,7 @@ h1 { font-size: 14px; font-weight: 600; }
 .scan-buttons { display: flex; gap: 8px; width: 100%; }
 .scan-buttons #scan-btn { flex: 1.15; }
 .scan-buttons #deep-crawl-btn { flex: 1; }
+.scan-buttons button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
 button.primary { background: #1976d2; color: #fff; }
 button.secondary { background: #262626; color: #90caf9; border: 1px solid #3d3d3d; border-radius: 4px; padding: 8px 12px; font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap; }
@@ -84,10 +85,12 @@ button:focus-visible, select:focus-visible, input:focus-visible, .media-item .ur
    the buttons are pinned right without shrinking. popup.js keeps the transient labels
    SHORTER than the steady ones so nothing can ever grow into the row. */
 .actions { display: flex; align-items: center; justify-content: space-between; padding: 10px 0 0; flex-wrap: nowrap; gap: 8px; }
-.actions-left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.concurrent-limit-input { width: 45px; margin-inline-start: 6px; }
-.actions-buttons { display: flex; gap: 8px; margin-inline-start: auto; flex-shrink: 0; }
-.actions label { font-size: 12px; color: #aaa; flex-shrink: 0; white-space: nowrap; }
+.actions-left { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.concurrent-limit-input { width: 36px; margin-inline-start: 4px; padding: 2px 4px; }
+.concurrent-limit-label { font-size: 11px; }
+.actions-buttons { display: flex; gap: 6px; margin-inline-start: auto; flex-shrink: 0; }
+.actions-buttons button { padding: 7px 11px; font-size: 12px; white-space: nowrap; }
+.actions label { font-size: 11px; color: #aaa; flex-shrink: 0; white-space: nowrap; }
 /* Errors.txt #1: "Save (Chrome) is always grey, so it looks inactive next to the bright
    blue Download". The button was never disabled (measured: disabled === false with items
    selected) — it was painted #424242, while the disabled state is #333/#777, i.e. the two

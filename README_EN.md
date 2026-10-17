@@ -90,7 +90,7 @@ The extension serves both as a standalone in-browser media downloader and as a q
 | **Copy Links** | **Copy Links** / Click URL | Copies selected media URLs to clipboard (or saves `.txt` on `Ctrl+Click`). Clicking any individual URL copies it instantly |
 | **Background Preview** | Click thumbnail | Opens full-size image in an adjacent background tab without closing the extension popup |
 | **Chrome Download** | **Save in Chrome (N)** | Downloads selected files directly inside Chrome with configurable concurrency (`Parallel: 1–10`) |
-| **Desktop Download** | **Download in App (N)** | Sends selected items to the desktop app download queue |
+| **Desktop Download** | **Send to App (N)** | Sends selected items to the desktop app download queue |
 | — | **Ctrl+Shift+S** | Hotkey: instantly scans and downloads all full-size media via Chrome |
 | — | **Ctrl+Shift+D** | Hotkey: quickly sends current tab URL to the desktop app queue |
 

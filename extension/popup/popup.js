@@ -204,14 +204,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const p = changes.scanProgress.newValue;
     if (!p) return;
     if (p.status === "scanning") {
-      // The x/y counter counts LINKED PAGES probed for fullsize discovery — no content
-      // cap, only the 45s page budget and the postponed-tier sub-budget end it. It is not
-      // "media found"; surface that count too so the numbers mean something (Errors.txt #2).
-      scanBtn.textContent = p.phase === "links" && p.total > 0
-        ? `Scanning... ${p.scanned}/${p.total} pages${p.found ? `, ${p.found} found` : ""}`
-        : p.phase === "verify"
-          ? "Checking media..."
-          : "Scanning...";
+      if (p.phase === "links") {
+        scanBtn.textContent = p.total > 0 ? `Scanning ${p.scanned}/${p.total}` : "Scanning...";
+        pageInfoDiv.textContent = `Probing linked pages: ${p.scanned}/${p.total}${p.found ? ` \u00B7 ${p.found} found` : ""}`;
+        pageInfoDiv.classList.remove("hidden");
+      } else if (p.phase === "verify") {
+        scanBtn.textContent = "Checking...";
+        pageInfoDiv.textContent = "Checking media accessibility...";
+        pageInfoDiv.classList.remove("hidden");
+      } else {
+        scanBtn.textContent = "Scanning...";
+      }
     } else if (p.status === "error") {
       showError(`Scan failed: ${p.error || "unknown error"}`);
       scanBtn.disabled = false;
@@ -861,7 +864,7 @@ downloadBtn.addEventListener("click", async () => {
   } else if (resp && resp.ok) {
     downloadBtn.innerHTML = `\u2713 Added ${resp.added}`;
     setTimeout(() => {
-      downloadBtn.innerHTML = 'Download in App <span id="selected-count">0</span>';
+      downloadBtn.innerHTML = 'Send to App <span id="selected-count">0</span>';
       downloadBtn.disabled = false;
       updateCount();
     }, 1500);
