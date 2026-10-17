@@ -443,7 +443,7 @@ class PriorityURLQueue:
         base_priority *= depth_factor
         
         # Detect and boost media-related URLs even if they don't match patterns
-        extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm', '.avi']
+        extensions = ['.jpg', '.jpeg', '.jfif', '.jif', '.png', '.gif', '.webp', '.mp4', '.webm', '.avi']
         if any(ext in full_url for ext in extensions):
             base_priority *= 5.0  # Significant boost for URLs that likely point to media files
             

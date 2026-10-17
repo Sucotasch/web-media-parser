@@ -318,5 +318,24 @@ class TestEmptyBodyHandling(unittest.TestCase):
         self.assertIsNone(parser._sync_session)
 
 
+class TestJfifJifSupport(unittest.TestCase):
+    """Verify .jfif and .jif image formats are recognized and handled as images."""
+
+    def test_is_image_url_recognizes_jfif_and_jif(self):
+        from src.parser.utils import is_image_url, is_format_allowed, guess_media_type
+        for url in ("https://example.com/photo.jfif", "https://example.com/gallery/img.jif",
+                    "https://example.com/asset.JFIF?w=800", "https://example.com/pic.JIF#hash"):
+            self.assertTrue(is_image_url(url), f"is_image_url failed for {url}")
+            self.assertTrue(is_format_allowed(url, "image", {}), f"is_format_allowed failed for {url}")
+            self.assertEqual(guess_media_type(url), "image", f"guess_media_type failed for {url}")
+
+    def test_anchor_image_extracted(self):
+        from bs4 import BeautifulSoup
+        from src.parser.utils import is_image_url
+        soup = BeautifulSoup('<a href="https://example.com/full.jif"><img src="https://example.com/thumb.jpg"></a>', "html.parser")
+        a = soup.find("a")
+        self.assertTrue(is_image_url(a["href"]))
+
+
 if __name__ == "__main__":
     unittest.main()

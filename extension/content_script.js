@@ -123,7 +123,7 @@
       media.push({ url, type, pageUrl: baseUrl, ...attrs });
     }
 
-    const IMAGE_FILE_RE = /\.(jpe?g|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i;
+    const IMAGE_FILE_RE = /\.(jpe?g|jfif|jif|png|gif|webp|bmp|tiff?|avif|heic)(\?|$)/i;
 
     // D-03: parity with the desktop app's DEFAULT_MAX_LINKS_PER_PAGE (200), and
     // ONLY for navigation links. A page with 1000 nav anchors (tag lists, page

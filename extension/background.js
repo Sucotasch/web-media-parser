@@ -17,7 +17,7 @@
 if (typeof importScripts === "function") importScripts("shared.js", "sieve.js", "sieve_updater.js");
 
 const API_BASE = "http://127.0.0.1:19876";
-const SIEVE_VERSION = "2026.07.15"; // Bump when shipping new sieve.json
+const SIEVE_VERSION = "2026.09.15"; // Bump when shipping new sieve.json
 
 // Load sieve rules from bundled file into storage
 async function loadSieveRules(force = false) {
@@ -435,7 +435,7 @@ async function discoverFullsize(links, pageUrl, onProgress) {
         let url = m[1];
         if (url.startsWith("//")) url = "https:" + url;
         if (url.startsWith("http") && !seen.has(url) && url !== linkUrl
-            && /\.(jpe?g|webp|avif|heic|bmp|tiff?)$/i.test(url)) {
+            && /\.(jpe?g|jfif|jif|webp|avif|heic|bmp|tiff?)$/i.test(url)) {
           seen.add(url);
           candidates.push(url);
         }

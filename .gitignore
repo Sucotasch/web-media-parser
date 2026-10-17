@@ -205,10 +205,16 @@ Errors.txt
 # Generated Deno npm cache (happy-dom) — populated by build_exe.py
 src/parser/js_engine/deno_cache/
 
-# R-H-1: agent/dev scratch (browser profiles for ext-dev-loop, skill output).
-# Narrow rules on purpose — .agents/types/* and .agents/skills/karpathy/SKILL.md
-# are tracked and stay tracked.
+# Agent instructions, audits, dev scratch and work logs (local only)
 .ext-dev-loop/
 .unlazy/
-.agents/skills/
+.agents/
+AGENTS.md
+Audit.md
+Audit/
+GATES*.md
+PLAN.md
+knowledge.md
+ReviewPrompt.txt
+Free-Start.bat
 /Errors*.txt

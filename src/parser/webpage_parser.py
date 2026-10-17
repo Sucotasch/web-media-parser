@@ -99,7 +99,7 @@ class WebpageParser:
         "picture": [("source", "nested")]
     }
     JS_PATTERNS = { 
-        "image_sources": [r'["\'](https?://[^"\']+\.(?:jpg|jpeg|png|gif|webp))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+)["\']', r'loadImage\s*\(\s*["\'](https?://[^"\']+)["\']', r'background(?:-image)?\s*:\s*url\(["\']?(https?://[^"\']+)["\']?\)',],
+        "image_sources": [r'["\'](https?://[^"\']+\.(?:jpg|jpeg|jfif|jif|png|gif|webp))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+)["\']', r'loadImage\s*\(\s*["\'](https?://[^"\']+)["\']', r'background(?:-image)?\s*:\s*url\(["\']?(https?://[^"\']+)["\']?\)',],
         "video_sources": [r'["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'loadVideo\s*\(\s*["\'](https?://[^"\']+)["\']',],
         # CORE-14: the data-srcset regex was removed — its group(1) captured the
         # whole srcset string (multi-URL srcsets became one garbage URL that
@@ -817,7 +817,7 @@ class WebpageParser:
             )
             if not is_url_shaped:
                 continue
-            if re.search(r"\.(jpg|jpeg|png|webp|gif|avif|tiff|bmp)", value.lower()):
+            if re.search(r"\.(jpg|jpeg|jfif|jif|png|webp|gif|avif|tiff|bmp)", value.lower()):
                 score = 999999 if any(h in attr_name.lower() for h in ["hi-res", "high", "retina", "full", "original", "max"]) else 0
                 candidates.append({"url": value, "width": 0, "score": score, "source": attr_name})
 
@@ -906,7 +906,7 @@ class WebpageParser:
         images, style = [], element.get("style", "")
         if style:
             urls = re.findall(r'url\(["\']?([^)"\']+)["\']?\)', style)
-            images.extend(u for u in urls if re.search(r"\.(jpg|jpeg|png|webp|gif|avif)", u.lower()))
+            images.extend(u for u in urls if re.search(r"\.(jpg|jpeg|jfif|jif|png|webp|gif|avif)", u.lower()))
         return images
 
     async def _extract_picture_sources(self, picture_elem: Any) -> List[Dict[str, Any]]:

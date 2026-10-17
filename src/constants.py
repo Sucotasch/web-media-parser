@@ -470,7 +470,7 @@ JSON_LINK_SCAN_MAX_DEPTH = 32
 
 # Comprehensive File Extensions
 IMAGE_EXTENSIONS = [
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif", ".ico"
+    ".jpg", ".jpeg", ".jfif", ".jif", ".png", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".avif", ".ico"
 ]
 VIDEO_EXTENSIONS = [
     ".mp4", ".webm", ".ogg", ".mov", ".avi", ".wmv", ".flv", ".mkv", 
@@ -487,7 +487,7 @@ TRASH_MEDIA_EXTENSIONS = [".gif", ".ico", ".svg", ".cur"]
 # are disabled by default (GIF/SVG/ICO/CUR are almost always decorative junk).
 # Defaults preserve historical behavior: those formats stay disabled.
 DEFAULT_ENABLED_IMAGE_FORMATS = [
-    ".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tiff",
+    ".jpg", ".jpeg", ".jfif", ".jif", ".png", ".webp", ".avif", ".bmp", ".tiff",
 ]
 DEFAULT_ENABLED_VIDEO_FORMATS = list(VIDEO_EXTENSIONS) + [".m3u8", ".mpd"]  # + streaming manifests
 DEFAULT_ENABLED_AUDIO_FORMATS = list(AUDIO_EXTENSIONS)

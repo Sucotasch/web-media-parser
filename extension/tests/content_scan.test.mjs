@@ -271,6 +271,17 @@ check("parseSrcset: data URI with commas stays one candidate", parseSrcset(`${DA
   check("D-03 control: 300 media links are all kept", out.links.length, 300);
 }
 
+{
+  const aJif = anchor("http://127.0.0.1:9811/photo.jif");
+  const aJfif = anchor("http://127.0.0.1:9811/photo.jfif");
+  const out = scanPageMedia(fakeDoc([], [aJif, aJfif]), BASE);
+  check(".jif anchor collected as a-link media", out.media.map((m) => [m.url, m.source]), [
+    ["http://127.0.0.1:9811/photo.jif", "a-link"],
+    ["http://127.0.0.1:9811/photo.jfif", "a-link"],
+  ]);
+  check(".jif anchors are not added to page links", out.links, []);
+}
+
 if (failures > 0) {
   console.error(`${failures} failure(s)`);
   process.exit(1);

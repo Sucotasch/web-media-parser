@@ -62,7 +62,7 @@ def is_image_url(url):
         return True
         
     # Advanced pattern matching based on RipUtils.java
-    image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|gif|png|webp|avif)(\?.*)?)", re.IGNORECASE)
+    image_pattern = re.compile(r"(https?://[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,3}(/\S*)\.(jpg|jpeg|jfif|jif|gif|png|webp|avif)(\?.*)?)", re.IGNORECASE)
     
     return bool(image_pattern.match(url_lower))
 
