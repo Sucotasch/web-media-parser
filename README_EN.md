@@ -14,7 +14,7 @@
 
 **An intelligent desktop application (PySide6) and companion browser extension (Chrome MV3) for crawling, discovering full-size originals, and batch-downloading media files.**
 
-Automatically detects images and videos, upgrades thumbnails to high-resolution originals using an Imagus Sieve database (820+ rules), bypasses anti-scraping protections (cookie consent, age gates, JS redirects), isolates per-domain concurrency, and provides fast multi-threaded resume-capable downloads.
+Automatically detects images and videos, upgrades thumbnails to high-resolution originals using an Imagus Sieve database (830+ rules), bypasses anti-scraping protections (cookie consent, age gates, JS redirects), isolates per-domain concurrency, and provides fast multi-threaded resume-capable downloads.
 
 <p align="center">
   <img src="docs/images/desktop_app.png" alt="Web Media Parser Desktop GUI" width="850">
@@ -83,25 +83,30 @@ The extension serves both as a standalone in-browser media downloader and as a q
 
 **Operating Modes:**
 
-| Mode | Button | Action |
+| Action | Control | Description |
 |---|---|---|
-| **Page only** ✓ | **Send to App** | Scans current page → sends selected media list to the desktop application queue |
-| **Page only** ✗ | **Parse Page** | Sends page URL to the desktop app for deep recursive crawling (crawler, sieve, deep crawl) |
-| Any | **Save (Chrome)** | Downloads selected files directly inside Chrome with configurable concurrency (`Parallel: 1–10`) |
+| **Scan Page** | **Scan This Page** | Scans current tab's DOM, resolves Sieve full-size rules, and displays media list |
+| **Deep Crawl** | **Crawl Site in App ↗** | Dispatches page URL and session cookies to desktop app for recursive website crawl |
+| **Copy Links** | **Copy Links** / Click URL | Copies selected media URLs to clipboard (or saves `.txt` on `Ctrl+Click`). Clicking any individual URL copies it instantly |
+| **Background Preview** | Click thumbnail | Opens full-size image in an adjacent background tab without closing the extension popup |
+| **Chrome Download** | **Save in Chrome (N)** | Downloads selected files directly inside Chrome with configurable concurrency (`Parallel: 1–10`) |
+| **Desktop Download** | **Download in App (N)** | Sends selected items to the desktop app download queue |
 | — | **Ctrl+Shift+S** | Hotkey: instantly scans and downloads all full-size media via Chrome |
 | — | **Ctrl+Shift+D** | Hotkey: quickly sends current tab URL to the desktop app queue |
 
 **Extension Features:**
 - **Deep DOM scanning**: inspects `<img>`, `<picture>`, `srcset` (picks optimal quality by DPR and width), CSS backgrounds, videos and posters, and direct `a[href]` links.
-- **Bundled Imagus Sieve**: 823 verified rules (v2026.07.15) for immediate thumbnail-to-original upgrade.
-- **Full autonomy**: `Save (Chrome)` works standalone without running the desktop companion app.
+- **Bundled Imagus Sieve**: 833 verified rules (v2026.09.15) for immediate thumbnail-to-original upgrade.
+- **Instant Link Copying & Export**: single-click copy for individual URLs with visual feedback; bulk `Copy Links` to clipboard or `.txt` file export.
+- **Background Inspection**: thumbnail click opens the full-size media in a background tab to the right, keeping the popup open.
+- **Full autonomy**: `Save in Chrome` works standalone without running the desktop companion app.
 - **Companion onboarding**: when the desktop app is offline, clicking the `Disconnected` pill opens setup instructions.
 - **Smart rule merge**: online sieve updates (`Update now`) from GitHub/jsDelivr preserving user rules (`_name`) and disabled status.
 
 **Installation:**
 1. Open `chrome://extensions` → enable **Developer mode**.
 2. Click **Load unpacked** → select the `extension/` directory.
-3. Ready to use: 823 Imagus Sieve rules are initialized automatically.
+3. Ready to use: 833 Imagus Sieve rules are initialized automatically.
 
 ---
 
