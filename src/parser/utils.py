@@ -5,6 +5,7 @@
 Utility functions for parser module
 """
 
+import hashlib
 import re
 import os
 from urllib.parse import urlparse
@@ -425,6 +426,61 @@ TWO_LEVEL_PUBLIC_SUFFIXES = frozenset({
     "com.sa", "org.sa", "net.sa", "gov.sa", "edu.sa",
     "com.co", "org.co", "net.co", "gov.co", "edu.co",
 })
+
+
+# C-05: Windows device names are reserved in EVERY directory, with or without an
+# extension — `CON.jpg` cannot be opened, so such a download fails forever.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+
+
+def sanitize_filename(filename: str) -> str:
+    """Make a URL-derived string safe as a Windows file name (C-05).
+
+    One implementation for both routes (parser results and the extension's
+    one-shot payload): they had drifted — the extension route passed the name
+    straight to the downloader, so `:` (NTFS alternate data stream), `|`, `?`,
+    `*` and device names like `CON.jpg` failed on every attempt with no file.
+    """
+    if not filename:
+        return ""
+    invalid_os_chars = r'<>:"/\\|?*'
+    control_chars = ''.join(map(chr, range(32)))
+    sanitized_name = re.sub(f'[{re.escape(invalid_os_chars + control_chars)}]+', '_', filename)
+    sanitized_name = re.sub(r'\s+', '_', sanitized_name)
+    sanitized_name = re.sub(r'__+', '_', sanitized_name).strip('_')
+    name_part, ext_part = os.path.splitext(sanitized_name)
+    # R-P-2: a query/tracking tail survived sanitising inside the extension
+    # ("photo.jpeg?w=100" -> ".jpeg_w"), so files were written with an unusable
+    # extension. Recover the real one from the known lists instead.
+    known_extensions = sorted(K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS,
+                              key=len, reverse=True)
+    ext_lower = ext_part.lower()
+    known_match = next((e for e in known_extensions if ext_lower.startswith(e)), None)
+    if known_match:
+        ext_part = ext_part[:len(known_match)]
+    elif len(ext_part) > 7:
+        ext_part = ext_part[:7]
+
+    # C-05: trailing dots/spaces are silently stripped (or forbidden) by Windows.
+    name_part = name_part.rstrip('. ')
+    if len(name_part) > K.MAX_FILENAME_LENGTH:
+        name_part = name_part[:K.MAX_FILENAME_LENGTH]
+
+    if not name_part:
+        name_part = hashlib.md5(filename.encode("utf-8", "replace")).hexdigest()[
+            :K.DEFAULT_FILENAME_HASH_LENGTH]
+        if not ext_part:
+            ext_part = K.DEFAULT_IMAGE_EXTENSION
+
+    # C-05: `CON`, `COM4`, `LPT1` (case-insensitive, extension ignored).
+    if name_part.rstrip('. ').lower() in _WINDOWS_RESERVED_NAMES:
+        name_part = "_" + name_part
+
+    return f"{name_part}{ext_part}"
 
 
 def registrable_domain(host: str) -> str:

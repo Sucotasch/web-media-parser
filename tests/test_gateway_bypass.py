@@ -400,6 +400,80 @@ def test_gateway_click_no_button_returns_none():
         engine.shutdown()
 
 
+# --- P-01: bypass cookies reach the aiohttp jar on both engines -------------
+
+
+class _RecordingCookieJar:
+    def __init__(self):
+        self.subsets = []
+
+    def update_cookies(self, cookies, url=None):
+        self.subsets.append((dict(cookies), str(url)))
+
+
+class _CurlLikeCookies:
+    """curl_cffi's Cookies: iteration yields plain STRINGS (no .name/.value)."""
+
+    def __iter__(self):
+        return iter(["age_verified", "consent"])
+
+    def get_dict(self):
+        return {"age_verified": "1", "consent": "1"}
+
+
+class _RequestsLikeCookies:
+    class _Cookie:
+        def __init__(self, name, value):
+            self.name, self.value = name, value
+
+    def __iter__(self):
+        yield self._Cookie("age_verified", "1")
+
+    def get_dict(self):
+        return {"age_verified": "1"}
+
+
+def _parser_with_recording_jar():
+    from helpers import _DummySession
+
+    parser, _ = _make_parser("<html></html>")
+    parser.session = _DummySession()
+    parser.session.cookie_jar = _RecordingCookieJar()
+    return parser
+
+
+def test_cookie_sync_reads_curl_cffi_cookies():
+    """P-01: `for c in session.cookies` gave AttributeError on curl_cffi.
+
+    Every page whose gateway bypass succeeded under http_engine=curl_cffi was
+    turned into UNKNOWN_ERROR and lost all of its links.
+    """
+    from types import SimpleNamespace
+
+    parser = _parser_with_recording_jar()
+    parser._sync_session = SimpleNamespace(cookies=_CurlLikeCookies())
+    parser._sync_bypass_cookies()
+    subsets = parser.session.cookie_jar.subsets
+    assert subsets and subsets[0][0] == {"age_verified": "1", "consent": "1"}
+    assert subsets[0][1].startswith("https://example.com/")
+
+
+def test_cookie_sync_still_works_for_requests():
+    from types import SimpleNamespace
+
+    parser = _parser_with_recording_jar()
+    parser._sync_session = SimpleNamespace(cookies=_RequestsLikeCookies())
+    parser._sync_bypass_cookies()
+    assert parser.session.cookie_jar.subsets[0][0] == {"age_verified": "1"}
+
+
+def test_cookie_sync_without_sync_session_is_a_noop():
+    parser = _parser_with_recording_jar()
+    parser._sync_session = None
+    parser._sync_bypass_cookies()  # must not raise
+    assert parser.session.cookie_jar.subsets == []
+
+
 def test_gateway_click_login_button_not_clicked():
     engine = _gateway_engine_or_skip()
     try:

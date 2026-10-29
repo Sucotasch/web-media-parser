@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.10%2B%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white" alt="PySide6">
   <img src="https://img.shields.io/badge/Extension-Chrome%20MV3-4285F4?logo=googlechrome&logoColor=white" alt="Chrome MV3">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white" alt="Windows">
@@ -58,7 +58,7 @@
 - **Многопоточность** — настраиваемое число потоков парсера и загрузчика
 - **Multi-threaded download** — загрузка одного файла несколькими потоками (с `Accept-Ranges`)
 - **Общая HTTP-сессия** — переиспользование TCP/TLS-соединений
-- **Контроль скорости** — ограничение пропускной способности (действует на однопоточные загрузки; при «Threads per File > 1» не применяется — `Audit.md`, DL-12)
+- **Контроль скорости** — ограничение пропускной способности (при «Threads per File > 1» все чанки одной загрузки троттлятся об общий счётчик байт)
 - **Дедупликация** — пропуск уже загруженных URL
 - **Атомарное сохранение** — `last_session.pkl` через temp + fsync + rename (защита от аварий)
 
@@ -68,9 +68,9 @@
 - **Скачивание в выбранную папку** — путь запоминается между запусками
 
 ### Поддержка форматов
-- **Изображения:** JPEG, PNG, WebP, AVIF, BMP, TIFF (GIF/SVG/ICO/CUR по умолчанию выключены, включаются в *Settings → Filters*)
-- **Видео:** MP4, WebM, OGG, MOV, MKV, AVI, FLV, M4V
-- **Аудио:** MP3, WAV, AAC, FLAC, OPUS
+- **Изображения:** JPEG, PNG, WebP, AVIF, BMP, TIFF, JFIF, JIF (GIF/SVG/ICO/CUR по умолчанию выключены, включаются в *Settings → Filters*)
+- **Видео:** MP4, WebM, OGG, MOV, MKV, AVI, FLV, M4V, WMV, TS, MPEG, MPG
+- **Аудио:** MP3, WAV, AAC, FLAC, OPUS, OGG, M4A
 - **Streaming:** M3U8 (HLS), MPD (DASH)
 - **API:** JSON-эндпоинты — рекурсивное извлечение медиафайлов из произвольных структур данных, поддержка вложенных списков и пагинации (`data.next`, `meta.pagination.next`)
 
@@ -109,6 +109,8 @@
 2. Нажмите **Load unpacked** (Загрузить распакованное) → выберите папку `extension/`
 3. Расширение готово к работе: при первом запуске автоматически подключаются 833 правила Imagus Sieve.
 
+**Firefox 115+:** скопируйте `extension/` в отдельную папку и замените в копии `manifest.json` на `manifest.firefox.json` (у Firefox нет `background.service_worker`, поэтому файлы `shared.js`/`sieve.js`/`sieve_updater.js`/`background.js` подключаются как `background.scripts`). Загрузка: `about:debugging` → **This Firefox** → **Load Temporary Add-on** → `manifest.json`.
+
 ### Интерфейс
 - **PySide6 GUI** — тёмная тема, лог с фильтрацией по уровням
 - **Пауза / Продолжить / Стоп** — полный контроль над процессом
@@ -121,7 +123,7 @@
 ## Установка
 
 ### Системные требования
-- **Python** 3.8+ (разработка и тестирование на Python 3.12)
+- **Python** 3.10+ (разработка и тестирование на Python 3.12)
 - **ОС:** Windows 10/11 — основная платформа.
 
 ### Из исходников
@@ -145,8 +147,7 @@ python build_exe.py
 ```
 dist/WebMediaParser/
 ├── WebMediaParser.exe
-├── Imagus_sieve_2026.04.01_849.json   — правила Imagus
-├── Imagus_sieve_2026.07.15_823.json
+├── Imagus_sieve_2026.09.15_833.json   — правила Imagus (в билд кладётся один, самый свежий файл)
 ├── junk_allowlist.txt                 — исключения для фильтра рекламы/мусора
 ├── bin/                               — JS-движок Deno (при сборке с Deno)
 │   ├── deno.exe
@@ -216,6 +217,8 @@ dist/WebMediaParser/
 | Min. Image Height | 100 px | Минимальная высота (из HTML-атрибутов) |
 | Min. Image Size | 40 KB | Минимальный размер файла (проверяется через HEAD) |
 | Min. Video Size | 1000 KB | Минимальный размер видео |
+| Max. File Size (KB) | 2 097 152 (2 ГиБ) | Верхний предел размера закачки; 0 = без предела |
+| Reject unverified length | Выкл | Отклонять закачки, чей размер не удалось подтвердить заголовками |
 | Форматы (галочки) | JPG/PNG/WebP/AVIF/BMP/TIFF | Allowlist форматов изображений/видео; GIF/SVG/ICO выключены по умолчанию |
 | Stop Words | список | Сегментно-осознанный матчинг path-сегментов URL (слово «ad» не убьёт «media») |
 
@@ -232,13 +235,14 @@ dist/WebMediaParser/
 |---|---|---|
 | User-Agent | Chrome 130 | Строка User-Agent |
 | Referer | auto | Политика Referer (`auto` / `origin` / `none`) |
-| Accept-Language | en-US | Язык ответов |
+| Accept-Language | en-US,en;q=0.9 | Язык ответов |
 | Timeout | 30 сек | Таймаут сетевого запроса |
 | Retry Count | 3 | Повторные попытки при ошибке |
 | Proxy | — | Прокси в формате `host:port` |
-| **JS Engine** | Static | `Static` (по умолчанию) / `Deno` — см. [JS Engine (Deno)](#js-engine-deno) |
+| **JS Engine** | Static | `Static` (по умолчанию) / `Deno` — контрол на вкладке **Parsing**; см. [JS Engine (Deno)](#js-engine-deno) |
 | **HTTP Engine** | Aiohttp | `Aiohttp` (по умолчанию) / `curl_cffi` — см. [HTTP Engine (curl_cffi)](#http-engine-curl_cffi) |
 | **Escalate on block** | ✓ | При HTTP 403/5xx — один запрос через curl_cffi (см. ниже) |
+| **Verify TLS** | Выкл | Проверять TLS-сертификаты у fallback/escalation-запросов |
 | Filter Ads/Junk | ✓ | Пропускать рекламные/tracker URL (allowlist-совместимо) |
 
 ### Logging
@@ -251,7 +255,7 @@ dist/WebMediaParser/
 
 ## JS Engine (Deno)
 
-Парсер может выполнять **JS-правила Imagus sieve** через лёгкий движок Deno вместо устаревшего конвертера JS→Python. Движок **выключен по умолчанию** (`Static`) — включите в *Settings → HTTP → JS Engine → Deno*.
+Парсер может выполнять **JS-правила Imagus sieve** через лёгкий движок Deno вместо устаревшего конвертера JS→Python. Движок **выключен по умолчанию** (`Static`) — включите в *Settings → Parsing → JS Engine → Deno*.
 
 ### Что даёт
 - **P0** — JS `to`-правила (преобразование thumbnail → fullsize URL)
@@ -289,7 +293,7 @@ dist/WebMediaParser/
 
 - **Bounded by construction**: одна попытка на URL, никаких циклов — эскалация невидима для карантина. Успех → файл/страница получены (счётчик failures не растёт); провал → возвращается та же ошибка, что и без эскалации (карантин работает как раньше).
 - **429 не эскалируется** — rate-limit лечится backoff'ом с `Retry-After`, отпечаток здесь не поможет.
-- При глобальном `HTTP Engine = curl_cffi` эскалация автоматически отключена (блок уже случился на curl — дублировать бессмысленно).
+- При глобальном `HTTP Engine = curl_cffi` эскалация автоматически отключена. Замечание аудита 2026-10-29 (P-02): страничный фетч при этом остаётся на aiohttp и эскалации не получает — поведение под вопросом, см. `Audit/2026-10-29_FULL_AUDIT.md`.
 - Отключается чекбоксом *Settings → HTTP → Escalate on block*.
 
 ### Ограничения (осознанные)
@@ -359,7 +363,7 @@ main.py
 
 **Page limit** — останавливает краул после N **страниц-источников, с которых были загрузки** (не файлов и не всех посещённых страниц).
 
-**Imagus Sieve (сторона приложения)** — правила подключаются автоматически в сборке (файл `Imagus_sieve_*.json` рядом с exe) или вручную: *Settings → HTTP → Imagus Sieve file*. В dev-запуске из репозитория автозагрузки нет — файлы в корне не входят в пути поиска (`Audit.md`, PAT-1); укажите путь вручную или положите файл в `resources/patterns/`.
+**Imagus Sieve (сторона приложения)** — правила подключаются автоматически в сборке (файл `Imagus_sieve_*.json` рядом с exe) или вручную: *Settings → Parsing → Imagus Sieve file*. Dev-запуск из репозитория тоже подхватывает sieve автоматически: сканируются корень проекта (там лежит свежий `Imagus_sieve_2026.09.15_833.json`) и `resources/patterns/` (PAT-1).
 
 ---
 
@@ -378,11 +382,11 @@ main.py
 
 ## Текущий статус и архитектурный аудит
 
-Проект прошёл комплексный инженерный аудит (см. подробный реестр **[`Audit.md`](Audit.md)** и верифицированные гейты в **[`GATES.md`](GATES.md)**):
+Проект прошёл комплексный инженерный аудит (свежий полный аудит и открытый бэклог — **[`Audit/2026-10-29_FULL_AUDIT.md`](Audit/2026-10-29_FULL_AUDIT.md)**, верифицированные гейты — **[`GATES.md`](GATES.md)**, история — `Audit/archive/`):
 - Полностью решены проблемы закрытия файловых дескрипторов при многопоточной загрузке (MT-download chunk bug), изоляции настроек сессий, Content-Type гейтов для предотвращения сохранения HTML-страниц ошибок как картинок, а также нормализации имен файлов.
 - Реализован паритет правил Imagus Sieve между браузерным расширением и десктопом, внедрена сегментная фильтрация URL и строгая классификация мусорных баннеров.
 - Расширение полностью очищено от устаревшего `new Function` и невалидных ключей манифеста, подготовлен официальный пакет для размещения в Chrome Web Store (см. [`docs/CHROME_WEB_STORE.md`](docs/CHROME_WEB_STORE.md) и [`PRIVACY_POLICY.md`](PRIVACY_POLICY.md)).
-- Тестовое покрытие: **498 пройденных тестов** в Python (`pytest`; 30 скипов без Deno) и **15 тестовых наборов** для браузерного расширения (`Node.js`).
+- Тестовое покрытие: **581 пройденный тест** в Python (`pytest`; 30 скипов без Deno) и **18 тестовых наборов** для браузерного расширения (`Node.js`).
 
 ---
 

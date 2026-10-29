@@ -51,8 +51,8 @@ STATE_KEYS = (
     "processed_urls", "downloaded_files", "pages_with_downloads", "stats",
     "settings", "start_url", "download_path", "domain_health",
     "quarantined_domains",
-    # A-03: the page/download in flight when the user hit Pause.
-    "inflight_url_item", "inflight_media",
+    # A-03/C-01: the pages/downloads in flight when the user hit Pause.
+    "inflight_url_items", "inflight_media_items",
 )
 
 
@@ -235,8 +235,8 @@ class TestInflightRestore(unittest.TestCase):
         async def save():
             pm = _make_manager(download_path=download_path)
             _prepare_loop_state(pm)
-            pm._inflight_url_item = self.IN_FLIGHT_PAGE
-            pm._inflight_media = self.IN_FLIGHT_DOWNLOAD
+            pm._inflight_pages[self.IN_FLIGHT_PAGE[0]] = self.IN_FLIGHT_PAGE
+            pm._inflight_downloads[self.IN_FLIGHT_DOWNLOAD["url"]] = self.IN_FLIGHT_DOWNLOAD
             await pm.save_state(download_path)
 
         asyncio.run(save())
@@ -258,6 +258,106 @@ class TestInflightRestore(unittest.TestCase):
                          "the interrupted page was not re-queued on resume")
         self.assertEqual(list(fresh.download_queue._queue), [self.IN_FLIGHT_DOWNLOAD],
                          "the interrupted download was not re-queued on resume")
+
+    def test_every_concurrent_inflight_item_survives(self):
+        """C-01: 4 parser + 8 download workers share the snapshot.
+
+        One shared slot kept only the LAST item; every other page/download in
+        flight was silently dropped from state.pkl.
+        """
+        download_path = os.path.join(self._tmp(), "album")
+        pages = [(f"https://site.com/album/{i}", 2, PAGE, {"source_url": PAGE})
+                 for i in range(1, 4)]
+        downloads = [{"url": f"https://cdn.example.com/f{i}.jpg",
+                      "filepath": f"album/f{i}.jpg", "media_type": "image",
+                      "source_url": PAGE} for i in range(2)]
+
+        async def save():
+            pm = _make_manager(download_path=download_path)
+            _prepare_loop_state(pm)
+            for page in pages:
+                pm._inflight_pages[page[0]] = page
+            for item in downloads:
+                pm._inflight_downloads[item["url"]] = item
+            await pm.save_state(download_path)
+
+        asyncio.run(save())
+
+        async def load():
+            fresh = _make_manager(download_path=download_path)
+            _prepare_loop_state(fresh)
+            await fresh.load_state(download_path)
+            return fresh
+
+        fresh = asyncio.run(load())
+        self.assertEqual(sorted(i.url for i in fresh.url_queue._queue),
+                         sorted(p[0] for p in pages),
+                         "only some in-flight pages survived the snapshot")
+        self.assertEqual(sorted(i["url"] for i in fresh.download_queue._queue),
+                         sorted(d["url"] for d in downloads),
+                         "only some in-flight downloads survived the snapshot")
+
+    def test_restored_page_is_forgotten_from_processed_urls(self):
+        """C-01: re-queueing alone was a no-op — the worker skips it.
+
+        `parser_worker` adds the URL to processed_urls before parsing and then
+        drops anything already in that set, so a restored page must also be
+        discarded from it or resume never re-parses the page.
+        """
+        download_path = os.path.join(self._tmp(), "album")
+
+        async def save():
+            pm = _make_manager(download_path=download_path)
+            _prepare_loop_state(pm)
+            pm.processed_urls.add(self.IN_FLIGHT_PAGE[0])
+            pm._inflight_pages[self.IN_FLIGHT_PAGE[0]] = self.IN_FLIGHT_PAGE
+            await pm.save_state(download_path)
+
+        asyncio.run(save())
+
+        async def load():
+            fresh = _make_manager(download_path=download_path)
+            _prepare_loop_state(fresh)
+            await fresh.load_state(download_path)
+            return fresh
+
+        fresh = asyncio.run(load())
+        self.assertNotIn(self.IN_FLIGHT_PAGE[0], fresh.processed_urls,
+                         "the restored page would be skipped as already processed")
+        self.assertEqual([(i.url, i.depth) for i in fresh.url_queue._queue],
+                         [(self.IN_FLIGHT_PAGE[0], self.IN_FLIGHT_PAGE[1])])
+
+    def test_legacy_single_slot_state_still_resumes(self):
+        """A state.pkl written before C-01 must still resume after the upgrade."""
+        download_path = os.path.join(self._tmp(), "album")
+
+        async def save_legacy():
+            pm = _make_manager(download_path=download_path)
+            _prepare_loop_state(pm)
+            real_dumps = parser_manager_module.pickle.dumps
+            state_path = task_state_path(download_path, "task-1")
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            with open(state_path, "wb") as f:
+                f.write(real_dumps({
+                    "url_queue_items": [], "download_queue_items": [],
+                    "quarantine_queue_items": [], "processed_urls": [PAGE],
+                    "downloaded_files": [], "pages_with_downloads": [],
+                    "stats": {}, "start_url": PAGE, "download_path": download_path,
+                    "inflight_url_item": self.IN_FLIGHT_PAGE,
+                    "inflight_media": self.IN_FLIGHT_DOWNLOAD,
+                }))
+
+        asyncio.run(save_legacy())
+
+        async def load():
+            fresh = _make_manager(download_path=download_path)
+            _prepare_loop_state(fresh)
+            await fresh.load_state(download_path)
+            return fresh
+
+        fresh = asyncio.run(load())
+        self.assertEqual([i.url for i in fresh.url_queue._queue], [self.IN_FLIGHT_PAGE[0]])
+        self.assertEqual(list(fresh.download_queue._queue), [self.IN_FLIGHT_DOWNLOAD])
 
     def test_a_finished_task_restores_empty_queues(self):
         """No in-flight item must not become a `None` queue entry."""
@@ -328,3 +428,70 @@ class TestStateSnapshot(unittest.TestCase):
         # not describing a no-op.
         self.assertEqual(pm.stats["pages_processed"], 999)
         self.assertEqual(pm.domain_health["cdn.example.com"]["failures"], 99)
+
+
+class TestOneShotSeeding(unittest.TestCase):
+    """G-02: the extension's pre-scanned list is a ONE-SHOT seed.
+
+    The GUI handed `_pending_downloads` to a new ParserManager on every launch,
+    so a Pause→Resume queued the whole original batch on top of the items
+    restored from state.pkl: every file downloaded twice (`name_1.jpg`), stats
+    doubled, progress stalled around 50%.
+    """
+
+    ITEMS = [{"url": "https://cdn.example.com/a.jpg", "filepath": "album/a.jpg"},
+             {"url": "https://cdn.example.com/b.jpg", "filepath": "album/b.jpg"}]
+
+    def _tmp(self):
+        path = tempfile.mkdtemp(prefix="wmp_state_")
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    def _manager(self, download_path, pending):
+        pm = _make_manager(download_path=download_path)
+        pm.pending_downloads = list(pending)
+        return pm
+
+    def test_resume_does_not_requeue_the_original_batch(self):
+        download_path = os.path.join(self._tmp(), "album")
+
+        async def first_run():
+            pm = self._manager(download_path, self.ITEMS)
+            _prepare_loop_state(pm)
+            self.assertTrue(await pm._seed_pending_downloads())
+            await pm.save_state(download_path)
+            return pm
+
+        first = asyncio.run(first_run())
+        self.assertEqual(first.download_queue.qsize(), 2)
+        self.assertEqual(first.stats["images_found"], 2)
+
+        async def resume():
+            # Deliberately still carrying the list, as the pre-fix GUI did.
+            pm = self._manager(download_path, self.ITEMS)
+            _prepare_loop_state(pm)
+            await pm.load_state(download_path)
+            await pm._seed_pending_downloads()
+            return pm
+
+        resumed = asyncio.run(resume())
+        self.assertEqual([i["url"] for i in resumed.download_queue._queue],
+                         [i["url"] for i in self.ITEMS],
+                         "resume queued the original batch a second time")
+        self.assertEqual(resumed.stats["images_found"], 2,
+                         "the one-shot stats were counted twice on resume")
+
+    def test_a_used_list_is_dropped_so_a_resume_seeds_nothing(self):
+        download_path = os.path.join(self._tmp(), "album")
+
+        async def run():
+            pm = self._manager(download_path, self.ITEMS)
+            _prepare_loop_state(pm)
+            await pm._seed_pending_downloads()
+            seeded_again = await pm._seed_pending_downloads()
+            return pm, seeded_again
+
+        pm, seeded_again = asyncio.run(run())
+        self.assertFalse(seeded_again)
+        self.assertEqual(pm.download_queue.qsize(), 2)
+        self.assertEqual(pm.pending_downloads, [])

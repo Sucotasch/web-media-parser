@@ -1,7 +1,9 @@
 # Web Media Parser — Контекст проекта и архитектура (as-built)
 
-> **Обновлено:** 2026-10-15 — план исправлений `Audit/FIXPLAN_2026-10-15.md` применён (этапы 0-7,
-> гейты в `GATES.2026-10-15.md`; топ-дефекты аудита закрыты, см. §7). Архитектурная часть — от 2026-08-16.
+> **Обновлено:** 2026-10-29 — полный аудит/баг-хант проведён, документация актуализирована;
+> открытый бэклог — `Audit/2026-10-29_FULL_AUDIT.md`, канонический dev-гид — `docs/DEV_GUIDE.md`.
+> Все датированные аудиты/планы (вкл. `Audit.md`, `PLAN.md`, снимки `GATES.*`) перемещены в `Audit/archive/`.
+> Этапы 0–7 плана `FIXPLAN_2026-10-15` применены и верифицированы (см. §7). Архитектурная часть — от 2026-08-16.
 > **Статус:** очередь задач и все фичи P0–P4 (sieve-JS/Deno, junk-фильтр, curl_cffi, гейтвеи) реализованы.
 > Этот документ описывает **как код устроен сейчас**. Исторические планы/аудиты сжаты в §9.
 
@@ -14,7 +16,7 @@
 - URL (из GUI или Chrome-расширения) → обход страниц по ссылкам → обнаружение изображений/видео → загрузка
 - Приоритизация URL (медиа > навигация), преобразование thumbnail → fullsize (паттерны + Imagus Sieve)
 - Обход защит: cookie-consent, age-gate (статика + Deno DOM-клик), JS-редиректы
-- Python 3.8+ (dev 3.12), Windows — основная платформа
+- Python 3.10+ (dev 3.12; PEP 604 union-типы в `src/`), Windows — основная платформа
 - Опционально: Deno JS-движок, curl_cffi TLS-имперсонация, Chrome-расширение (localhost API)
 
 ---
@@ -25,7 +27,7 @@
 web-media-parser/
 ├── main.py                  # Точка входа: fix_lxml/fix_brotli → QApplication → MainWindow
 ├── build_exe.py             # PyInstaller onedir → dist/WebMediaParser/ (+ bin/deno, sieve, allowlist)
-├── setup.py                 # setuptools (известно: отстаёт от requirements.txt — Audit PKG-2)
+├── setup.py                 # setuptools (зеркалит requirements.txt — 13 зависимостей)
 ├── requirements.txt         # Канонический список зависимостей
 ├── WebMediaParser.spec      # Генерируемый артефакт build_exe.py (не источник истины)
 │
@@ -51,9 +53,7 @@ web-media-parser/
 │   │   ├── junk_filter.py           # Классификатор ad/tracker-мусора + allowlist (P2-lite)
 │   │   ├── http_engine.py           # Выбор движка sync-путей: requests vs curl_cffi (P3) + эскалация
 │   │   ├── shared_session.py        # AsyncClientManager (aiohttp) + extension_cookies
-│   │   ├── utils.py                 # is_media_url, normalize_url, should_skip_crawl_url и др.
-│   │   └── domain_blocklist.txt     # УСТАРЕВШАЯ копия блоклиста (канон — resources/; Audit PAT-7)
-│   │
+│   │   └── utils.py                 # is_media_url, normalize_url, should_skip_crawl_url и др.
 │   ├── downloader/
 │   │   └── media_downloader.py      # Single/multi-thread загрузка, rate limit, эскалация
 │   │
@@ -72,12 +72,13 @@ web-media-parser/
 │   ├── junk_allowlist.txt            # Allowlist для junk-фильтра
 │   └── patterns/site_patterns.json   # Встроенные паттерны (32)
 │
-├── tests/                  # 24 модуля pytest (+ helpers.py/conftest.py)
+├── tests/                  # 37 модулей pytest (+ helpers.py/conftest.py)
 ├── docs/
-│   ├── DENO_JS_ENGINE_DESIGN.md           # Дизайн+статус P0–P4 (двигок Deno)
-│   └── DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md  # Рабочий план улучшений краула
-├── Audit.md                # Полный аудит 2026-08-16 (приложение + расширение)
-└── Imagus_sieve_*.json     # Sieve-файлы (корень; в dev НЕ подхватываются автоматом — Audit PAT-1)
+│   ├── DEV_GUIDE.md                       # Канонический гид разработчика
+│   ├── CHROME_WEB_STORE.md                # Листинг CWS
+│   └── archive/                           # Исторические: DENO_JS_ENGINE_DESIGN, DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS
+├── Audit/                  # 2026-10-29_FULL_AUDIT.md (открытый бэклог) + archive/ (все датированные аудиты)
+└── Imagus_sieve_*.json     # Sieve-файл в корне (сканируется и в dev — PAT-1; сейчас 2026.09.15_833)
 ```
 
 ---
@@ -123,7 +124,7 @@ web-media-parser/
 
 `task_ended(reason)` эмитится ВСЕГДА: `completed | stopped | failed` — по нему живёт автозапуск очереди.
 
-Ключевой порядок для Resume: **load_state вызывается внутри `_main_task` (parser_manager.py:302), до посева start_url** — старый race «воркеры стартуют раньше восстановления state» устранён архитектурно. Очередь URL, download_queue, processed_urls, downloaded_files, quarantine восстанавливаются; докачанные URL фильтруются через `downloaded_files`.
+Ключевой порядок для Resume: **load_state вызывается внутри `_main_task` (parser_manager.py:363), до посева start_url** — старый race «воркеры стартуют раньше восстановления state» устранён архитектурно. Очередь URL, download_queue, processed_urls, downloaded_files, quarantine восстанавливаются; докачанные URL фильтруются через `downloaded_files`.
 
 ### 3.3. Завершение
 
@@ -187,50 +188,54 @@ web-media-parser/
 
 ## 6. Интеграция с расширением
 
-- Протокол: `GET /api/status`, `GET /api/queue` (= status, дубликат), `POST /api/tasks` `{urls:[{url,source,type,...}], one_shot, user_agent, cookies}`; origin-гейт «любой chrome-extension://» (см. §7 EXT-11).
+- Протокол: `GET /api/status`, `POST /api/tasks` `{urls:[{url,source,type,...}], one_shot, user_agent, cookies}`; origin-гейт `chrome-extension://` (пин `K.EXTENSION_ID`, см. §7 EXT-11) и `moz-extension://`; все роуты дополнительно проверяют loopback-`Host` (C-06), тело — dict/list/скаляры валидируются (C-03).
 - One-shot путь: элементы собираются в `_pending_downloads` (оригинальный URL, transformed-флаг), задача стартует как crawl по странице-источнику.
 - Куки+UA вкладки передаются в settings задачи (`extension_cookies`, `user_agent`) → `shared_session` (⚠ сессионный заголовок на все хосты — Audit DL-7).
-- Popup шлёт `{url, source: pageUrl (referer), type, original_url, transformed}`; валидации элементов на сервере нет (Audit EXT-4).
+- Popup шлёт `{url, source: pageUrl (referer), type, original_url, transformed}`; сервер фильтрует невалидные элементы и чистит скаляры (EXT-4/C-04).
 
 ---
 
-## 7. Известные дефекты (сводно; детали и фиксы — Audit.md)
+## 7. Известные дефекты (сводно; детали и фиксы — `Audit/archive/`, текущий бэклог — `Audit/2026-10-29_FULL_AUDIT.md`)
 
-**Топ-дефекты из аудита 2026-08-16 — применены** этапами 0-7 плана `Audit/FIXPLAN_2026-10-15.md`
-(гейты и замеры: `GATES.2026-10-15.md`; коммиты `d663444`, `fef0758`, `54688c6`, `f6958a7`):
+**Топ-дефекты из аудита 2026-08-16 — применены** этапами 0-7 плана `Audit/archive/FIXPLAN_2026-10-15.md`
+(гейты и замеры: `Audit/archive/GATES.2026-10-15.md`; коммиты `d663444`, `fef0758`, `54688c6`, `f6958a7`):
 
 | ID | Суть | Как закрыт |
 |---|---|---|
 | CORE-1 | JSON-парсер мёртв (`async with` без контекст-менеджера) | контекстом управляет вызывающий; `async with self.session.get(...)` — тест `test_json_parser.py` |
 | CORE-10 | Ошибка единственной страницы → задача не завершается (hang) | `task_ended` эмитится на всех выходах `_main_task`, включая аварийный |
-| GUI-1 | `QTimer.singleShot` из HTTP-потока — автостарт/refresh из расширения не срабатывают | payload расширения буферизуется, `QTimer` только в GUI-потоке (`main_window.py:141`, `_pending_extension_payloads`) |
+| GUI-1 | `QTimer.singleShot` из HTTP-потока — автостарт/refresh из расширения не срабатывают | payload расширения буферизуется, `QTimer` только в GUI-потоке (`main_window.py`: `_pending_extension_payloads` / `_drain_pending_extension_payloads`) |
 | GUI-2 | Гонка смены задач: утечка QThread / порча статуса чужим `task_ended` | `task_ended = Signal(task_id, reason)`; `finished.connect(deleteLater)` |
 | GUI-4 | `task_queue.json` не атомарен; один битый элемент стирает всю очередь | `tmp + fsync + os.replace`, один битый элемент — только он и пропускается |
 | DL-3 | gzip-ответы ложно бракуются по размеру → карантин домена | проверка по framing + сниффинг тела + `unverified_length` вместо наивного сравнения размеров |
 | PAT-1 | Dev-запуск: 0 sieve-правил | проверено на этом дереве: 815 имён правил / 561 правило / 34 паттерна в dev |
 | PAT-7/8 | Блоклист и allowlist в dev грузятся не оттуда | единый `app_paths.resource_path()` для dev и frozen |
 
-Полный список (~90 находок с фиксами и кодом): **`Audit.md`**. Независимая верификация
-(63/63 Medium/Low, 3 новых дефекта) — `Audit/VERIFY_2026-10-15.md`.
+Полный список (~90 находок с фиксами и кодом): `Audit/archive/Audit_2026-10-14_main-review.md`
+(бывший корневой `Audit.md`; по сверкe 2026-10-29 закрыто 74/80, реально открытые хвосты перенесены
+в `Audit/2026-10-29_FULL_AUDIT.md` §3.2). Независимая верификация (63/63 Medium/Low, 3 новых дефекта) —
+`Audit/archive/VERIFY_2026-10-15.md`.
 
 ---
 
 ## 8. Тесты
 
 ```bash
-python -m pytest tests -q    # 498 passed, 30 skipped (2026-10-16)
-for f in extension/tests/*.test.mjs; do node "$f"; done   # 15/15 ALL PASS
-
-> **Что лежит в state-файле (A-02, продуктовое решение 2026-10-15).** `last_session.pkl` — обычный pickle в каталоге загрузки: он содержит очереди URL/загрузок, статистику, health домена и **cookie, выученные на gateway/age-gate страницах** (в открытом виде). Шифрования и фильтрации кредов здесь нет намеренно: контур локальный и доверенный (однопользовательский инструмент, cookie из браузера самого пользователя), а вырезание cookie при персисте ломало бы resume на age-gate/авторизованных сайтах (`Close window` → Pause + save queue → перезапуск вернул бы consent-страницу). Не выкладывайте каталог загрузок в публичный архив/репозиторий.
+python -m pytest tests -q    # 581 passed, 30 skipped, 8 subtests (2026-10-29)
+for f in extension/tests/*.test.mjs; do node "$f"; done   # 18/18 ALL PASS
 ```
 
-Скипы: **все 30** — нет Deno в окружении (`Deno binary/worker not available`, `Deno DOM worker / happy-dom cache not available`); проверено `-rs` 2026-10-15. Прежняя запись «9 — curl_cffi не установлен, 1 — сетевой плейсхолдер» неверна: `curl_cffi 0.16.0` установлен, escalation-тесты идут (E-06). Слабые/вакуумные тесты и пробелы — Audit TST-1…TST-6.
+> **Что лежит в state-файле (A-02, продуктовое решение 2026-10-15).** `last_session.pkl` — обычный pickle в каталоге загрузки: он содержит очереди URL/загрузок, статистику, health домена и **cookie, выученные на gateway/age-gate страницах** (в открытом виде). Шифрования и фильтрации кредов здесь нет намеренно: контур локальный и доверенный (однопользовательский инструмент, cookie из браузера самого пользователя), а вырезание cookie при персисте ломало бы resume на age-gate/авторизованных сайтах (`Close window` → Pause + save queue → перезапуск вернул бы consent-страницу). Не выкладывайте каталог загрузок в публичный архив/репозиторий.
+
+Скипы: **все 30** — нет Deno в окружении (`Deno binary/worker not available`, `Deno DOM worker / happy-dom cache not available`); это штатный зелёный статус. Слабые/вакуумные тесты и пробелы — Audit TST-1…TST-6 (архив).
 
 ---
 
 ## 9. История (сжато)
 
 - **2026-04-12/14 — очередь задач.** TaskItem/TaskQueueManager/UI/пауза-резюм/`task_ended`/`{task_id}/last_session.pkl`. Известные тогда проблемы (Resume-дубликаты, порядок mark_paused, неограниченный log history) — решены: `load_state` перенесён внутрь `_main_task` (до посева URL), `mark_paused()` теперь ДО `stop_parsing()`, history — deque(5000). Внешние аудиты того периода (Gemini 7/10, Qwen 5/10) учтены; применённые фиксы — thread-safe stop, wait in-flight, quarantine в state, regex `$10`, рекурсивный `_expand_variants`.
-- **2026-07-16 — план улучшений краула** (`docs/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md`): WP по junk/links/fullsize — легли в основу P2-lite и сегментного stop-words.
-- **2026-08-07..10 — P0–P4** (`docs/DENO_JS_ENGINE_DESIGN.md`): Deno-движок (sieve-JS, DOM-правила, this.node-шимы), junk_filter, curl_cffi + эскалация, gateway-bypass с consent-кэшем. Боевая проверка: fullsize-дискавери 1940 media (было 0), 0 DOM-ошибок.
-- **2026-08-16 — полный аудит** (`Audit.md`): два блока (приложение/расширение), ~90 находок с фиксами; CONTEXT переписан как as-built (этот документ).
+- **2026-07-16 — план улучшений краула** (`docs/archive/DEV_GUIDE_MEDIA_CRAWL_IMPROVEMENTS.md`): WP по junk/links/fullsize — легли в основу P2-lite и сегментного stop-words.
+- **2026-08-07..10 — P0–P4** (`docs/archive/DENO_JS_ENGINE_DESIGN.md`): Deno-движок (sieve-JS, DOM-правила, this.node-шимы), junk_filter, curl_cffi + эскалация, gateway-bypass с consent-кэшем. Боевая проверка: fullsize-дискавери 1940 media (было 0), 0 DOM-ошибок.
+- **2026-08-16 — полный аудит** (`Audit_2026-10-14_main-review.md`, ныне в `Audit/archive/`): два блока (приложение/расширение), ~90 находок с фиксами; CONTEXT переписан как as-built (этот документ).
+- **2026-10-29 — полный аудит/баг-хант + актуализация документации.** Аудит (P/C/G/E/X-xx) — `Audit/2026-10-29_FULL_AUDIT.md`; создан `docs/DEV_GUIDE.md`; старый корпус — в `Audit/archive/`, дизайн-доки — в `docs/archive/`.
+- **2026-10-29 — внедрение всего бэклога аудита** (см. §7 аудита): in-flight наборы на паузе (C-01), cookie-sync после bypass (P-01), эскалация/прокси (P-02/P-03), паритет host-like вариантов и link→url (E-01/P-07/E-03), единый junk-классификатор в расширении (E-09), `dc`-скип (X-07), Firefox-манифест (E-02) и moz-origin (C-04), single-instance (C-08), guard'ы GUI/JS-движка. Гейты: 581/30/8 subtests, 18/18 node, ruff — только 3 намеренных E402.

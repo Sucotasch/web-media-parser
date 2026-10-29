@@ -26,7 +26,7 @@ class TaskQueueManager(QObject):
     """Manages a sequential queue of parsing tasks.
 
     One active task at a time.  Mutations happen on the GUI thread, but the
-    extension's HTTP thread READS the queue (`/api/status`, `/api/queue`), so
+    extension's HTTP thread READS the queue (via `/api/status`), so
     every public entry point holds `_lock` for its mutation/snapshot only and
     emits Qt signals after releasing it (C-08: a slot may call back into the
     manager, possibly from another thread — emitting under the lock would
@@ -321,6 +321,11 @@ class TaskQueueManager(QObject):
         tmp = filepath + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            # C-07: without fsync a power loss can leave the freshly renamed file
+            # empty (NTFS keeps the size update in cache) — the whole queue gone.
+            # Same pattern as the session pickle and settings.json.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, filepath)
         logger.info(f"Queue saved to {filepath} ({len(self._queue)} tasks)")
 

@@ -331,6 +331,18 @@ class TestMainWindowWiring(unittest.TestCase):
         self.assertIn("self.parser_thread = None", self.source,
                       "C-06: the old thread reference is not cleared before replacement")
 
+    def test_switching_tasks_disconnects_every_parser_signal(self):
+        """G-01: only task_ended was disconnected; the old instance kept writing
+        progress and status into the UI of the task that replaced it."""
+        disconnect = self._method_body("def _disconnect_parser_signals(self, pm=None):")
+        for signal in ("total_progress_updated", "current_progress_updated",
+                       "parsing_finished", "status_updated", "task_ended"):
+            self.assertIn(signal, disconnect,
+                          f"G-01: {signal} is not disconnected on task switch")
+        launch = self._method_body("def _launch_parser_for_task(self, task):")
+        self.assertIn("self._disconnect_parser_signals(", launch,
+                      "G-01: task launch no longer disconnects the old parser")
+
     def test_queue_signals_mark_the_file_dirty(self):
         for signal in ("task_added", "task_removed", "task_status_changed"):
             self.assertIn(f"self.task_queue.{signal}.connect(self._mark_queue_dirty)",
@@ -344,6 +356,36 @@ class TestMainWindowWiring(unittest.TestCase):
         self.assertIn("extension_server_failed = Signal(str)", self.source)
         self.assertIn("self.extension_server_failed.emit(", self.source)
         self.assertIn("QMessageBox.warning(self, \"Extension API unavailable\"", self.source)
+
+    def test_parser_constructor_failure_rolls_the_task_back(self):
+        """G-04: a broken site_patterns.json aborted the constructor while the
+        task was already RUNNING — Start/Remove stayed disabled forever."""
+        body = self._method_body("def _launch_parser_for_task(self, task):")
+        self.assertIn("except Exception as e:", body)
+        self.assertIn("task.mark_failed(", body)
+        self.assertIn("self.task_queue.clear_active()", body)
+
+    def test_stop_waits_for_the_event_loop_thread(self):
+        """G-05: waiting for the QThread (which only runs exec()) is not enough;
+        the *.part sweep raced the loop thread that actually writes files."""
+        body = self._method_body("def stop_parsing(self):")
+        self.assertIn("loop_thread = getattr(self.parser_manager, \"loop_thread\", None)", body)
+        self.assertIn("loop_thread.join(5.0)", body)
+
+    def test_extension_refresh_preserves_the_selection(self):
+        """G-11: selectRow(0) on every refresh moved the Start/Resume target."""
+        body = self._method_body("def _updateUiFromExtension(self, task_id=\"\"):")
+        self.assertIn("selected = self._get_selected_task_id()", body)
+        self.assertIn("self._refresh_task_table(selected_task_id=selected)", body)
+        self.assertIn("if self.task_queue.queue and not self._get_selected_task_id():", body)
+
+    def test_makedirs_failures_are_contained_in_slots(self):
+        """G-08: an unreachable network drive raised out of the Qt slot."""
+        for signature in ("def add_task_to_queue(self):",
+                          "def _start_from_url_input(self):"):
+            body = self._method_body(signature)
+            self.assertIn("except OSError as e:", body, signature)
+            self.assertIn("Cannot create download folder", body, signature)
 
     def _method_body(self, signature):
         start = self.source.index(signature)
@@ -502,4 +544,17 @@ class TestSearchDepthComboWiring(unittest.TestCase):
 
         saved = dialog.get_settings_from_ui()
         self.assertEqual(saved[K.SETTING_SEARCH_DEPTH], 0)
+
+    def test_reset_does_not_alias_process_wide_defaults(self):
+        """G-10: `.copy()` kept the SAME stop_words/format lists as K.* — an
+        in-place edit after Reset corrupted the defaults for the whole process."""
+        from src.gui.settings_dialog import SettingsDialog
+        dialog = SettingsDialog()
+        self.addCleanup(dialog.deleteLater)
+
+        dialog.reset_settings()
+        dialog.settings["stop_words"].append("g10-alias-probe")
+
+        self.assertNotIn("g10-alias-probe", K.DEFAULT_SETTINGS_VALUES["stop_words"])
+        self.assertNotIn("g10-alias-probe", K.DEFAULT_STOP_WORDS)
 

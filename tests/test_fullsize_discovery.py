@@ -88,6 +88,41 @@ class TestSieveLinkChain(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertIsNone(pm.apply_link_url_transform(rule, m))
 
+    def test_root_relative_url_template_resolves_against_the_page(self):
+        """P-07: '/share.php?id=$1' used to become 'https:///share.php?id=77'
+        (empty host — a URL that can never be fetched)."""
+        import re as _re
+        rule = {"link": "share:(\\d+)", "url": "/share.php?id=$1", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/share:77")
+        self.assertEqual(self.pm.apply_link_url_transform(
+            rule, m, page_url="https://example.com/gallery/1"),
+            ("https://example.com/share.php?id=77", None))
+
+    def test_protocol_relative_url_template_keeps_the_page_scheme(self):
+        """E-03: the desktop forced https on every protocol-relative template."""
+        import re as _re
+        rule = {"link": "g:(\\d+)", "url": "//cdn.example/$1.jpg", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/g:9")
+        self.assertEqual(self.pm.apply_link_url_transform(
+            rule, m, page_url="http://example.com/"),
+            ("http://cdn.example/9.jpg", None))
+
+    def test_scheme_less_host_template_gets_https(self):
+        import re as _re
+        rule = {"link": "h:(\\d+)", "url": "view.example/$1", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/h:5")
+        self.assertEqual(self.pm.apply_link_url_transform(
+            rule, m, page_url="http://example.com/"),
+            ("https://view.example/5", None))
+
+    def test_missing_group_leaves_no_literal_placeholder(self):
+        """E-03: an unmatched group used to leave a literal `$2` in the URL."""
+        import re as _re
+        rule = {"link": "(a)(b)?", "url": "https://cdn.example/$1/$2.jpg", "res": "x"}
+        m = _re.search(rule["link"], "https://example.com/a")
+        self.assertEqual(self.pm.apply_link_url_transform(rule, m),
+                         ("https://cdn.example/a/.jpg", None))
+
     def test_get_link_rule_returns_none_for_unmatched(self):
         # Empty/invalid inputs never match any rule.
         self.assertIsNone(self.pm.get_link_rule(""))
@@ -219,6 +254,62 @@ class TestDiscoveryIntegration(unittest.TestCase):
         # CORE-2: even the early return (binary content, no body read) must
         # release the pooled connection via async-CM __aexit__.
         self.assertTrue(resp.closed)
+
+    def test_res_fallback_marks_extraction_source(self):
+        """E-06: the caller must be able to tell the rule's own `res` match
+        from the blind <img> dump (the extension classifies that dump by count)."""
+        rule = {"link": r"^https?://example\\.com/img/", "res": r"(<div>nope</div>)"}
+
+        pm = self._make_manager().pattern_manager
+        meta = {}
+        urls = pm.extract_res_urls(
+            rule, '<img src="https://cdn.example/a.jpg"/>', meta=meta)
+        self.assertEqual(urls, ["https://cdn.example/a.jpg"])
+        self.assertTrue(meta.get("fallback"))
+
+        meta2 = {}
+        pm.extract_res_urls(
+            {"link": "x", "res": r"(https://cdn[.]example/a[.]jpg)"},
+            '<img src="https://cdn.example/a.jpg"/>', meta=meta2)
+        self.assertNotIn("fallback", meta2)
+
+    def test_grid_fallback_is_not_marked_as_fullsize(self):
+        """E-06: a grid page's <img> dump must not become "sieve-res".
+
+        The desktop marked every fallback URL as a fullsize original, so an
+        index/grid page downloaded all of its previews as originals (the
+        e-hentai symptom fixed only in the extension). One image is a detail
+        page's original, many are the page's own thumbnails.
+        """
+        pm = self._make_manager()
+        session = AsyncMock()
+        session.post.return_value = self.FakeResp(
+            html=('<img src="https://cdn.example/t1.jpg"/>'
+                  '<img src="https://cdn.example/t2.jpg"/>'))
+
+        async def run():
+            return await pm._discover_linked_fullsize(
+                [(IMX_LINK, {"from_image": True, "thumbnail_url": IMX_THUMB})],
+                "https://vipergirls.to/threads/123", session)
+
+        discovered, _, _ = asyncio.run(run())
+        self.assertEqual(sorted(m[1] for m in discovered),
+                         ["https://cdn.example/t1.jpg", "https://cdn.example/t2.jpg"])
+        self.assertEqual({m[2]["source"] for m in discovered}, {"page-img"})
+
+    def test_single_image_fallback_is_a_linked_original(self):
+        pm = self._make_manager()
+        session = AsyncMock()
+        session.post.return_value = self.FakeResp(
+            html='<img src="https://cdn.example/only.jpg"/>')
+
+        async def run():
+            return await pm._discover_linked_fullsize(
+                [(IMX_LINK, {"from_image": True, "thumbnail_url": IMX_THUMB})],
+                "https://vipergirls.to/threads/123", session)
+
+        discovered, _, _ = asyncio.run(run())
+        self.assertEqual([m[2]["source"] for m in discovered], ["linked-img"])
 
     def test_unmatched_link_not_consumed(self):
         pm = self._make_manager()

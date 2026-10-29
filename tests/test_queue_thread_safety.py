@@ -3,7 +3,7 @@
 
 """C-08 (2026-10-15): the extension thread reads the queue; the GUI thread writes it.
 
-`/api/status` and `/api/queue` are served from the aiohttp thread while the GUI
+`/api/status` is served from the aiohttp thread while the GUI
 thread adds, starts, pauses and removes tasks. Before the fix the manager had no
 lock at all and the status callback composed three separate reads
 (`active_task`, `len(queue)`, `active.files_downloaded`), so one HTTP response

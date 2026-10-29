@@ -97,7 +97,12 @@ class GUILogHandler(QObject, logging.Handler):
         Clear the log and reapply all filters to message history
         """
         self.clear_signal.emit()
-        for level, msg in self.message_history:
+        # G-03: `message_history` is a deque that parser/server/executor threads
+        # append to; iterating it live raised "deque mutated during iteration"
+        # inside this Qt slot, leaving the log empty or truncated (and in a
+        # windowed build the only trace was stderr). A snapshot costs one list
+        # copy of at most GUI_LOG_MAX_BLOCKS records, on an explicit user click.
+        for level, msg in list(self.message_history):
             if self.log_filter.is_enabled(level):
                 self.log_signal.emit(level, msg)
 

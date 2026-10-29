@@ -178,9 +178,10 @@ const onMessageSrc = bgSrc.slice(bgSrc.indexOf("chrome.runtime.onMessage.addList
 check("D-09: no branch calls .then(sendResponse) directly",
   /\.then\(sendResponse\)/.test(onMessageSrc), false);
 // download, discoverFullsize, startScan, chromeDownload, getContext, getStatus,
-// updateSieve — the audit counted six, the file has seven async branches.
+// updateSieve, setSieveRules (E-10) — the audit counted six; keep the count in
+// sync with the real async branches (this is the tripwire for a new one).
 check("D-09: every async branch goes through replyWith",
-  (onMessageSrc.match(/replyWith\(/g) || []).length, 7);
+  (onMessageSrc.match(/replyWith\(/g) || []).length, 8);
 
 if (failures > 0) {
   console.error(`${failures} failure(s)`);

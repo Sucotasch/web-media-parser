@@ -83,6 +83,21 @@ class TestSingleSourceOfDefaults(unittest.TestCase):
         )
         self.assertEqual(missing, [], f"declared settings without a default: {missing}")
 
+    def test_reset_copies_mutable_defaults(self):
+        """G-10: Reset must not alias K.DEFAULT_SETTINGS_VALUES lists."""
+        with io.open(DIALOG_PATH, encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("self.settings = self._copy_defaults()", source)
+        self.assertNotIn("self.settings = self.default_settings.copy()", source)
+
+    def test_sieve_path_write_is_copy_on_write(self):
+        """G-09: the HTTP thread reads this dict; no in-place mutation."""
+        with io.open(DIALOG_PATH, encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("self.settings = {**self.settings, K.SETTING_IMAGUS_SIEVE_PATH: sieve_path}",
+                      source)
+        self.assertNotIn("self.settings[K.SETTING_IMAGUS_SIEVE_PATH] = sieve_path", source)
+
     def test_stop_words_are_unique_and_lowercase(self):
         words = K.DEFAULT_STOP_WORDS
         self.assertEqual(len(words), len(set(words)),

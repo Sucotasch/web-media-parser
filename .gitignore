@@ -185,6 +185,8 @@ downloads/
 *.exe
 settings.json
 task_queue.json
+app.lock
+startup_error.log
 # A-01: the BUNDLED pattern file must be trackable (a clean clone had zero
 # patterns and `assert pattern_count > 0` failed); stray dev copies stay ignored.
 !resources/patterns/site_patterns.json

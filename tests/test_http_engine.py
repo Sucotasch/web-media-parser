@@ -223,6 +223,43 @@ def test_should_escalate_off_when_engine_is_curl(monkeypatch):
     assert http_engine.should_escalate({}, 429) is False
 
 
+def test_page_fetch_escalates_even_when_engine_is_curl(monkeypatch):
+    """P-02: pages always go out through aiohttp.
+
+    The old gate read the http_engine SETTING, so with curl_cffi selected a TLS
+    blocked page was refused without a single curl attempt — strictly worse than
+    the default. The caller now reports what it actually used.
+    """
+    monkeypatch.setattr(http_engine, "CURL_CFFI_AVAILABLE", True)
+    monkeypatch.setattr(http_engine, "_curl_requests", MagicMock())
+    curl_settings = {K.SETTING_HTTP_ENGINE: "curl_cffi"}
+    assert http_engine.should_escalate(
+        curl_settings, 403, primary_is_browser_tls=False) is True
+    # A request that really was browser-fingerprinted gains nothing from a retry.
+    assert http_engine.should_escalate(
+        {}, 403, primary_is_browser_tls=True) is False
+    # Backwards-compatible default (downloader path).
+    assert http_engine.should_escalate(curl_settings, 403) is False
+
+
+class _FakeCurlSession:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.proxies = None
+
+
+def test_escalation_session_carries_the_configured_proxy(monkeypatch):
+    """P-03: without the proxy the retry either always fails (mandatory proxy)
+    or leaves the machine directly, exposing the real IP."""
+    monkeypatch.setattr(http_engine, "CURL_CFFI_AVAILABLE", True)
+    monkeypatch.setattr(http_engine, "_curl_requests",
+                        MagicMock(Session=_FakeCurlSession))
+    session = http_engine.create_escalation_session({K.SETTING_PROXY: "1.2.3.4:8080"})
+    assert session.proxies == {"http": "http://1.2.3.4:8080",
+                               "https": "http://1.2.3.4:8080"}
+    assert http_engine.create_escalation_session({}).proxies is None
+
+
 def test_escalate_get_is_single_attempt(monkeypatch):
     """_try_escalate_get is bounded: called once per download, guarded."""
     if not http_engine.CURL_CFFI_AVAILABLE:

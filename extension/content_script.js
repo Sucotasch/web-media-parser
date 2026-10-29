@@ -49,6 +49,47 @@
       "ljcounter",
     ]);
 
+    // E-09: desktop parity — the ad/tracker tables below are the same data as
+    // junk_filter.AD_HOST_SUFFIXES and utils._AD_KEYWORDS (pinned by
+    // tests/test_junk_parity.py). Without them "Save in Chrome" happily
+    // downloaded ad creatives the app itself drops. Hosts match with a dot
+    // boundary; tokens match whole (see isAdKeyword).
+    const AD_HOST_SUFFIXES = [
+      "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+      "googletagmanager.com", "google-analytics.com", "googletagservices.com",
+      "adnxs.com", "appnexus.com", "taboola.com", "outbrain.com",
+      "criteo.com", "criteo.net", "rubiconproject.com", "pubmatic.com",
+      "openx.net", "moatads.com", "moat.com", "liadm.com", "serving-sys.com",
+      "scorecardresearch.com", "quantserve.com", "casalemedia.com",
+      "adsafeprotected.com", "advertising.com", "adtechus.com",
+      "adform.net", "adform.com", "adservice.google.com", "2mdn.net",
+      "everesttech.net", "media.net", "contextweb.com", "mathtag.com",
+      "krxd.net", "sovrn.com", "yieldmo.com", "yieldlab.net", "smartadserver.com",
+      "cpx.to", "clickbooth.com", "clickbank.net", "revcontent.com",
+      "mgid.com", "teads.tv", "teads.com", "sekindo.com", "tidaltv.com",
+      "spotxchange.com", "springserve.com", "freewheel.tv", "gfpkrw.net",
+      "ttwnz.com", "exelator.com", "adglare.net", "adskeeper.com",
+      "adsterra.com", "propellerads.com", "popads.net", "onclickads.net",
+      "revenuehits.com", "juicyads.com", "exoclick.com", "ero-advertising.com",
+      "trafficfactory.biz", "trafficjunky.net", "exosrv.com", "badoink.com",
+    ];
+
+    // Same tokens as utils._AD_KEYWORDS ("pixel" is deliberately absent:
+    // pixel-art galleries are legitimate content).
+    const AD_KEYWORDS = [
+      "ads", "advert", "advertisement", "advertising", "adserver", "adservice",
+      "banner", "banners", "promo", "promotion", "promotions",
+      "sponsor", "sponsors", "sponsored",
+      "tracking", "tracker", "trackers",
+      "analytics", "marketing", "campaign", "campaigns",
+      "popup", "popups", "popover", "popovers",
+      "cta", "ctas", "calltoaction", "call-to-action",
+      "adsense", "doubleclick", "googlesyndication", "googleadservices",
+      "adnxs", "taboola", "outbrain", "adservice", "adroll", "criteo",
+      "impression", "beacon", "affiliate", "popunder",
+      "mgid", "revcontent", "juicyads", "exoclick", "propellerads", "popads",
+    ];
+
     // A URL-wide substring test is safe for these two: neither can be a prefix
     // of a content filename.
     const JUNK_URL_PATTERNS = [
@@ -60,8 +101,10 @@
     ];
 
     // Unicode-aware split, like Python's \w: a Cyrillic filename must yield
-    // tokens (and therefore be KEPT), not split into nothing.
-    const TOKEN_SPLIT = /[^\p{L}\p{N}]+/u;
+    // tokens (and therefore be KEPT), not split into nothing. `_` is a word
+    // character in Python, so it is one here too (E-09: `icon_arrow.png` is
+    // one token, exactly as the desktop classifies it).
+    const TOKEN_SPLIT = /[^\p{L}\p{N}_]+/u;
 
     function tokens(text) {
       return (text || "").toLowerCase().split(TOKEN_SPLIT).filter(Boolean);
@@ -69,6 +112,19 @@
 
     function isJunkToken(token) {
       return JUNK_TOKENS.has(token);
+    }
+
+    // Two rules mirror utils._matches_ad_keyword exactly: the token equals a
+    // keyword, or extends it by a trailing "s" (banners, popads). Hyphens are
+    // ignored on both sides so "call-to-action" matches its own spelling.
+    function isAdKeyword(token) {
+      for (const kw of AD_KEYWORDS) {
+        const k = kw.replace(/-/g, "");
+        const t = token.replace(/-/g, "");
+        if (t === k) return true;
+        if (t.length === k.length + 1 && t.startsWith(k) && t.endsWith("s")) return true;
+      }
+      return false;
     }
 
     function isJunkUrl(url) {
@@ -84,6 +140,12 @@
       // escapes (a Cyrillic content name must be judged on its own words).
       let rawPath = parsed.pathname || "";
       try { rawPath = decodeURIComponent(rawPath); } catch (e) { /* keep it encoded */ }
+
+      // E-09: ad/tracker host suffix (dot boundary) or an ad token anywhere in
+      // host + path. Strong signals — they decide alone, like the desktop gate.
+      const host = (parsed.hostname || "").toLowerCase();
+      if (AD_HOST_SUFFIXES.some(s => host === s || host.endsWith("." + s))) return true;
+      if (tokens(host + "/" + rawPath).some(isAdKeyword)) return true;
 
       // Directory segments: `.../icons/x.png`, `.../images/avatar/1.jpg`.
       const segments = rawPath.split("/").filter(Boolean);

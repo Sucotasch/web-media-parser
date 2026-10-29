@@ -26,6 +26,10 @@ function parseSieve(data) {
     // keeps one rule set valid for every consumer; the bundled sieve ships 8
     // of them, and they used to keep transforming URLs in the extension.
     if (rule.off) continue;
+    // X-07: `dc` (domain-code macros) is unsupported by both implementations.
+    // The desktop logs and skips such rules; skipping them explicitly here keeps
+    // the two rule sets identical instead of depending on `!img || !to`.
+    if (rule.dc) continue;
     const img = rule.img || "";
     const to = rule.to || "";
     const link = rule.link || "";
@@ -167,17 +171,28 @@ function matchRuleUrl(imgRegex, url) {
 }
 
 /**
- * NF-1: make a produced variant absolute against the page it came from.
+ * E-01: a scheme-less value that begins with a host name (`cdn.example/x.jpg`)
+ * is an ABSOLUTE host reference, not a file next to the page. Resolving it
+ * against the page produced `https://page-host/dir/cdn.example/x.jpg` — garbage
+ * for 7 bundled rules (ImageShack, YouTube hq, Simkl, 3Dtoday, ...). A slash
+ * after the host is required so a plain file name (`photo.jpg`) stays relative.
+ */
+const HOST_LIKE_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?\//i;
+
+/**
+ * NF-1/E-01: make a produced variant absolute against the page it came from.
  *
  * `//cdn/x.jpg` takes the PAGE's scheme (hardcoding https broke http pages),
- * a scheme-less/relative result is resolved with the URL parser, and anything
- * that already carries a scheme (`http:`, `data:`, `blob:` …) is left alone.
+ * a scheme-less host reference gets `https://`, any other relative result is
+ * resolved with the URL parser, and anything that already carries a scheme
+ * (`http:`, `data:`, `blob:` …) is left alone. Twin: `normalize_variant`.
  */
 function normalizeVariant(variant, pageUrl) {
   if (typeof variant !== "string") return "";
   const v = variant.trim();
   if (!v) return "";
   if (/^[a-z][a-z0-9+.-]*:/i.test(v)) return v;
+  if (HOST_LIKE_RE.test(v)) return "https://" + v;
   const base = pageUrl
     || (typeof location !== "undefined" && location && location.href)
     || "";

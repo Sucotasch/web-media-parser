@@ -610,7 +610,10 @@ class SettingsDialog(QDialog):
                 "Choose a sieve file first (Imagus Sieve File on the Patterns tab).")
             return
         # Keep the view-model in sync so a later save writes the same path.
-        self.settings[K.SETTING_IMAGUS_SIEVE_PATH] = sieve_path
+        # G-09: the HTTP thread reads this dict; rebind a copy instead of mutating
+        # the live object the GUI thread may be iterating ("dictionary changed
+        # size during iteration" → 500 to the extension).
+        self.settings = {**self.settings, K.SETTING_IMAGUS_SIEVE_PATH: sieve_path}
 
         self.sieve_download_btn.setEnabled(False)
         self.sieve_status_label.setText("Downloading…")
@@ -981,11 +984,21 @@ class SettingsDialog(QDialog):
             
         self.accept()
 
+    def _copy_defaults(self) -> dict:
+        """G-10: defaults with mutable values copied (no aliases into K.*).
+
+        `default_settings` spreads K.DEFAULT_SETTINGS_VALUES, so `.copy()` kept
+        the very same `stop_words` / format lists: one in-place edit after Reset
+        would corrupt the process-wide defaults (F-01 fixed the load path only).
+        """
+        return {k: (list(v) if isinstance(v, list) else v)
+                for k, v in self.default_settings.items()}
+
     def reset_settings(self):
         """
         Reset settings to defaults
         """
-        self.settings = self.default_settings.copy()
+        self.settings = self._copy_defaults()
         self.apply_settings_to_ui()
 
     @staticmethod
@@ -1103,8 +1116,7 @@ class SettingsDialog(QDialog):
         # mutable values (stop_words, format lists) are shared with the module
         # constants — copy them, or a later in-place edit of the dialog's
         # settings would corrupt the process-wide defaults.
-        default_settings = {k: (list(v) if isinstance(v, list) else v)
-                            for k, v in self.default_settings.items()}
+        default_settings = self._copy_defaults()
         
         # Ensure some critical defaults are set
         if "min_video_size" not in default_settings:

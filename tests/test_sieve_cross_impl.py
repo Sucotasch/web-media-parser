@@ -81,6 +81,12 @@ class TestLiveSieveRulesAgree(unittest.TestCase):
         for name, rule in self.raw.items():
             if not isinstance(rule, dict) or rule.get("off"):
                 continue
+            # X-07: `dc` (domain-code) rules are unsupported by BOTH sides —
+            # site_pattern_manager logs and skips them at load, sieve.js now does
+            # the same. Comparing their `to` templates would measure a transform
+            # neither implementation ever applies.
+            if rule.get("dc"):
+                continue
             to = rule.get("to")
             img = rule.get("img")
             if not isinstance(to, str) or not to or to.startswith(":"):
@@ -161,7 +167,7 @@ class TestLiveSieveRulesAgree(unittest.TestCase):
         names = set()
         uncompilable = []
         for name, rule in self.raw.items():
-            if not isinstance(rule, dict) or rule.get("off"):
+            if not isinstance(rule, dict) or rule.get("off") or rule.get("dc"):
                 continue
             to = rule.get("to")
             if not isinstance(to, str) or not to or to.startswith(":"):

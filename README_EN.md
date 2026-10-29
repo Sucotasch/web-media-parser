@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.10%2B%20%7C%203.12-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white" alt="PySide6">
   <img src="https://img.shields.io/badge/Extension-Chrome%20MV3-4285F4?logo=googlechrome&logoColor=white" alt="Chrome MV3">
   <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white" alt="Windows">
@@ -57,7 +57,7 @@ Automatically detects images and videos, upgrades thumbnails to high-resolution 
 - **Multi-threaded downloads** — Configurable thread pools for both parsing and file downloading.
 - **Multi-segmented downloads** — Download single large files in multiple chunks (supporting `Accept-Ranges`).
 - **Connection reuse** — Shared HTTP sessions and connection pooling.
-- **Speed limit** — Bandwidth throttling for single-thread file downloads.
+- **Speed limit** — Bandwidth throttling; with `Threads per File > 1` all chunks of one download throttle against a shared byte counter.
 - **Deduplication** — Skips previously downloaded media URLs.
 - **Crash-safe state storage** — Atomic persistence of `last_session.pkl` using temporary files, fsync, and atomic rename.
 
@@ -67,9 +67,9 @@ Automatically detects images and videos, upgrades thumbnails to high-resolution 
 - **Configurable download folder** — Retains last selected output directory across launches.
 
 ### Supported Formats
-- **Images:** JPEG, PNG, WebP, AVIF, BMP, TIFF (GIF, SVG, ICO, CUR disabled by default; toggleable in *Settings → Filters*).
-- **Video:** MP4, WebM, OGG, MOV, MKV, AVI, FLV, M4V.
-- **Audio:** MP3, WAV, AAC, FLAC, OPUS.
+- **Images:** JPEG, PNG, WebP, AVIF, BMP, TIFF, JFIF, JIF (GIF, SVG, ICO, CUR disabled by default; toggleable in *Settings → Filters*).
+- **Video:** MP4, WebM, OGG, MOV, MKV, AVI, FLV, M4V, WMV, TS, MPEG, MPG.
+- **Audio:** MP3, WAV, AAC, FLAC, OPUS, OGG, M4A.
 - **Streaming:** M3U8 (HLS), MPD (DASH).
 - **APIs:** JSON endpoints — recursively extracts media objects from arbitrary data trees, nested lists, and handles pagination (`data.next`, `meta.pagination.next`).
 
@@ -108,12 +108,14 @@ The extension serves both as a standalone in-browser media downloader and as a q
 2. Click **Load unpacked** → select the `extension/` directory.
 3. Ready to use: 833 Imagus Sieve rules are initialized automatically.
 
+**Firefox 115+:** copy `extension/` to a separate folder and replace `manifest.json` there with `manifest.firefox.json` (Firefox has no `background.service_worker`, so `shared.js`/`sieve.js`/`sieve_updater.js`/`background.js` load as `background.scripts`). Install via `about:debugging` → **This Firefox** → **Load Temporary Add-on** → `manifest.json`.
+
 ---
 
 ## Installation
 
 ### System Requirements
-- **Python** 3.8+ (developed and tested on Python 3.12)
+- **Python** 3.10+ (developed and tested on Python 3.12)
 - **OS:** Windows 10/11 (primary supported platform).
 
 ### Running from Source
@@ -137,8 +139,7 @@ Structure:
 ```
 dist/WebMediaParser/
 ├── WebMediaParser.exe
-├── Imagus_sieve_2026.04.01_849.json   — Imagus rule sets
-├── Imagus_sieve_2026.07.15_823.json
+├── Imagus_sieve_2026.09.15_833.json   — Imagus rule sets (the build ships the single newest file)
 ├── junk_allowlist.txt                 — Allowlist for junk/ad filters
 ├── bin/                               — Deno JS engine (when built with Deno)
 │   ├── deno.exe
@@ -208,6 +209,8 @@ Files are organized by the source page domain and up to 2 path components:
 | Min. Image Height | 100 px | Minimum height parsed from HTML attributes |
 | Min. Image Size | 40 KB | Minimum file size (verified via HTTP HEAD) |
 | Min. Video Size | 1000 KB | Minimum video file size |
+| Max. File Size (KB) | 2 097 152 (2 GiB) | Upper per-download size limit; 0 = unlimited |
+| Reject unverified length | Off | Reject downloads whose length cannot be confirmed via headers |
 | Formats (checkboxes) | JPG/PNG/WebP/AVIF/BMP/TIFF | Image and video format allowlist; GIF/SVG/ICO disabled by default |
 | Stop Words | word list | Segment-aware path filter (e.g. `ad` will not drop `media`) |
 
@@ -224,13 +227,14 @@ Files are organized by the source page domain and up to 2 path components:
 |---|---|---|
 | User-Agent | Chrome 130 | Outgoing User-Agent string |
 | Referer | auto | Referer header policy (`auto` / `origin` / `none`) |
-| Accept-Language | en-US | Language preference header |
+| Accept-Language | en-US,en;q=0.9 | Language preference header |
 | Timeout | 30 sec | Network request timeout |
 | Retry Count | 3 | Number of retries on transient errors |
 | Proxy | — | HTTP/HTTPS proxy (`host:port`) |
-| **JS Engine** | Static | `Static` (default) / `Deno` — see [JS Engine (Deno)](#js-engine-deno) |
+| **JS Engine** | Static | `Static` (default) / `Deno` — control lives on the **Parsing** tab; see [JS Engine (Deno)](#js-engine-deno) |
 | **HTTP Engine** | Aiohttp | `Aiohttp` (default) / `curl_cffi` — see [HTTP Engine (curl_cffi)](#http-engine-curl_cffi) |
 | **Escalate on block** | ✓ | On HTTP 403/5xx, try one curl_cffi attempt before failing |
+| **Verify TLS** | Off | Verify TLS certificates on fallback/escalation requests |
 | Filter Ads/Junk | ✓ | Discard advertising/tracker URLs (allowlist compatible) |
 
 ### Logging
@@ -243,7 +247,7 @@ Files are organized by the source page domain and up to 2 path components:
 
 ## JS Engine (Deno)
 
-Web Media Parser can execute **Imagus Sieve JavaScript rules** through a lightweight, sandboxed Deno engine instead of static regex translation. Disabled by default (`Static`), enable via *Settings → HTTP → JS Engine → Deno*.
+Web Media Parser can execute **Imagus Sieve JavaScript rules** through a lightweight, sandboxed Deno engine instead of static regex translation. Disabled by default (`Static`), enable via *Settings → Parsing → JS Engine → Deno*.
 
 ### Capabilities
 - **P0** — JS `to`-rules (thumbnail → full-size URL transformations).
@@ -332,11 +336,11 @@ main.py
 
 ## Status & Engineering Audit
 
-The codebase has undergone a comprehensive engineering audit (see detailed registry in **[`Audit.md`](Audit.md)** and verification gates in **[`GATES.md`](GATES.md)**):
+The codebase has undergone a comprehensive engineering audit (fresh full audit & open backlog — **[`Audit/2026-10-29_FULL_AUDIT.md`](Audit/2026-10-29_FULL_AUDIT.md)**, verification gates — **[`GATES.md`](GATES.md)**, history — `Audit/archive/`):
 - Resolved multi-thread download chunk file descriptor leaks, session configuration leakage, Content-Type validation gates preventing error HTML pages from being saved as images, and filename normalization.
 - Achieved Imagus Sieve rule parity between desktop and browser extension, path-segment-aware URL filtering, and robust ad/banner categorization.
 - Browser extension fully cleaned of legacy `new Function` calls and deprecated manifest properties, with full packaging documentation for Chrome Web Store distribution (see [`docs/CHROME_WEB_STORE.md`](docs/CHROME_WEB_STORE.md) and [`PRIVACY_POLICY.md`](PRIVACY_POLICY.md)).
-- Test coverage: **498 passed tests** in Python (`pytest`; 30 skipped without Deno) and **15 test suites** for the Chrome extension (`Node.js`).
+- Test coverage: **581 passed tests** in Python (`pytest`; 30 skipped without Deno) and **18 test suites** for the browser extension (`Node.js`).
 
 ---
 

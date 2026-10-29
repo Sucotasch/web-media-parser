@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from heapq import heappush, heappop
 from dataclasses import dataclass, field
 from datetime import datetime
-from src.parser.utils import is_media_url, normalize_url
+from src.parser.utils import is_media_url, normalize_url, registrable_domain
 from src import constants as K
 
 logger = logging.getLogger(__name__)
@@ -125,13 +125,17 @@ class PriorityURLQueue:
         if url_domain == source_domain:
             return True
 
-        # Domain check
+        # Domain check (P-04). The old two rules were both wrong:
+        #  * `source_domain.endswith('.' + url_domain)` rejected "subdomain ->
+        #    apex" (www.example.com -> example.com), so a crawl started on www
+        #    silently lost every apex page;
+        #  * last-two-labels comparison let `bbc.co.uk` and `evil.co.uk` pass.
+        # Compare the registrable domain in BOTH directions — the same helper the
+        # top-level `is_same_domain` filter (CORE-6) already uses.
         if url_domain != source_domain:
-            if source_domain.endswith('.' + url_domain):
-                return False
-            url_main = '.'.join(url_domain.split('.')[-2:]) if len(url_domain.split('.')) >= 2 else url_domain
-            source_main = '.'.join(source_domain.split('.')[-2:]) if len(source_domain.split('.')) >= 2 else source_domain
-            if url_main != source_main:
+            url_site = registrable_domain(url_domain)
+            source_site = registrable_domain(source_domain)
+            if not url_site or not source_site or url_site != source_site:
                 return False
 
         url_path = url_parsed.path.lower().strip('/')
@@ -537,9 +541,25 @@ class PriorityURLQueue:
             path_segs, seg_count = [], 0
         # A single segment appearing many times is a urljoin-bloat signature
         # (e.g. threads/members/threads/members/...) even when not adjacent.
+        # P-12: a bare `> 3` also dropped legitimate taxonomies/calendars
+        # (/tag/x/tag/y/tag/z/tag/w). The signature is either ADJACENT repeats
+        # (`a/a/a`) or a repeated segment that DOMINATES the path.
         repeated_seg = False
-        if path_segs:
-            repeated_seg = max(Counter(path_segs).values()) > 3
+        if path_segs and max(Counter(path_segs).values()) > 3:
+            # Periodic path = the urljoin bloat signature (`a/b/a/b/a/b`,
+            # `threads/x/threads/x`). A taxonomy that merely reuses one segment
+            # (/tag/x/tag/y/tag/z) is not periodic and is kept.
+            # The periodic prefix is what matters: the bloat usually ends with
+            # one real segment (…/threads/members/520129-title).
+            for period in (1, 2, 3):
+                run = 0
+                for i in range(period, len(path_segs)):
+                    if path_segs[i] != path_segs[i - period]:
+                        break
+                    run += 1
+                if run + period >= 3 * period:
+                    repeated_seg = True
+                    break
         if seg_count > K.MAX_URL_PATH_SEGMENTS or len(url) > K.MAX_URL_LENGTH or repeated_seg:
             logger.debug(f"Skipping pathological URL (segments={seg_count}, len={len(url)}): {url[:120]}")
             return

@@ -201,23 +201,30 @@ def _third_party(page_host: str, url_host: str) -> bool:
 # The forum.php 404s observed in logs were urljoin artifacts
 # (/threads/forum.php instead of /forum.php) — handled by the URL-dedup and
 # 404 handling, not by blocking the pattern.
+# P-08: these matched anywhere in the URL, so `research.php` was skipped as
+# `search.php`, `remember.php` as `member.php`, `blogin.php` as `login.php`, and
+# `viewfullscreen` as `viewfull`. The pattern must start a path segment — `\b`
+# would not do: in `url.php?a=1` the character before `php` is `.`, and `\b`
+# also matches between a word char and `/`.
+_SEG_START = r"(?:^|[/?&=])"
+
 SKIP_CRAWL_REGEXES = (
     # vBulletin/phpBB action forms (never GET content)
-    re.compile(r"search\.php", re.I),
-    re.compile(r"newreply\.php", re.I),
-    re.compile(r"newthread\.php", re.I),
-    re.compile(r"sendmessage\.php", re.I),
-    re.compile(r"editpost\.php", re.I),
+    re.compile(_SEG_START + r"search\.php", re.I),
+    re.compile(_SEG_START + r"newreply\.php", re.I),
+    re.compile(_SEG_START + r"newthread\.php", re.I),
+    re.compile(_SEG_START + r"sendmessage\.php", re.I),
+    re.compile(_SEG_START + r"editpost\.php", re.I),
     re.compile(r"do=newreply", re.I),
     # account / admin / user profiles & lists — dead ends, no media (not
     # hubs: forum.php/index.php/album.php are deliberately NOT here)
-    re.compile(r"member\.php", re.I),
-    re.compile(r"memberlist", re.I),
+    re.compile(_SEG_START + r"member\.php", re.I),
+    re.compile(_SEG_START + r"memberlist", re.I),
     re.compile(r"/members/", re.I),
-    re.compile(r"usercp\.php", re.I),
-    re.compile(r"private\.php", re.I),
-    re.compile(r"login\.php", re.I),
-    re.compile(r"register\.php", re.I),
+    re.compile(_SEG_START + r"usercp\.php", re.I),
+    re.compile(_SEG_START + r"private\.php", re.I),
+    re.compile(_SEG_START + r"login\.php", re.I),
+    re.compile(_SEG_START + r"register\.php", re.I),
     re.compile(r"wp-admin", re.I),
     re.compile(r"wp-login", re.I),
     # post permalinks — same thread, re-crawled per post (duplicates)

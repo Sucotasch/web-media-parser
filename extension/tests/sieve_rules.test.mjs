@@ -25,7 +25,7 @@ const fakeConsole = {
 };
 
 const api = new Function("console", `${src}
-  return { parseSieve, applySieveRules, applySieveRulesAll, applySubstitution, applySubstitutionAll };
+  return { parseSieve, applySieveRules, applySieveRulesAll, applySubstitution, applySubstitutionAll, normalizeVariant };
 `)(fakeConsole);
 
 let failures = 0;
@@ -151,6 +151,34 @@ check(
   "D-08: the aggregate warning names the count",
   /1 rule\(s\) could not be parsed/.test(consoleCalls[1][1]),
   true
+);
+
+// --- E-01: host-like variants are absolute, not page-relative ---------------
+// Twin: tests/test_sieve_substitution_vectors.py
+check(
+  "host-like variant becomes https, not a page-relative path",
+  api.normalizeVariant("imagizer.imageshack.us/v2/500x500/x.jpg", "https://imageshack.com/a/x"),
+  "https://imagizer.imageshack.us/v2/500x500/x.jpg"
+);
+check(
+  "plain file name stays page-relative",
+  api.normalizeVariant("photo.jpg", "https://imageshack.com/a/page"),
+  "https://imageshack.com/a/photo.jpg"
+);
+check(
+  "root-relative stays page-relative",
+  api.normalizeVariant("/abs/x.jpg", "https://example.com/a/page"),
+  "https://example.com/abs/x.jpg"
+);
+check(
+  "protocol-relative takes the page scheme",
+  api.normalizeVariant("//cdn.example/x.jpg", "http://example.com/a/"),
+  "http://cdn.example/x.jpg"
+);
+check(
+  "absolute urls are untouched",
+  api.normalizeVariant("https://cdn/x.jpg", "http://example.com/"),
+  "https://cdn/x.jpg"
 );
 
 if (failures > 0) {

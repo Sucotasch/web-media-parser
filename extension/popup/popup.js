@@ -8,6 +8,23 @@ let activeDomainFilter = "";
 let activeSourceFilter = "";
 let concurrentLimit = 2;
 
+// --- Selection model and render state ---
+// What is SELECTED is a model question (matching items minus the ones the user
+// explicitly unchecked), not a DOM question: the list is painted incrementally,
+// so a row may not exist yet while its item is perfectly downloadable.
+const deselected = new Set();
+
+// F-07: how many rows one paint pass builds. NOT a cap on the list — the next
+// chunk is appended when the end of the list scrolls into view, so scrolling
+// reaches every item.
+const RENDER_CHUNK = 100;
+
+let renderQueue = [];        // filtered items for the current view, in order
+let renderedCount = 0;       // how many of them have a row by now
+let renderSentinel = null;   // "showing X of Y" footer, also the observer target
+let renderToken = 0;         // bumps on every render; stale callbacks stop
+let renderObserver = null;
+
 // FULLSIZE_SOURCES / DISCOVER_QUARANTINE_MS come from shared.js (EXT-9).
 
 // DOM elements
@@ -145,6 +162,7 @@ scanBtn.addEventListener("click", async () => {
   scanBtn.disabled = true;
   scanBtn.textContent = "Scanning...";
   mediaItems.length = 0;
+  deselected.clear();
   activeDomainFilter = "";
   activeSourceFilter = "fullsize";
   domainFilter.value = "";
@@ -242,6 +260,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 function applyScanResult(result) {
   mediaItems.length = 0;
+  // A new result set re-selects everything: old unchecks refer to old items.
+  deselected.clear();
   mediaItems.push(...result.media);
   // ERR-9: explain the verification in one line — a shorter list than before
   // must read as "these were checked out", not as missing media.
@@ -331,8 +351,14 @@ async function restoreScanState() {
     const samePage = (a, b) => !!a && !!b && a.split("#")[0] === b.split("#")[0];
     const resultStale = stored.scanResult && (!tab || stored.scanResult.tabId !== tab.id
       || !samePage(stored.scanResult.pageUrl, tab.url));
+    // E-08: a progress entry written by a service worker that died mid-scan is
+    // never updated again — after the scan budget it must be treated as stale,
+    // otherwise the button stays "Scanning..." (disabled) forever. Entries
+    // without `ts` (written by an older version) stay "fresh" for this check.
     const progressStale = stored.scanProgress && stored.scanProgress.status === "scanning"
-      && (!tab || stored.scanProgress.tabId !== tab.id);
+      && ((!tab || stored.scanProgress.tabId !== tab.id)
+          || (typeof stored.scanProgress.ts === "number"
+              && Date.now() - stored.scanProgress.ts > 90_000));
     if (resultStale || progressStale) {
       chrome.storage.local.remove(["scanResult", "scanProgress"]).catch(() => {});
       stored.scanResult = null;
@@ -385,15 +411,30 @@ function shouldShowDims(item) {
 
 // --- Render media list ---
 
+// One definition of "matches the current filters" — the painter, the counters,
+// Select all, Copy links, Send to App and Save must all agree on the set.
+function matchesFilters(item, domain, source) {
+  if (domain && extractDomain(item.url) !== domain) return false;
+  if (source === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
+  if (source === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
+  return true;
+}
+
+function filteredItems(items, domain, source) {
+  return items.filter((item) => matchesFilters(item, domain, source));
+}
+
+// Selected = every filtered item the user did not uncheck. Having no painted
+// row must never mean "not selected".
+function selectedItems(items, domain, source, skipped) {
+  return filteredItems(items, domain, source).filter((item) => !skipped.has(item));
+}
+
 function renderMediaList() {
   mediaList.innerHTML = "";
+  stopRenderObserver();
 
-  const filtered = mediaItems.filter((item) => {
-    if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
-    if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
-    if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
-    return true;
-  });
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
 
   if (filtered.length === 0) {
     // "No media found on this page" was shown for a filter that hides everything
@@ -409,24 +450,40 @@ function renderMediaList() {
   emptyDiv.classList.add("hidden");
   resultsDiv.classList.remove("hidden");
 
-  // F-07: rendering 1000+ rows froze the popup (every row builds a preview
-  // <img> that the browser then tries to load). Show the first 300 and say how
-  // many are left, so the list is usable instead of merely complete — the
-  // filters and "select all" still cover what is on screen.
-  const { shown, hidden } = capForRender(filtered);
+  // F-07 follow-up: the list is no longer CUT at a cap. Building 1000+ rows in
+  // one pass froze the popup, and hiding the remainder made those items
+  // unreachable; rows are now painted in chunks as the end of the list scrolls
+  // into view, so the whole result set is browsable and downloadable.
+  renderQueue = filtered;
+  renderedCount = 0;
+  renderToken++;
+  renderSentinel = document.createElement("div");
+  renderSentinel.className = "media-more hidden";
+  mediaList.appendChild(renderSentinel);
+  renderNextChunk(renderToken);
+}
 
-  shown.forEach((item) => {
-    const globalIndex = mediaItems.indexOf(item);
+// Builds the rows for one chunk. Kept out of renderMediaList so the painter can
+// append more rows later without rebuilding the list it already painted.
+function paintRows(items) {
+  const frag = document.createDocumentFragment();
+
+  items.forEach((item) => {
     const div = document.createElement("div");
     div.className = "media-item";
 
     // Checkbox — named for screen readers; the row's own text is the URL.
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
-    checkbox.checked = true;
-    checkbox.dataset.index = globalIndex;
+    // Unchecked rows live in `deselected`; everything else matching the filters
+    // counts as selected, painted row or not.
+    checkbox.checked = !deselected.has(item);
     checkbox.setAttribute("aria-label", `Select ${item.url}`);
-    checkbox.addEventListener("change", updateCount);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) deselected.delete(item);
+      else deselected.add(item);
+      updateCount();
+    });
 
     // Preview: a real <button> that opens the item in a new tab. It used to be
     // an image/div with `cursor: pointer` and no handler - a click that did
@@ -570,25 +627,84 @@ function renderMediaList() {
     info.appendChild(metaDiv);
     div.appendChild(checkbox);
     div.appendChild(info);
-    mediaList.appendChild(div);
+    frag.appendChild(div);
   });
 
-  if (hidden > 0) {
-    const more = document.createElement("div");
-    more.className = "media-more";
-    more.textContent = `\u2026 and ${hidden} more`
-      + " \u2014 narrow the domain or source filter to reach them";
-    mediaList.appendChild(more);
+  // One insertion per chunk: the browser lays out N rows once, not N times.
+  mediaList.insertBefore(frag, renderSentinel);
+}
+
+// --- Chunked painting ---
+
+// Pure: the slice the next paint pass builds.
+function nextRenderChunk(items, from, size = RENDER_CHUNK) {
+  return items.slice(from, from + size);
+}
+
+function renderNextChunk(token) {
+  if (token !== renderToken) return;   // a newer render superseded this pass
+  const chunk = nextRenderChunk(renderQueue, renderedCount);
+  if (chunk.length === 0) {
+    updateRenderSentinel();
+    return;
+  }
+  paintRows(chunk);
+  renderedCount += chunk.length;
+  updateRenderSentinel();
+  if (renderedCount >= renderQueue.length) {
+    stopRenderObserver();
+    return;
+  }
+  // A chunk that does not fill the list leaves the sentinel visible, and an
+  // IntersectionObserver never fires for an element that did not leave the
+  // view — keep painting until the list scrolls, or the rest would be stranded.
+  if (!listOverflows()) {
+    requestAnimationFrame(() => renderNextChunk(renderToken));
+    return;
+  }
+  observeRenderSentinel();
+}
+
+function listOverflows() {
+  return mediaList.scrollHeight > mediaList.clientHeight + 1;
+}
+
+// "showing 300 of 1439 \u2014 scroll for more" is INFORMATION, not a limit:
+// nothing is withheld, the rest is appended as the user scrolls.
+function updateRenderSentinel() {
+  if (!renderSentinel) return;
+  const left = renderQueue.length - renderedCount;
+  if (left > 0) {
+    renderSentinel.textContent = `showing ${renderedCount} of ${renderQueue.length}`
+      + " \u2014 scroll for more";
+    renderSentinel.classList.remove("hidden");
+  } else {
+    renderSentinel.textContent = "";
+    renderSentinel.classList.add("hidden");
   }
 }
 
-// F-07: how many rows the popup paints at once, and whether it must say that
-// more exist. Pure so the cap is testable without a DOM.
-const RENDER_LIMIT = 300;
+function observeRenderSentinel() {
+  if (!renderSentinel) return;
+  if (typeof IntersectionObserver !== "function") {
+    // No observer (unexpected in MV3): paint the rest in one pass rather than
+    // leave items unreachable.
+    while (renderedCount < renderQueue.length) renderNextChunk(renderToken);
+    return;
+  }
+  if (!renderObserver) {
+    renderObserver = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) renderNextChunk(renderToken);
+    }, { root: mediaList, rootMargin: "200px 0px" });
+  } else {
+    // Re-arm on the sentinel's new position after the chunk was appended.
+    renderObserver.disconnect();
+  }
+  renderObserver.observe(renderSentinel);
+}
 
-function capForRender(items, limit = RENDER_LIMIT) {
-  const shown = items.slice(0, limit);
-  return { shown, hidden: items.length - shown.length };
+function stopRenderObserver() {
+  if (renderObserver) renderObserver.disconnect();
 }
 
 function getVisibleCheckboxes() {
@@ -596,16 +712,10 @@ function getVisibleCheckboxes() {
 }
 
 function updateCount() {
-  const checked = getVisibleCheckboxes();
-  let checkedCount = 0;
-  checked.forEach((cb) => { if (cb.checked) checkedCount++; });
-
-  const total = mediaItems.filter((item) => {
-    if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return false;
-    if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
-    if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
-    return true;
-  }).length;
+  // Counted over the model, not over the painted rows: the rows past the last
+  // painted chunk have no checkbox and are still selected.
+  const total = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter).length;
+  const checkedCount = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected).length;
 
   // Both counters are re-queried: their spans live inside button labels that
   // other code rewrites via innerHTML, so the cached references go stale.
@@ -629,40 +739,42 @@ function updateCount() {
     ? "Select at least one item first"
     : "Save selected files with Chrome's own downloader";
   selectAllCheckbox.checked = checkedCount === total && total > 0;
+  // "300 of 1439" is neither all nor none; a plain unchecked box would claim
+  // that nothing is selected.
+  selectAllCheckbox.indeterminate = checkedCount > 0 && checkedCount < total;
 }
 
 // --- Select all ---
 
 selectAllCheckbox.addEventListener("change", () => {
-  getVisibleCheckboxes().forEach((cb) => {
-    cb.checked = selectAllCheckbox.checked;
-  });
+  // Applies to every item the filters match — the rows that are not painted yet
+  // included — and only mirrors the result onto the rows that do exist.
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
+  const select = selectAllCheckbox.checked;
+  filtered.forEach((item) => (select ? deselected.delete(item) : deselected.add(item)));
+  getVisibleCheckboxes().forEach((cb) => { cb.checked = select; });
   updateCount();
 });
 
 // --- Chrome Download ---
 
 chromeDownloadBtn.addEventListener("click", async () => {
-    const selected = [];
-    mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
-      const item = mediaItems[parseInt(cb.dataset.index)];
-      if (item) {
+    // Every selected item, painted row or not — reading `:checked` from the DOM
+    // silently limited a save to the rows that happened to be built.
+    const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected)
+      .map((item) => ({
+        url: item.url,
+        referer: item.pageUrl || "",
         // D-07: a name Chrome accepts — a path separator or a device name
         // ("..%2F..%2Fx.png", "CON.png") makes it refuse the whole download.
-        const baseName = sanitizeFilename(item.url.split("/").pop().split("?")[0]);
-        selected.push({
-          url: item.url,
-          referer: item.pageUrl || "",
-          filename: baseName,
-          // ERR-5: "link-direct" items were network-verified during the scan
-          // (processLink fetched them and saw image/video) — the background
-          // skips the resolve round-trip so downloads start immediately.
-          // ERR-9: items the scan verified as media carry `verified: true` —
-          // the background then skips its resolve round-trip entirely.
-          verified: item.verified === true || item.source === "link-direct",
-        });
-      }
-    });
+        filename: sanitizeFilename(item.url.split("/").pop().split("?")[0]),
+        // ERR-5: "link-direct" items were network-verified during the scan
+        // (processLink fetched them and saw image/video) — the background
+        // skips the resolve round-trip so downloads start immediately.
+        // ERR-9: items the scan verified as media carry `verified: true` —
+        // the background then skips its resolve round-trip entirely.
+        verified: item.verified === true || item.source === "link-direct",
+      }));
 
   if (selected.length === 0) return;
 
@@ -757,23 +869,13 @@ if (deepCrawlBtn) {
 // --- Copy / Export Media Links ---
 
 function getExportUrls() {
-  const checkedBoxes = mediaList.querySelectorAll("input[type='checkbox']:checked");
-  const urls = [];
-  if (checkedBoxes.length > 0) {
-    checkedBoxes.forEach((cb) => {
-      const item = mediaItems[parseInt(cb.dataset.index)];
-      if (item && item.url) urls.push(item.url);
-    });
-  } else {
-    // If nothing checked, take all items currently matching visible filters
-    mediaItems.forEach((item) => {
-      if (activeDomainFilter && extractDomain(item.url) !== activeDomainFilter) return;
-      if (activeSourceFilter === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return;
-      if (activeSourceFilter === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return;
-      if (item.url) urls.push(item.url);
-    });
-  }
-  return urls;
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
+  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected);
+  // Nothing selected falls back to everything the filters match; either way the
+  // set comes from the model, never from the painted rows.
+  return (selected.length > 0 ? selected : filtered)
+    .map((item) => item.url)
+    .filter(Boolean);
 }
 
 if (copyLinksBtn) {
@@ -831,10 +933,9 @@ if (copyLinksBtn) {
 // --- Download Selected Media to Desktop App ---
 
 downloadBtn.addEventListener("click", async () => {
-  const selected = [];
-  mediaList.querySelectorAll("input[type='checkbox']:checked").forEach((cb) => {
-    const item = mediaItems[parseInt(cb.dataset.index)];
-    if (item) selected.push({
+  // The same set the counter shows: all selected items, painted or not.
+  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected)
+    .map((item) => ({
       url: item.url,
       // EXT-4: `source` in the scan results means ORIGIN (img/srcset/sieve-res);
       // the POST payload needs the page as REFERER — rename to avoid the clash.
@@ -844,8 +945,7 @@ downloadBtn.addEventListener("click", async () => {
       // item.original_url — `item.original` never existed (always null).
       original_url: item.original_url || null,
       transformed: !!item.transformed,
-    });
-  });
+    }));
 
   if (selected.length === 0) return;
 
@@ -941,7 +1041,14 @@ sieveFileInput.addEventListener("change", async (e) => {
       showError("File contains no rules");
       return;
     }
-    await chrome.storage.local.set({ sieveRules: text });
+    // E-10: the background marks a manually loaded set as authoritative
+    // (sieveVersion) — writing `sieveRules` here alone made the next SW start
+    // treat the user's rules as an outdated bundle and merge them away.
+    const resp = await chrome.runtime.sendMessage({ action: "setSieveRules", rules: text });
+    if (!resp || !resp.ok) {
+      showError(`Failed to load: ${(resp && resp.error) || "unknown error"}`);
+      return;
+    }
     const jsCount = typeof countJsRules === "function" ? countJsRules(data) : 0;
     document.getElementById("sieve-info").textContent = jsCount > 0
       ? `Sieve: ${count} rules (${jsCount} JS — skipped in popup)`

@@ -284,6 +284,9 @@ class DenoJsEngine:
         self._gateway_worker = _find_gateway_worker_script()
         self._deno_cache = _find_deno_cache_dir()
         self._timeout = timeout
+        # X-04: after shutdown() a late caller must not respawn a worker — an
+        # orphaned Deno process would outlive the task and hold its ports/files.
+        self._closed = False
         self._proc = None
         self._lock = threading.Lock()
         self._dom_proc = None
@@ -332,6 +335,8 @@ class DenoJsEngine:
     # --- process lifecycle ----------------------------------------------
 
     def _ensure_proc(self):
+        if self._closed:
+            raise RuntimeError("JS engine is shut down")
         if self._proc is not None and self._proc.poll() is None:
             return self._proc
         # (Re)spawn the worker. Deno's first run compiles the script; --quiet
@@ -448,6 +453,8 @@ class DenoJsEngine:
         self._proc = None
 
     def _ensure_dom_proc(self):
+        if self._closed:
+            raise RuntimeError("JS engine is shut down")
         if self._dom_proc is not None and self._dom_proc.poll() is None:
             return self._dom_proc
         cmd = [self._bin, "run", "--quiet", self._dom_worker]
@@ -490,6 +497,8 @@ class DenoJsEngine:
         and lock from the DOM worker so a slow gateway click (up to its own
         timeout) never blocks sieve res/url rules on other pages.
         """
+        if self._closed:
+            raise RuntimeError("JS engine is shut down")
         if self._gateway_proc is not None and self._gateway_proc.poll() is None:
             return self._gateway_proc
         cmd = [self._bin, "run", "--quiet", self._gateway_worker]
@@ -527,6 +536,7 @@ class DenoJsEngine:
 
     def shutdown(self):
         """Terminate all workers. Safe to call multiple times."""
+        self._closed = True
         with self._lock:
             self._kill_proc()
             self._cache.clear()
@@ -570,7 +580,7 @@ class DenoJsEngine:
         Thread-safe; blocks up to self._timeout. Fail-open: returns None on
         any error so callers keep the static path unchanged.
         """
-        if not self.available() or not code:
+        if self._closed or not self.available() or not code:
             return None
         code = code.lstrip()
         code = code[1:] if code.startswith(":") else code
@@ -607,14 +617,14 @@ class DenoJsEngine:
             self._kill_proc()
             raise
         resp = self._read_matching_response(proc, request_id, self._kill_proc)
-        self._recycle_if_due(self._kill_proc, "proc")
+        self._recycle_if_due(self._kill_proc, "proc", proc)
         if resp.get("error"):
             # JS rule threw (e.g. it needs DOM). Not a fatal error.
             logger.debug(f"Deno JS rule error: {resp['error'][:160]}")
             return None
         return resp.get("result")
 
-    def _recycle_if_due(self, killer, counter_attr: str) -> None:
+    def _recycle_if_due(self, killer, counter_attr: str, proc=None) -> None:
         """B-17: retire a worker after K.JS_WORKER_MAX_REQUESTS calls.
 
         The next call pays one cold spawn (~300 ms) and starts from a fresh
@@ -633,7 +643,15 @@ class DenoJsEngine:
             setattr(self, "_" + counter_attr + "_calls", 0)
             killer()
             return
-        rss = child_rss_mb(getattr(self, "_" + counter_attr + "_proc", None))
+        # P-05: the attribute was derived from the counter name, and for the
+        # sieve worker that name ("proc") does not match its attribute (`_proc`)
+        # — `_proc_proc` was always None, so the RSS guard never fired for the
+        # worker that runs on every JS rule. Pass the process explicitly.
+        if proc is None:
+            proc = getattr(self, "_" + counter_attr + "_proc", None)
+            if proc is None:
+                proc = getattr(self, "_" + counter_attr, None)
+        rss = child_rss_mb(proc)
         if rss is not None and self._max_rss_mb and rss >= self._max_rss_mb:
             logger.info(
                 f"Recycling the {counter_attr} worker: {rss:.0f} MB resident "
@@ -748,7 +766,7 @@ class DenoJsEngine:
         Blocks up to self._timeout. No result cache: each call carries a
         unique page document.
         """
-        if not self.dom_available() or not code:
+        if self._closed or not self.dom_available() or not code:
             return None
         code = code.lstrip()
         code = code[1:] if code.startswith(":") else code
@@ -780,7 +798,7 @@ class DenoJsEngine:
             self._kill_dom_proc()
             raise
         resp = self._read_matching_response(proc, request_id, self._kill_dom_proc)
-        self._recycle_if_due(self._kill_dom_proc, "dom")
+        self._recycle_if_due(self._kill_dom_proc, "dom", proc)
         if resp.get("error"):
             logger.debug(f"Deno DOM rule error: {resp['error'][:160]}")
             return None
@@ -800,7 +818,7 @@ class DenoJsEngine:
         reload_requested} or None (fail-open on any error, including no button
         found). Bounded: one synchronous call, worker killed on timeout.
         """
-        if (not self.available() or not self._gateway_worker
+        if (self._closed or not self.available() or not self._gateway_worker
                 or not self._deno_cache or not html):
             return None
         patterns = [p for p in (text_patterns or []) if isinstance(p, str)]
@@ -831,7 +849,7 @@ class DenoJsEngine:
                     raise ValueError(
                         f"Deno gateway worker answered with a foreign id: {resp.get('id')!r}"
                     )
-                self._recycle_if_due(self._kill_gateway_proc, "gateway")
+                self._recycle_if_due(self._kill_gateway_proc, "gateway", self._gateway_proc)
                 if resp.get("error"):
                     logger.debug(f"Deno gateway click error: {resp['error'][:160]}")
                     return None

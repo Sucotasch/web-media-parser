@@ -10,9 +10,9 @@ This document contains everything needed to submit the **Web Media Parser** exte
 `Web Media Parser`
 
 ### Summary / Short Description (<= 132 chars)
-> Scan pages for media, upgrade thumbnails to original full-size images with Imagus Sieve, and save via Chrome or companion desktop app.
+> Scan pages for media, upgrade thumbnails to full-size originals with Imagus Sieve, and save via Chrome or the desktop app.
 
-*(Length: 130 characters)*
+*(Length: 122 characters — the previous wording was 134 and exceeded the store limit)*
 
 ---
 

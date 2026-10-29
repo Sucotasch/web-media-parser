@@ -20,6 +20,34 @@ const API_BASE = "http://127.0.0.1:19876";
 const SIEVE_VERSION = "2026.09.15"; // Bump when shipping new sieve.json
 
 // Load sieve rules from bundled file into storage
+// E-10: a manually loaded file must be authoritative. Writing only `sieveRules`
+// from the popup left `sieveVersion` pointing at the old bundle, so the next SW
+// start merged the user's set as if it were an outdated bundle — rules missing
+// from the bundle were silently switched off (`off: 1`) or overwritten.
+async function setUserSieveRules(text) {
+  if (typeof text !== "string" || !text.trim()) {
+    return { ok: false, error: "No rules supplied" };
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, error: "Invalid JSON" };
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { ok: false, error: "Sieve file must be a JSON object of rules" };
+  }
+  const count = Object.keys(data).length;
+  if (count === 0) return { ok: false, error: "File contains no rules" };
+  try {
+    await chrome.storage.local.set({ sieveRules: text, sieveVersion: SIEVE_VERSION });
+    await loadSieveResPatterns();
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+  return { ok: true, count };
+}
+
 async function loadSieveRules(force = false) {
   try {
     const stored = await chrome.storage.local.get(["sieveRules", "sieveVersion"]);
@@ -129,6 +157,8 @@ async function loadSieveResPatterns() {
       // R-E-9: respect `off: 1` (8 rules in the bundled sieve, plus the
       // ghosts mergeSieve writes) — mirror of parseSieve's skip.
       if (rule.off) continue;
+      // X-07: `dc` rules are unsupported on both sides (desktop logs and skips).
+      if (rule.dc) continue;
       // Require link + (res OR url) — url alone can be a redirect/transform
       if (!rule.link || (!rule.res && !rule.url)) continue;
       try {
@@ -230,6 +260,24 @@ function applyUrlTransform(template, matchGroups) {
 // Regexes are declared INSIDE the function so the node tests can extract the
 // function source standalone (the url_transform test pattern); module-level
 // consts would be invisible to the isolated evaluation.
+// E-04: a sieve `res` match may be protocol-relative or relative.
+// `https:` + relative (the old code) produced `https:images/x.jpg` — an opaque
+// URL that can never be fetched. Desktop twin:
+// site_pattern_manager.extract_res_urls (protocol-relative -> https, relative
+// -> resolved against the page that was just fetched).
+function normalizeResMatch(raw, pageUrl) {
+  if (typeof raw !== "string") return "";
+  const u = raw.trim();
+  if (!u) return "";
+  if (u.startsWith("//")) return "https:" + u;
+  if (/^https?:\/\//i.test(u)) return u;
+  try {
+    return new URL(u, pageUrl || undefined).href;
+  } catch (e) {
+    return u;
+  }
+}
+
 function applyResizeUpgrade(url) {
   try {
     const EXCLUDED_RE = /(?:^|\.)(?:reddit\.com|redd\.it|jtvnw\.net|cdn\.tv2\.no)\//i;
@@ -408,8 +456,11 @@ async function discoverFullsize(links, pageUrl, onProgress) {
             pat.lastIndex = 0;
             const match = pat.exec(html);
             if (match && match[1]) {
-              let imgUrl = match[1];
-              if (!imgUrl.startsWith("http")) imgUrl = "https:" + imgUrl;
+              // E-04: `https:` + a relative match produced `https:images/x.jpg`
+              // — an opaque, unfetchable URL. Mirrors the desktop
+              // extract_res_urls: protocol-relative keeps https, a relative
+              // match resolves against the page that was just fetched.
+              const imgUrl = normalizeResMatch(match[1], linkUrl);
               if (!seen.has(imgUrl)) {
                 seen.add(imgUrl);
                 results.push({ url: imgUrl, type: "image", pageUrl, source: "sieve-res" });
@@ -595,7 +646,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (!alarm || alarm.name !== KEEPALIVE_ALARM) return;
   // With refs > 0 the wake itself resets the idle timer (no-op needed here);
   // with refs == 0 (SW restarted with a stale alarm) self-clear.
-  if (_keepaliveRefs === 0) chrome.alarms.clear(KEEPALIVE_ALARM).catch(() => {});
+  if (_keepaliveRefs === 0) {
+    // E-05: `chrome.alarms.clear` returns undefined on Chrome <111 and in the
+    // Firefox namespace — `.catch` on undefined threw a TypeError in onAlarm.
+    // Same guard as keepaliveRelease above.
+    try {
+      const cleared = chrome.alarms.clear(KEEPALIVE_ALARM);
+      if (cleared && typeof cleared.catch === "function") cleared.catch(() => {});
+    } catch (e) {}
+  }
 });
 // Re-arm after a SW restart if a session is mid-flight (state survives in
 // storage; the alarm does not).
@@ -720,7 +779,10 @@ async function handleStartScan(tabId) {
   // staleness check). Without it a crashed/abandoned scan left
   // "Scanning..." in the popup forever and survived page navigations.
   const progress = {
+    // E-08: `ts` lets the popup tell a LIVE scan from a progress entry whose
+    // service worker died mid-scan (which used to show "Scanning..." forever).
     status: "scanning", phase: "page", scanned: 0, total: 0, found: 0, tabId,
+    ts: Date.now(),
   };
   keepaliveAcquire();
   try {
@@ -737,6 +799,7 @@ async function handleStartScan(tabId) {
     if (response.links && response.links.length > 0) {
       progress.phase = "links";
       progress.total = response.links.length;
+      progress.ts = Date.now();
       try { await chrome.storage.local.set({ scanProgress: progress }); } catch (e) {}
       const linked = await discoverFullsize(
         response.links, pageUrl,
@@ -744,6 +807,7 @@ async function handleStartScan(tabId) {
           progress.scanned = scanned;
           progress.total = total;
           progress.found = media.length + found;
+          progress.ts = Date.now();
           chrome.storage.local.set({ scanProgress: { ...progress } }).catch(() => {});
         }
       );
@@ -779,6 +843,7 @@ async function handleStartScan(tabId) {
     // VERIFY_BUDGET_MS — measured at 1.15 s for a 9-candidate bucket with the
     // image Accept, versus 8.3 s when the probe still sent "text/html".
     progress.phase = "verify";
+    progress.ts = Date.now();
     try { await chrome.storage.local.set({ scanProgress: { ...progress } }); } catch (e) {}
     let verdicts = { verified: 0, notMedia: 0, unknown: 0 };
     try {
@@ -793,7 +858,7 @@ async function handleStartScan(tabId) {
     try {
       await chrome.storage.local.set({
         scanResult: result,
-        scanProgress: { status: "done", phase: "done", scanned: 1, total: 1, found: media.length, tabId },
+        scanProgress: { status: "done", phase: "done", scanned: 1, total: 1, found: media.length, tabId, ts: Date.now() },
       });
     } catch (e) {
       // D-02: the popup paints from storage, so a failed FINAL write would
@@ -808,7 +873,7 @@ async function handleStartScan(tabId) {
     console.error("handleStartScan failed:", e);
     try {
       await chrome.storage.local.set({
-        scanProgress: { status: "error", phase: "error", error: e.message, tabId },
+        scanProgress: { status: "error", phase: "error", error: e.message, tabId, ts: Date.now() },
       });
     } catch (e2) {
       // D-02: the error state could not be persisted either — say it out loud.
@@ -882,9 +947,7 @@ async function resolveUrl(url, referer) {
           pat.lastIndex = 0;
           const match = pat.exec(html);
           if (match && match[1]) {
-            let imgUrl = match[1];
-            if (!imgUrl.startsWith("http")) imgUrl = "https:" + imgUrl;
-            return imgUrl;
+            return normalizeResMatch(match[1], url);
           }
         }
       } catch (e) {}
@@ -1282,7 +1345,11 @@ async function commandScanAndProcess(action) {
   media = await upgradeMediaList(media, response.url);
 
   const fullsize = media.filter(m => FULLSIZE_SOURCES.has(m.source));
-  const items = fullsize.length > 0 ? fullsize : media;
+  // E-07: mirror the popup's bucket exactly — a URL PROVEN not to be media
+  // (404/410 or a 2xx text/* answer) is dropped BEFORE the badge count and
+  // before verification, so Ctrl+Shift+S cannot save an HTML shell as .jpg.
+  const items = (fullsize.length > 0 ? fullsize : media)
+    .filter(item => item && item.mediaVerdict !== "not-media");
   // ERR-9: same verification as the popup path, so the badge count this command
   // announces matches what chrome.downloads will actually save.
   try {
@@ -1301,7 +1368,9 @@ async function commandScanAndProcess(action) {
       referer: response.url || "",
       // ERR-5: link-direct items were already fetched (image/video) during
       // discovery — skip the resolve round-trip so downloads start instantly.
-      verified: item.source === "link-direct",
+      // E-07: the popup also keeps `verified` set by the scan's media probe;
+      // dropping it re-probed every item the keyboard path had just verified.
+      verified: item.verified === true || item.source === "link-direct",
     }));
     await chromeDownload(toDownload);
     setTimeout(() => setBadge(""), 5000);
@@ -1365,6 +1434,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // The popup's button is an explicit user action — bypass the R-E-12 throttle.
     replyWith(runSieveUpdate(true).then((r) => r || { status: "error", message: "updater unavailable" }),
       sendResponse);
+    return true;
+  }
+  if (request.action === "setSieveRules") {
+    // E-10: installed by the background so the manual set is marked authoritative.
+    replyWith(setUserSieveRules(request.rules), sendResponse);
     return true;
   }
 });

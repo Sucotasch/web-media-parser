@@ -26,7 +26,9 @@ class FakeRequest:
         self.headers = {"Origin": origin} if origin else {}
 
     async def json(self):
-        if not isinstance(self._body, dict):
+        # C-03: the handler must reject a non-object body itself now, so the
+        # double hands back whatever the body is.
+        if isinstance(self._body, str):
             raise ValueError("invalid json")
         return self._body
 
@@ -72,6 +74,43 @@ class TestAddTasksValidation(unittest.TestCase):
         resp = asyncio.run(s._handle_add_tasks(FakeRequest("not json")))
         self.assertEqual(resp.status, 400)
 
+    def test_non_object_json_returns_400_not_500(self):
+        """C-03: `[]` reached `.get` on a list and answered 500 + traceback."""
+        s = self._server()
+        for body in ([], [{"url": "https://a.example/1.jpg"}], 5, None):
+            resp = asyncio.run(s._handle_add_tasks(FakeRequest(body)))
+            self.assertEqual(resp.status, 400, body)
+        self.assertFalse(s.received)
+
+    def test_non_list_urls_returns_400(self):
+        """C-03: `{"urls": 5}` either 500'd or iterated garbage."""
+        s = self._server()
+        for urls in (5, "https://a.example/1.jpg", {"url": "https://a.example/1.jpg"}):
+            resp = asyncio.run(s._handle_add_tasks(FakeRequest({"urls": urls})))
+            self.assertEqual(resp.status, 400, urls)
+        self.assertFalse(s.received)
+
+    def test_string_false_is_false(self):
+        """C-03: `bool("false")` is True — the flag was inverted for clients
+        that send strings."""
+        s = self._server()
+        asyncio.run(s._handle_add_tasks(FakeRequest(
+            {"urls": [{"url": "https://a.example/1.jpg"}], "one_shot": "false"})))
+        self.assertFalse(s.received[0][1])
+
+    def test_callback_error_is_not_echoed_to_the_client(self):
+        """X-03: the raw `str(e)` (internals, paths) went back over the wire."""
+        s = ExtensionServer()
+
+        def boom(urls, one_shot, **kw):
+            raise OSError("C:\\Users\\secret\\downloads is unavailable")
+
+        s.add_tasks_callback = boom
+        resp = asyncio.run(s._handle_add_tasks(FakeRequest(
+            {"urls": [{"url": "https://a.example/1.jpg"}]})))
+        self.assertEqual(resp.status, 500)
+        self.assertNotIn("secret", resp.text)
+
 
 class TestOriginTrust(unittest.TestCase):
     def _server(self):
@@ -86,6 +125,18 @@ class TestOriginTrust(unittest.TestCase):
             origin="chrome-extension://abcdefghijklmnopabcdefghijklmnop")))
         self.assertEqual(resp.status, 200)
 
+    def test_firefox_extension_origin_allowed(self):
+        """C-04: the manifest ships a Firefox target; moz-extension origins
+        used to get a 403 on every POST (the bridge was dead there)."""
+        s = self._server()
+        resp = asyncio.run(s._handle_add_tasks(FakeRequest(
+            {"urls": [{"url": "https://a.example/1.jpg"}]},
+            origin="moz-extension://9b2f40a1-6c1e-4d3e-9d1a-0f3b7c8e2a51")))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(
+            resp.headers.get("Access-Control-Allow-Origin"),
+            "moz-extension://9b2f40a1-6c1e-4d3e-9d1a-0f3b7c8e2a51")
+
     def test_foreign_origin_rejected(self):
         s = self._server()
         resp = asyncio.run(s._handle_add_tasks(FakeRequest(
@@ -98,6 +149,53 @@ class TestOriginTrust(unittest.TestCase):
         resp = asyncio.run(s._handle_add_tasks(FakeRequest(
             {"urls": [{"url": "https://a.example/1.jpg"}]})))
         self.assertEqual(resp.status, 200)
+
+
+class TestReadRouteHardening(unittest.TestCase):
+    """C-06 / X-01: the GET side of the loopback API."""
+
+    def _server(self):
+        s = ExtensionServer()
+        s.get_status_callback = lambda: {"active_task": None}
+        return s
+
+    def test_status_rejects_a_foreign_origin(self):
+        s = self._server()
+        resp = asyncio.run(s._handle_status(FakeRequest(None, origin="https://evil.example")))
+        self.assertEqual(resp.status, 403)
+
+    def test_status_allows_the_extension_and_local_clients(self):
+        s = self._server()
+        self.assertEqual(asyncio.run(s._handle_status(FakeRequest(None))).status, 200)
+        resp = asyncio.run(s._handle_status(FakeRequest(
+            None, origin="chrome-extension://abcdefghijklmnopabcdefghijklmnop")))
+        self.assertEqual(resp.status, 200)
+
+    def test_foreign_host_header_is_refused(self):
+        """C-06: DNS rebinding arrives with a foreign Host, whatever the origin."""
+        s = self._server()
+
+        async def call(host):
+            request = FakeRequest(None)
+            request.headers = {"Host": host} if host else {}
+            return await s._host_check_middleware(
+                request, lambda req: _ok_response())
+
+        for host in ("evil.example", "evil.example:19876", "192.168.1.5:19876"):
+            self.assertEqual(asyncio.run(call(host)).status, 403, host)
+        for host in ("127.0.0.1:19876", "localhost:19876", "[::1]:19876", "127.0.0.1", ""):
+            self.assertEqual(asyncio.run(call(host)).status, 200, host)
+
+    def test_queue_route_is_gone(self):
+        """X-01: /api/queue returned the /api/status payload."""
+        s = ExtensionServer()
+        paths = {route.resource.canonical for route in s._app.router.routes()}
+        self.assertIn("/api/status", paths)
+        self.assertNotIn("/api/queue", paths)
+
+
+async def _ok_response():
+    return web.Response(status=200)
 
 
 class TestScalarCleaning(unittest.TestCase):

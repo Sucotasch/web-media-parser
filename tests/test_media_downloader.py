@@ -275,6 +275,8 @@ def test_mt_chunk_success_writes_full_file(tmp_path):
                         settings=ZERO_MIN_SIZE, media_type="image")
     d.session = MagicMock()
     resp = MagicMock()
+    # C-02: a ranged request is only valid when the server answers 206.
+    resp.status_code = 206
     resp.headers = {"Content-Type": "image/jpeg", "Content-Length": str(3 * 600 * 1024)}
     chunk = b"x" * (600 * 1024)
     resp.iter_content.return_value = iter([chunk, chunk, chunk])
@@ -290,6 +292,31 @@ def test_mt_chunk_success_writes_full_file(tmp_path):
     assert progress_dict["errors"] == []
     assert part_path.exists()
     assert part_path.stat().st_size == 3 * 600 * 1024
+
+
+def test_mt_chunk_rejects_200_for_a_range_request(tmp_path):
+    """C-02: a host that ignores Range answers 200 with the WHOLE body.
+
+    Without the status check every chunk thread would stream the full file into
+    its own .partN (N x traffic/disk) and only discover it at the size check.
+    """
+    d = MediaDownloader(url="http://example.com/1.jpg", filepath=str(tmp_path / "x.jpg"),
+                        settings=ZERO_MIN_SIZE, media_type="image")
+    d.session = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {"Content-Type": "image/jpeg", "Content-Length": "2048"}
+    resp.iter_content.return_value = iter([b"x" * 2048])
+    d.session.get.return_value = resp
+
+    progress_dict = {"total": 0, "success": True, "errors": []}
+    lock = threading.Lock()
+    part_path = tmp_path / "c0.part"
+    d._download_chunk(0, 2047, str(part_path), 2048, progress_dict, lock, 30)
+
+    assert progress_dict["success"] is False
+    assert any("ignored Range" in e for e in progress_dict["errors"]), progress_dict["errors"]
+    assert not part_path.exists(), "the body must not be written when Range was ignored"
 
 
 def test_downloader_filters_webpage_files():

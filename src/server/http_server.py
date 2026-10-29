@@ -34,6 +34,26 @@ def _clean_header_value(value) -> str:
     return cleaned[:MAX_SCALAR_LENGTH]
 
 
+def _as_bool(value) -> bool:
+    """C-03: `bool("false")` is True — a string flag must be read, not truth-tested.
+
+    Keeps the historical lenient semantics (`"yes"`/`"1"`/`"on"` are True) while
+    fixing the one that silently inverted intent (`one_shot: "false"`).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return False
+
+
+# C-06: DNS-rebinding requests arrive with a foreign Host header, so the Host
+# itself is a trust signal for a loopback-only API.
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
 def _clean_cookie_value(value) -> str:
     if not isinstance(value, str):
         return ""
@@ -57,12 +77,16 @@ class ExtensionServer:
         self.port = port
         self._app = web.Application(client_max_size=self.MAX_REQUEST_BODY)
         self._app.router.add_get("/api/status", self._handle_status)
-        self._app.router.add_get("/api/queue", self._handle_queue)
+        # X-01: the `/api/queue` route returned the /api/status payload (a
+        # duplicate under a name that promised something else). Nothing used it;
+        # it is gone rather than left as a misleading alias.
         self._app.router.add_post("/api/tasks", self._handle_add_tasks)
         self._app.router.add_options("/api/tasks", self._handle_cors)  # CORS preflight
         # C-05: report an oversized body as 413 (the intended status) instead of
         # letting it surface as "Invalid JSON".
         self._app.middlewares.append(self._body_size_middleware)
+        # C-06: every route (including GET) is loopback-only by Host.
+        self._app.middlewares.append(self._host_check_middleware)
 
         # Callbacks set by MainWindow
         self.add_tasks_callback: Optional[Callable] = None  # (urls: list[dict], one_shot: bool) -> None
@@ -74,6 +98,30 @@ class ExtensionServer:
         # C-01: the last start failure, so the GUI can tell the user why the
         # extension is unreachable (None = started fine / not tried yet).
         self.start_error: Optional[str] = None
+
+    @web.middleware
+    async def _host_check_middleware(self, request, handler):
+        """C-06: refuse a foreign Host header (DNS rebinding).
+
+        A page can make the browser resolve `evil.example` to 127.0.0.1; the
+        request then arrives with `Host: evil.example` and could read /api/status.
+        Loopback-only clients (and every extension fetch) send `127.0.0.1` or
+        `localhost`, so this costs nothing legitimate. A missing Host (raw HTTP/1.0,
+        in-process clients) is treated as local.
+        """
+        host = (request.headers.get("Host") or "").strip()
+        if host:
+            hostname = host
+            if hostname.startswith("["):           # [::1]:19876
+                hostname = hostname.split("]", 1)[0] + "]"
+            elif hostname.count(":") == 1:         # 127.0.0.1:19876
+                hostname = hostname.rsplit(":", 1)[0]
+            if hostname.lower() not in _ALLOWED_HOSTS:
+                logger.warning(f"Rejected request with foreign Host header: {host!r}")
+                return web.json_response(
+                    {"error": "Forbidden host"}, status=403,
+                    headers=self._cors_headers(request))
+        return await handler(request)
 
     @web.middleware
     async def _body_size_middleware(self, request, handler):
@@ -147,6 +195,12 @@ class ExtensionServer:
         origin = request.headers.get("Origin", "")
         if not origin:
             return True
+        # C-04: the manifest ships a Firefox target too (manifest.firefox.json),
+        # and a moz-extension origin used to get a 403 on every POST. Firefox
+        # extension IDs are per-install UUIDs, so only the Chrome origin can be
+        # pinned by K.EXTENSION_ID.
+        if origin.startswith("moz-extension://"):
+            return True
         if not origin.startswith("chrome-extension://"):
             return False
         # EXT-11: pin to a specific extension ID when configured (stable only
@@ -162,7 +216,7 @@ class ExtensionServer:
             "Access-Control-Allow-Headers": "Content-Type",
         }
         # Echo the extension origin instead of `*` so browser responses stay readable
-        if origin.startswith("chrome-extension://"):
+        if origin.startswith(("chrome-extension://", "moz-extension://")):
             headers["Access-Control-Allow-Origin"] = origin
         return headers
 
@@ -171,23 +225,17 @@ class ExtensionServer:
 
     async def _handle_status(self, request):
         """GET /api/status — returns current parsing status."""
+        # C-06: the POST route was origin-gated but GET was not, so any web page
+        # could read the app's status/queue over loopback.
+        if not self._is_trusted_origin(request):
+            logger.warning(f"Rejected cross-origin GET from {request.headers.get('Origin', '')}")
+            return web.Response(status=403, text="Forbidden", headers=self._cors_headers(request))
         status = {}
         if self.get_status_callback:
             try:
                 status = self.get_status_callback()
             except Exception as e:
                 logger.error(f"Error getting status: {e}")
-                status = {"error": str(e)}
-        return web.json_response(status, headers=self._cors_headers(request))
-
-    async def _handle_queue(self, request):
-        """GET /api/queue — returns current task queue."""
-        status = {}
-        if self.get_status_callback:
-            try:
-                status = self.get_status_callback()
-            except Exception as e:
-                logger.error(f"Error getting queue: {e}")
                 status = {"error": str(e)}
         return web.json_response(status, headers=self._cors_headers(request))
 
@@ -215,7 +263,17 @@ class ExtensionServer:
         except Exception:
             return web.json_response({"error": "Invalid JSON"}, status=400, headers=self._cors_headers(request))
 
-        urls = body.get("urls", [])
+        # C-03: a non-dict JSON body (``[]``/``"str"``) raised AttributeError on
+        # `.get` below and surfaced as a 500 with a traceback; a non-list `urls`
+        # (``{"urls": 5}``) either did the same or silently iterated garbage.
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Expected a JSON object"}, status=400,
+                                     headers=self._cors_headers(request))
+        raw_urls = body.get("urls", [])
+        if not isinstance(raw_urls, list):
+            return web.json_response({"error": "`urls` must be a list"}, status=400,
+                                     headers=self._cors_headers(request))
+        urls = raw_urls
         # EXT-4: validate items server-side — a corrupt payload (strings, nulls,
         # missing url) must not 500 the callback, which calls .get on each item.
         urls = [
@@ -226,9 +284,7 @@ class ExtensionServer:
         # trusted. Their type is load-bearing: `{"user_agent": 5}` reached
         # aiohttp's header machinery as a TypeError, and a non-str cookie string
         # landed in the task snapshot / settings file as-is.
-        one_shot = body.get("one_shot", False)
-        if not isinstance(one_shot, bool):
-            one_shot = bool(one_shot)
+        one_shot = _as_bool(body.get("one_shot", False))
         user_agent = _clean_header_value(body.get("user_agent", ""))
         cookies = _clean_cookie_value(body.get("cookies", ""))
 
@@ -242,7 +298,11 @@ class ExtensionServer:
                 # count was dead (and misleading after validation filtering).
                 return web.json_response({"ok": True, **(result or {})}, headers=self._cors_headers(request))
             except Exception as e:
-                logger.error(f"Error adding tasks from extension: {e}")
-                return web.json_response({"error": str(e)}, status=500, headers=self._cors_headers(request))
+                # X-03: F-04 residual — the raw exception string went back to the
+                # client (paths, internals) and was logged without a traceback,
+                # which left the 500 undiagnosable.
+                logger.error(f"Error adding tasks from extension: {e}", exc_info=True)
+                return web.json_response({"error": "Internal error while adding tasks"},
+                                         status=500, headers=self._cors_headers(request))
 
         return web.json_response({"error": "No callback registered"}, status=503, headers=self._cors_headers(request))

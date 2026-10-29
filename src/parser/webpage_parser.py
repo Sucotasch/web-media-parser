@@ -265,7 +265,11 @@ class WebpageParser:
                         msg = f"Client HTTP error {http_status} for {self.url}"
                         block_status = http_status
                         from src.parser import http_engine as _he
-                        if _he.should_escalate(self.settings, http_status):
+                        # P-02: the page fetch always went through aiohttp, so the
+                        # block happened on the non-browser stack regardless of the
+                        # http_engine setting — escalation always applies here.
+                        if _he.should_escalate(self.settings, http_status,
+                                               primary_is_browser_tls=False):
                             logger.info(f"HTTP 403 (block?) for {self.url} — escalating to curl_cffi...")
                             content_bytes, http_status, is_binary = await self._try_escalate_fetch()
                             escalation_tried = True
@@ -285,7 +289,8 @@ class WebpageParser:
                         # P3 auto-escalation on 5xx (after retries exhausted):
                         # bot-protection often answers 5xx to non-browser TLS.
                         from src.parser import http_engine as _he2
-                        if not escalation_tried and _he2.should_escalate(self.settings, http_status):
+                        if not escalation_tried and _he2.should_escalate(
+                                self.settings, http_status, primary_is_browser_tls=False):
                             server_status = http_status
                             logger.info(f"HTTP {server_status} for {self.url} after retries — escalating to curl_cffi...")
                             content_bytes, http_status, is_binary = await self._try_escalate_fetch()
@@ -323,7 +328,12 @@ class WebpageParser:
         # report NETWORK_ERROR, which penalised the domain health for a server
         # that simply had nothing to say. Report it as a clean empty parse, the
         # same contract the binary-media guard uses.
-        if content_bytes == b"" and http_status and 200 <= http_status < 300 and not escalation_tried:
+        # P-11: the `not escalation_tried` term made an escalated "200 with an
+        # empty body" fall through to NETWORK_ERROR, which penalises domain
+        # health — while the identical non-escalated response is a clean empty
+        # page. Same response, same verdict. (A binary payload is handled just
+        # below by `_escalated_binary`.)
+        if content_bytes == b"" and http_status and 200 <= http_status < 300:
             if self.url not in self._empty_body_warned:
                 if len(self._empty_body_warned) > 200:  # bounded: the log line is per URL
                     self._empty_body_warned.clear()
@@ -1000,9 +1010,16 @@ class WebpageParser:
                                     # dropped by the out-of-domain filter later — the thumbnail
                                     # would be lost entirely. In that case keep the thumbnail.
                                     if is_same_domain(link_abs_url, self.url):
-                                        has_parent_webpage_link = True
-                                        # Add the linked page for crawling
-                                        if not is_interstitial_retry or link_abs_url != self.url:
+                                        # P-10: a self-link (the interstitial case,
+                                        # where the gate page's <img> is wrapped in
+                                        # an <a href=itself>) has no other page to
+                                        # defer to — the link is deliberately not
+                                        # queued, so marking the parent link
+                                        # dropped the image entirely on exactly
+                                        # the pages the retry exists for.
+                                        if not (is_interstitial_retry and link_abs_url == self.url):
+                                            has_parent_webpage_link = True
+                                            # Add the linked page for crawling
                                             self.links[link_abs_url] = {'from_image': True, 'thumbnail_url': abs_url, 'is_webpage': True, 'priority': 15.0}
 
                         if not has_parent_webpage_link:
@@ -1605,12 +1622,7 @@ class WebpageParser:
                         if not self._js_gateway_html:
                             logger.info(f"Cookies updated. RE-FETCHING original content: {self.url}")
                             # Sync bypass cookies to aiohttp session so re-fetch includes them
-                            if self._sync_session:
-                                for c in self._sync_session.cookies:
-                                    self.session.cookie_jar.update_cookies(
-                                        {c.name: c.value},
-                                        yarl.URL(f"{urlparse(self.url).scheme}://{urlparse(self.url).netloc}/")
-                                    )
+                            self._sync_bypass_cookies()
                         # Reset discovered content before re-fetching / re-parsing
                         self.media_files.clear()
                         self.links.clear()
@@ -1639,6 +1651,32 @@ class WebpageParser:
             logger.error(msg, exc_info=False)
             return self.links, self.media_files, K.PARSER_UNKNOWN_ERROR, msg, http_status_code, None
 
+
+    def _sync_bypass_cookies(self) -> None:
+        """Copy the sync session's cookies into the aiohttp jar (P-01).
+
+        Iterating `session.cookies` yields Cookie objects under requests but
+        plain STRINGS under curl_cffi, so the old `c.name` loop raised
+        AttributeError on every successful gateway bypass with
+        http_engine=curl_cffi: the page became UNKNOWN_ERROR and the bypass
+        cookies never reached aiohttp (the re-fetch behind the gate never
+        carried them). `get_dict()` is the one API both engines share.
+        """
+        if not self._sync_session:
+            return
+        try:
+            sync_cookies = dict(self._sync_session.cookies.get_dict())
+        except Exception as e:
+            logger.debug(f"Cookie sync skipped: {e}")
+            return
+        if not sync_cookies:
+            return
+        parsed = urlparse(self.url)
+        try:
+            self.session.cookie_jar.update_cookies(
+                sync_cookies, yarl.URL(f"{parsed.scheme}://{parsed.netloc}/"))
+        except Exception as e:
+            logger.debug(f"Cookie jar update skipped: {e}")
 
     def _is_preview_transition(self, elem) -> bool:
         """True if this element is a thumbnail image wrapped in a link to a

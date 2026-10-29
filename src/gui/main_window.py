@@ -38,7 +38,7 @@ from src.gui.log_handler import GUILogHandler
 from src.core.task_queue_manager import TaskQueueManager
 from src.core.task_item import TaskStatus, TaskItem
 from src.server.http_server import ExtensionServer
-from src.parser.utils import normalize_url
+from src.parser.utils import normalize_url, sanitize_filename
 from src.app_paths import queue_path
 
 logger = logging.getLogger(__name__)
@@ -184,9 +184,14 @@ def build_extension_task_payload(urls, settings, download_dir, one_shot=False, t
             url = normalize_url(url)
             # GUI-9: the old ternary had "image" on both branches — dead conditional
             media_type = item.get("type", "image")
-            basename = os.path.basename(url.split("?")[0])
+            # C-05: the parser route sanitised its names, this one did not — a
+            # `:` (NTFS alternate data stream), `|`, `?`, `*` or a reserved
+            # device name (`CON.jpg`) failed every download attempt on Windows
+            # and the item was lost on each run.
+            raw_basename = os.path.basename(url.split("?")[0])
+            basename = sanitize_filename(raw_basename)
             if not basename or "." not in basename:
-                basename = f"media_{len(items)}.jpg"
+                basename = sanitize_filename(f"media_{len(items)}.jpg")
             items.append({
                 "url": url,
                 "source_url": source_page,
@@ -629,7 +634,14 @@ class MainWindow(QMainWindow):
             )
             return
         download_path = os.path.join(self.download_dir, task_folder)
-        os.makedirs(download_path, exist_ok=True)
+        # G-08: an unreachable network drive used to raise out of this Qt slot
+        # (invisible in a windowed build) and the task vanished silently.
+        try:
+            os.makedirs(download_path, exist_ok=True)
+        except OSError as e:
+            self.log_handler.error(f"Cannot create download folder {download_path}: {e}")
+            self.status_bar.showMessage("Cannot create the download folder")
+            return
 
         # Snapshot settings NOW so queued tasks are not affected by later changes
         settings = self.settings_dialog.get_settings()
@@ -1069,13 +1081,12 @@ class MainWindow(QMainWindow):
 
     def _launch_parser_for_task(self, task):
         """Create ParserManager + QThread for a TaskItem."""
-        # Disconnect old parser signals to prevent old task_ended from corrupting new task
-        old_pm = getattr(self, 'parser_manager', None)
-        if old_pm is not None:
-            try:
-                old_pm.task_ended.disconnect(self.on_task_ended)
-            except (RuntimeError, TypeError):
-                pass  # signal not connected
+        # G-01: disconnect ALL of the old parser's signals, not just task_ended.
+        # The old instance keeps emitting total/current progress, status and
+        # parsing_finished while its thread is torn down (save can wait up to
+        # 5 s), so the new task's bars and status used to flicker between two
+        # tasks' values.
+        self._disconnect_parser_signals(getattr(self, 'parser_manager', None))
 
         # GUI-2/C-06: make sure the previous parser thread is truly dead before
         # starting a new one, and hand the old wrapper to Qt BEFORE dropping our
@@ -1092,15 +1103,39 @@ class MainWindow(QMainWindow):
                 if not old_thread.wait(5000):
                     self.log_handler.warning("Old parser thread did not stop in 5s")
 
-        self.parser_manager = ParserManager(
-            url=task.url,
-            download_path=task.download_path,
-            settings=task.settings,
-            log_handler=self.log_handler,
-            task_id=task.id,
-            one_shot=task.one_shot,
-            pending_downloads=getattr(task, '_pending_downloads', None),
-        )
+        # G-04: the task is already marked RUNNING here, so a constructor failure
+        # (e.g. a broken site_patterns.json next to the exe) used to leave it
+        # RUNNING forever with Start/Remove disabled and the queue stuck. Roll
+        # the mark back and report it instead.
+        try:
+            pm = ParserManager(
+                url=task.url,
+                download_path=task.download_path,
+                settings=task.settings,
+                log_handler=self.log_handler,
+                task_id=task.id,
+                one_shot=task.one_shot,
+                pending_downloads=getattr(task, '_pending_downloads', None),
+            )
+        except Exception as e:
+            logger.error(f"Failed to create ParserManager for task {task.id}: {e}",
+                         exc_info=True)
+            self.parser_manager = None
+            task.mark_failed(f"Failed to start: {e}")
+            self.task_queue.clear_active()
+            self._update_task_row(task.id)
+            self.update_ui_state(False)
+            self._update_start_button_state()
+            self.log_handler.error(f"Could not start task {task.id}: {e}")
+            self.status_bar.showMessage("Task failed to start")
+            return
+        self.parser_manager = pm
+        # G-02: the pre-scanned list is a ONE-SHOT seed. Handing it over again
+        # on Resume queued the whole original batch on top of the items restored
+        # from state.pkl (duplicate downloads, doubled stats, progress stuck
+        # near 50%). The parser also dedups against downloaded_files, but the
+        # list itself must not survive the first launch.
+        task._pending_downloads = None
         self._connect_parser_signals()
 
         # State loading is now handled inside ParserManager._main_task()
@@ -1140,7 +1175,12 @@ class MainWindow(QMainWindow):
             )
             return
         download_path = os.path.join(self.download_dir, task_folder)
-        os.makedirs(download_path, exist_ok=True)
+        try:
+            os.makedirs(download_path, exist_ok=True)   # G-08
+        except OSError as e:
+            self.log_handler.error(f"Cannot create download folder {download_path}: {e}")
+            self.status_bar.showMessage("Cannot create the download folder")
+            return
 
         self.log_handler.info(f"Starting parsing {url}")
         self.log_handler.info(f"Files will be saved to {download_path}")
@@ -1167,6 +1207,27 @@ class MainWindow(QMainWindow):
         self.parser_manager.parsing_finished.connect(self.on_parsing_finished)
         self.parser_manager.status_updated.connect(self.update_status)
         self.parser_manager.task_ended.connect(self.on_task_ended)
+
+    def _disconnect_parser_signals(self, pm=None):
+        """G-01: mirror of `_connect_parser_signals`.
+
+        The two lists must stay in sync: task switching used to disconnect only
+        `task_ended`, leaving the previous task's progress/status slots live.
+        """
+        pm = pm if pm is not None else getattr(self, "parser_manager", None)
+        if pm is None:
+            return
+        for signal, slot in (
+            (pm.total_progress_updated, self.update_total_progress),
+            (pm.current_progress_updated, self.update_current_progress),
+            (pm.parsing_finished, self.on_parsing_finished),
+            (pm.status_updated, self.update_status),
+            (pm.task_ended, self.on_task_ended),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass  # signal was not connected
 
     def _save_then_stop(self, pm, download_path: str) -> None:
         """C-07: save the session on the parser loop, THEN stop the task.
@@ -1256,6 +1317,18 @@ class MainWindow(QMainWindow):
                 self.parser_thread.quit()
                 if not self.parser_thread.wait(10000):
                     self.log_handler.warning("Parser thread did not stop within 10s")
+
+            # G-05: the QThread only spins exec(); parsing and downloads run in
+            # `loop_thread` and the executors. Sweeping *.part while a writer is
+            # still alive silently fails (and the file reappears after the
+            # sweep). Bounded wait — Stop must not hang the window.
+            loop_thread = getattr(self.parser_manager, "loop_thread", None)
+            if loop_thread is not None and loop_thread.is_alive():
+                loop_thread.join(5.0)
+                if loop_thread.is_alive():
+                    self.log_handler.warning(
+                        "Parser event loop did not stop within 5s; "
+                        "partial-file cleanup may race a live write")
 
             # Clean up: delete partial files and state for the stopped task
             active = self.task_queue.active_task
@@ -1585,10 +1658,14 @@ class MainWindow(QMainWindow):
                 self.task_queue.start_task(task.id)
                 self._launch_parser_for_task(task)
                 self.update_ui_state(True)
-        self._refresh_task_table()
-        if self.task_queue.queue:
+        # G-11: keep the user's selection across extension-driven refreshes —
+        # an unconditional selectRow(0) moved the Start/Resume target while the
+        # extension was still sending batches. Only a fresh table gets row 0.
+        selected = self._get_selected_task_id()
+        self._refresh_task_table(selected_task_id=selected)
+        if self.task_queue.queue and not self._get_selected_task_id():
             self.task_table.selectRow(0)
-            self._update_start_button_state()
+        self._update_start_button_state()
 
     def _apply_extension_task_payload(self, payload):
         """GUI thread (A-5): materialize one buffered extension payload —

@@ -107,14 +107,25 @@ class JSONWebpageParser:
             logger.error(f"Network error fetching JSON from {self.url}: {str(e)}")
             return None
 
-    def _extract_media_from_json(self, data: Any, path: str = "") -> None:
+    # P-09: the walk recursed with no bound. The neighbouring link scan is
+    # iterative with a hard cap (R-C-4), but a deep (still valid) document could
+    # blow the stack here and turn the whole page into UNKNOWN_ERROR. 64 levels
+    # is far beyond any media JSON (real payloads stop around 10-15) and far
+    # below Python's recursion limit.
+    MAX_JSON_DEPTH = 64
+
+    def _extract_media_from_json(self, data: Any, path: str = "", depth: int = 0) -> None:
         """
         Recursively extract media files from JSON data
 
         Args:
             data: JSON data to process
             path: Current JSON path for debugging
+            depth: current nesting level (bounded by MAX_JSON_DEPTH)
         """
+        if depth >= self.MAX_JSON_DEPTH:
+            logger.debug(f"JSON media scan stopped at depth {depth} ({path[:80]})")
+            return
         if isinstance(data, dict):
             # Process dictionary
             for key, value in data.items():
@@ -124,12 +135,12 @@ class JSONWebpageParser:
                     self._process_potential_media(value, new_path)
                 else:
                     # Continue recursion
-                    self._extract_media_from_json(value, new_path)
+                    self._extract_media_from_json(value, new_path, depth + 1)
         elif isinstance(data, list):
             # Process list
             for i, item in enumerate(data):
                 new_path = f"{path}[{i}]" if path else f"[{i}]"
-                self._extract_media_from_json(item, new_path)
+                self._extract_media_from_json(item, new_path, depth + 1)
 
     def _is_media_key(self, key: str) -> bool:
         """

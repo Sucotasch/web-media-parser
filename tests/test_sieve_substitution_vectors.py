@@ -118,6 +118,28 @@ class TestSubstitutionVectors(unittest.TestCase):
         self.assertEqual(normalize_variant("data:,x", page), "data:,x")
         self.assertEqual(normalize_variant("", page), "")
 
+    def test_host_like_variants_are_absolute_not_page_relative(self):
+        """E-01: `host.tld/path` is an absolute reference, not a file next door.
+
+        Resolving it against the page produced
+        `https://imageshack.com/a/imagizer.imageshack.us/...` — the garbage that
+        shipped in 7 bundled rules (ImageShack, YouTube hq, Simkl, ...). A plain
+        file name has no slash after the host and must stay page-relative.
+        """
+        page = "https://imageshack.com/a/x"
+        self.assertEqual(
+            normalize_variant("imagizer.imageshack.us/v2/500x500/x.jpg", page),
+            "https://imagizer.imageshack.us/v2/500x500/x.jpg")
+        self.assertEqual(normalize_variant("i.ytimg.com/vi/abc/hq.jpg", page),
+                         "https://i.ytimg.com/vi/abc/hq.jpg")
+        # Not host-like: single label, no host/path split, root-relative.
+        self.assertEqual(normalize_variant("photo.jpg", page),
+                         "https://imageshack.com/a/photo.jpg")
+        self.assertEqual(normalize_variant("images/photo.jpg", page),
+                         "https://imageshack.com/a/images/photo.jpg")
+        self.assertEqual(normalize_variant("/abs/x.jpg", page),
+                         "https://imageshack.com/abs/x.jpg")
+
 
 if __name__ == "__main__":
     unittest.main()

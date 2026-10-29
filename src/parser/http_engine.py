@@ -108,17 +108,28 @@ def tls_verify(settings: Dict[str, Any], legacy_default: bool = True) -> bool:
     return verify
 
 
-def should_escalate(settings: Dict[str, Any], code) -> bool:
+def should_escalate(settings: Dict[str, Any], code,
+                    primary_is_browser_tls: bool = None) -> bool:
     """True when an HTTP status is an explicit-block signal worth one curl_cffi
     retry: 403 (canonical block) or 5xx (bot-protection often answers 5xx to
     non-browser TLS). 429 is never escalated — rate-limit backoff already exists
-    and a different TLS fingerprint cannot help. Also never escalates when the
-    primary engine is already curl_cffi (the block happened on curl itself; a
-    second curl session is a wasted duplicate request).
+    and a different TLS fingerprint cannot help.
+
+    P-02: escalating is pointless only when the request that was blocked already
+    went out with the browser TLS fingerprint. That used to be decided from the
+    `http_engine` SETTING, which is wrong for the page fetch: pages always go
+    through aiohttp (the setting only picks the sync engine), so with
+    http_engine=curl_cffi a TLS-blocked page was refused without a single curl
+    attempt — strictly worse than the default. Callers therefore report what
+    they actually used; `None` keeps the old setting-based decision for callers
+    whose primary path IS the configured engine (the downloader).
     """
     if not settings.get(K.SETTING_HTTP_ESCALATE, K.DEFAULT_HTTP_ESCALATE):
         return False
-    if engine_uses_curl(settings):
+    if primary_is_browser_tls is None:
+        if engine_uses_curl(settings):
+            return False
+    elif primary_is_browser_tls:
         return False
     if code is None:
         return False
@@ -143,10 +154,25 @@ def create_escalation_session(settings: Dict[str, Any]):
         return None
     profile = impersonate_profile(settings)
     try:
-        return _curl_requests.Session(impersonate=profile)
+        session = _curl_requests.Session(impersonate=profile)
     except Exception as e:  # pragma: no cover - depends on curl_cffi version
         logger.warning(f"curl_cffi escalation session unavailable ({e})")
         return None
+    # P-03: the escalation session used to be built without the proxy that every
+    # other sync path applies. On networks where the proxy is mandatory the retry
+    # always failed; on private ones the request left the machine directly — the
+    # exact IP the proxy exists to hide. Same helper as _get_sync_session.
+    try:
+        from src.parser.utils import format_proxy_url
+        proxy_url = format_proxy_url(settings.get(K.SETTING_PROXY))
+    except Exception:
+        proxy_url = None
+    if proxy_url:
+        try:
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+        except Exception as e:  # pragma: no cover - depends on curl_cffi version
+            logger.debug(f"Escalation session proxy could not be set: {e}")
+    return session
 
 
 def create_sync_session(settings: Dict[str, Any]):

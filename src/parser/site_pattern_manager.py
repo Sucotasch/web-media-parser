@@ -103,13 +103,23 @@ def get_substitution(template: str, match: "re.Match") -> str:
     return "".join(out)
 
 
+# E-01: a scheme-less variant that starts with a host name (`cdn.example/x.jpg`,
+# no scheme, no leading slash) is an ABSOLUTE host reference, not a file
+# relative to the page's directory. Resolving it against the page produced
+# `https://page-host/dir/cdn.example/x.jpg` — garbage that shipped in 7 bundled
+# rules (ImageShack, YouTube hq, Simkl, 3Dtoday, ...). A slash after the host is
+# required so a plain file name (`photo.jpg`) stays page-relative.
+_HOST_LIKE_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?/", re.I)
+
+
 def normalize_variant(variant: str, page_url: str = "") -> str:
-    """NF-1: make a produced variant an absolute URL (extension parity).
+    """NF-1/E-01: make a produced variant an absolute URL (extension parity).
 
     A protocol-relative variant takes the PAGE's scheme (hardcoding https broke
     http pages and produced `https:////host/path` on some paths — A-06), a
-    scheme-less one is resolved against the page, and anything already carrying
-    a scheme (`http:`, `data:`, `blob:` …) is left untouched.
+    scheme-less host reference (`host.tld/path`, E-01) gets `https://`, any
+    other scheme-less value is resolved against the page, and anything already
+    carrying a scheme (`http:`, `data:`, `blob:` …) is left untouched.
     """
     if not isinstance(variant, str):
         return ""
@@ -118,6 +128,8 @@ def normalize_variant(variant: str, page_url: str = "") -> str:
         return ""
     if re.match(r"^[a-z][a-z0-9+.-]*:", v, re.I):
         return v
+    if _HOST_LIKE_RE.match(v):
+        return "https://" + v
     if not page_url:
         return v
     try:
@@ -309,10 +321,16 @@ class SitePatternManager:
                 if os.path.exists(exe_patterns_path):
                     built_in_path = exe_patterns_path
                     logger.info(f"Using patterns from executable directory: {built_in_path}")
-                    with open(built_in_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                    # G-04: this peek only logs the version — a malformed file
+                    # must fall through to _load_pattern_file (which reports and
+                    # skips it), not abort the ParserManager constructor.
+                    try:
+                        with open(built_in_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
                         if 'version' in data:
                             logger.info(f"Loaded patterns version: {data['version']}")
+                    except (OSError, ValueError) as e:
+                        logger.warning(f"Could not read pattern version from {built_in_path}: {e}")
                     self._load_pattern_file(built_in_path)
                     exe_built_in = True  # PAT-10: continue to the sieve scan below
             
@@ -802,8 +820,16 @@ def _transform(m):
                 pattern_domains = pattern_data.get('domains', [])
                 domain_match = False
                 
+                # P-06: this used a plain substring test, so `yandex.ru` matched
+                # `notyandex.ru` (and `vk.com` would match `vk.com.ua`). Match the
+                # host or a real subdomain of it — the same rule junk_filter and
+                # the domain blocklist already use.
+                host = domain.split("@")[-1].split(":")[0]
                 for pattern_domain in pattern_domains:
-                    if pattern_domain.lower() in domain:
+                    d = (pattern_domain or "").strip().lower()
+                    if not d:
+                        continue
+                    if host == d or host.endswith("." + d):
                         domain_match = True
                         break
                 
@@ -1164,23 +1190,20 @@ def _transform(m):
             # C-4: data:-templates are no-fetch markers (Mod semantics), not URLs.
             if template.startswith('data:'):
                 return None
-            if template.startswith('//'):
-                template = 'https:' + template
-            elif not template.startswith(('http://', 'https://')):
-                template = 'https://' + template
-            return template, post_data
+            # E-03: the JS branch used to force every protocol-relative and
+            # scheme-less result onto https. normalize_variant is the single
+            # normalizer (page scheme for `//`, https for a bare host,
+            # page-relative for a path) and the extension's twin.
+            return normalize_variant(template, page_url), post_data
         post_match = re.search(r'\s+:(.+)$', url_tpl)
         template = url_tpl[:post_match.start()] if post_match else url_tpl
         post_data = post_match.group(1).strip() if post_match else None
-        result = template
-        # Substitute $n in DESCENDING order so $10 isn't corrupted when $1 is
-        # replaced first (e.g. '$10' would become 'g(1)0' otherwise).
-        for i in range(len(match.groups()), 0, -1):
-            placeholder = f'${i}'
-            if placeholder in result and match.group(i) is not None:
-                result = result.replace(placeholder, match.group(i))
-        if '$&' in result:
-            result = result.replace('$&', match.group(0) or '')
+        # E-03/P-07: use the shared ECMAScript GetSubstitution instead of a
+        # hand-rolled `str.replace` loop. The loop left `$2` literal when the
+        # group did not participate, mishandled `$$`/`` $` ``/`$'` and
+        # re-substituted inside already-replaced group text — the extension
+        # never had those defects, so the same rule produced two different URLs.
+        result = get_substitution(template, match)
         if not result:
             return None
         # C-4: data:-templates (29 rules in shipped sieve, e.g. "data:,$&") are
@@ -1189,13 +1212,13 @@ def _transform(m):
         # probe the linked page itself (existing fallback path).
         if result.startswith('data:'):
             return None
-        if result.startswith('//'):
-            result = 'https:' + result
-        elif not result.startswith(('http://', 'https://')):
-            result = 'https://' + result
-        return result, post_data
+        # P-07/E-03: a root-relative template ('/go/xyz') used to become
+        # 'https:///go/xyz' (empty host). normalize_variant resolves it against
+        # the page and keeps `//host` on the page's scheme instead of forcing
+        # https — identical to the extension and to the img-`to` path above.
+        return normalize_variant(result, page_url), post_data
 
-    def extract_res_urls(self, rule, html, page_url="", groups=None, href=""):
+    def extract_res_urls(self, rule, html, page_url="", groups=None, href="", meta=None):
         """Extract fullsize media URLs from a linked page's HTML.
 
         Applies the rule's `res` regex(es); JS res expressions (starting with
@@ -1256,12 +1279,19 @@ def _transform(m):
             if urls:
                 break
         if not urls:
+            # E-06: the blind <img> dump is NOT the site's own knowledge — the
+            # extension marks it (`classifyPageImages`) instead of calling every
+            # grid thumbnail a full-size original. `meta` lets the caller do the
+            # same without changing this method's return type.
+            if meta is not None:
+                meta["fallback"] = True
             for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I):
                 u = m.group(1)
                 if u.startswith('//'):
                     u = 'https:' + u
+                # jfif/jif: the extension accepts them, this list did not.
                 if (u.startswith('http') and u not in seen and
-                        re.search(r'\.(jpe?g|webp|avif|heic|bmp|tiff?)$', u, re.I)):
+                        re.search(r'\.(jpe?g|jfif|jif|webp|avif|heic|bmp|tiff?)$', u, re.I)):
                     seen.add(u)
                     urls.append(u)
         return urls

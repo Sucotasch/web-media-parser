@@ -267,6 +267,26 @@ class TestWorkerReaping(unittest.TestCase):
         self.assertEqual(engine._cache_order, [])
         self.assertIsNone(engine._proc)
 
+    def test_shutdown_prevents_respawning_any_worker(self):
+        """X-04: a call that arrives after shutdown() must not spawn Deno again.
+
+        The executors are torn down around shutdown(), but a call already queued
+        there could resurrect a worker and leave an orphaned child behind.
+        """
+        engine = _engine()
+        engine.shutdown()
+
+        with patch("src.parser.js_engine.engine.subprocess.Popen") as popen:
+            self.assertIsNone(engine.run_js("code", []))
+            self.assertIsNone(engine.run_dom_js("code", "<html></html>"))
+            self.assertIsNone(engine.run_gateway_click("<html></html>"))
+            for ensure in (engine._ensure_proc, engine._ensure_dom_proc,
+                           engine._ensure_gateway_proc):
+                with self.assertRaises(RuntimeError):
+                    ensure()
+
+        self.assertEqual(popen.call_count, 0, "a worker was respawned after shutdown")
+
 
 class TestProtocolPayload(unittest.TestCase):
 

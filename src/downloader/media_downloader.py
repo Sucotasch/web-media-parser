@@ -755,6 +755,14 @@ class MediaDownloader:
                     result["unverified_length"] = True
                 return result
             finally:
+                # C-09: close the streaming response too. On a completed read this
+                # is a no-op, but on every abort path (Stop, size cap, body sniff,
+                # disk error, no Content-Length) the unread body otherwise holds a
+                # pooled socket until the GC gets to it. The MT path already does.
+                try:
+                    response_get.close()
+                except Exception:
+                    pass
                 # Close an escalation curl session (if any) after the stream is
                 # consumed or the download aborted — never leak the session.
                 self._close_escalation_session()
@@ -870,6 +878,16 @@ class MediaDownloader:
             response = self.session.get(self.url, headers=headers, stream=True, timeout=timeout_val)
             try:
                 response.raise_for_status()
+                # C-02: a server may legally ignore Range (RFC 7233) and answer 200
+                # with the WHOLE body. Without this check every one of the N chunk
+                # threads downloaded the full file into its own .partN — up to
+                # N x size of traffic and disk — before the size check noticed and
+                # the whole attempt fell back (and with max_bytes the result was
+                # reported as size_limited, i.e. no fallback at all). Checked
+                # before the file is opened and before a single body byte is read.
+                if response.status_code != 206:
+                    raise IOError(
+                        f"Server ignored Range (HTTP {response.status_code})")
                 # R-C-3: the multi-threaded path assembles ranged GETs and returns
                 # before the single-threaded GET guard runs — validate the chunk
                 # type here too. On mismatch the whole MT attempt fails, the

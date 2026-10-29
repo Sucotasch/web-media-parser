@@ -48,6 +48,23 @@ class TestQueuePersistence(unittest.TestCase):
             self.assertNotIn("running", statuses)
             self.assertIn("paused", statuses)
 
+    def test_save_fsyncs_before_the_atomic_replace(self):
+        """C-07: settings and the session pickle fsync; the queue did not.
+
+        On NTFS a power loss after os.replace could leave the renamed file empty
+        — the whole queue gone. The flush is what makes the replace durable.
+        """
+        from unittest.mock import patch
+
+        tm = self._manager()
+        tm.add_task("https://a.example/", {}, "/tmp/out/a")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "task_queue.json")
+            with patch("src.core.task_queue_manager.os.fsync", wraps=os.fsync) as fsync:
+                tm.save(path)
+            self.assertGreaterEqual(fsync.call_count, 1, "the queue file was never fsynced")
+            self.assertEqual(json.load(open(path, encoding="utf-8"))["version"], 1)
+
     def test_corrupt_entry_does_not_erase_queue(self):
         tm = self._manager()
         tm.add_task("https://a.example/", {}, "/tmp/out/a")

@@ -40,6 +40,7 @@ from src.parser.utils import (
     registrable_domain,
     is_format_allowed,
     should_skip_crawl_url,
+    sanitize_filename,
     # is_image_url, # Not used directly
     # is_video_url # Not used directly
 )
@@ -159,11 +160,14 @@ class ParserManager(QObject):
         self._last_activity_time: float = time.time()  # Updated on each parsed page/download for idle detection
         self._active_tasks = 0
         self._active_tasks_lock = threading.Lock()
-        # A-03: items taken out of a queue but not finished yet. They live in no
-        # queue's own storage, so a snapshot without them silently loses the
-        # page or the download that was in flight when the user hit Pause.
-        self._inflight_url_item = None
-        self._inflight_media = None
+        # A-03/C-01: items taken out of a queue but not finished yet. They live
+        # in no queue's own storage, so a snapshot without them silently loses
+        # the work that was in flight when the user hit Pause. Maps (not single
+        # slots): every parser worker (threads_per_file... parser_threads) and
+        # every download worker runs concurrently and used to overwrite one
+        # shared attribute, so only the LAST item survived the snapshot.
+        self._inflight_pages: Dict[str, tuple] = {}
+        self._inflight_downloads: Dict[str, dict] = {}
         # B-02/A-16: created in _main_task (the event-loop thread) and always
         # present so callers can pass them to run_in_executor without a
         # getattr dance; None means "use the default executor" (tests, scripts).
@@ -295,11 +299,9 @@ class ParserManager(QObject):
         self.quarantine_queue = asyncio.Queue()
         self._active_tasks = 0
         self._active_tasks_lock = threading.Lock()
-        # A-03: items taken out of a queue but not finished yet. They live in no
-        # queue's own storage, so a snapshot without them silently loses the
-        # page or the download that was in flight when the user hit Pause.
-        self._inflight_url_item = None
-        self._inflight_media = None
+        # A-03/C-01: see __init__ — one entry per in-flight page/download.
+        self._inflight_pages = {}
+        self._inflight_downloads = {}
         # B-02/A-16: created in _main_task (the event-loop thread) and always
         # present so callers can pass them to run_in_executor without a
         # getattr dance; None means "use the default executor" (tests, scripts).
@@ -342,6 +344,46 @@ class ParserManager(QObject):
                 self.loop.close()
                 logger.info("Asyncio event loop closed.")
 
+    async def _seed_pending_downloads(self) -> bool:
+        """G-02: queue the pre-scanned extension items exactly once.
+
+        One-shot tasks arrive with `pending_downloads` already populated (the
+        extension did the scanning). The GUI hands that list over on every
+        launch, so a Pause→Resume used to queue the whole original list AGAIN
+        on top of the items restored from `state.pkl`: every file was
+        downloaded twice (`name_1.jpg`), stats doubled and progress stalled
+        around 50%. `downloaded_files` is the existing "already queued"
+        registry — items in it are skipped here, which makes the seeding
+        idempotent regardless of how many times the task is resumed.
+
+        Returns True when the task was one-shot (the start URL must NOT be
+        seeded: there is nothing to crawl).
+        """
+        if not self.pending_downloads:
+            return False
+        attempted = len(self.pending_downloads)
+        queued = 0
+        for item in self.pending_downloads:
+            url = (item or {}).get("url")
+            if url and url in self.downloaded_files:
+                continue
+            await self.download_queue.put(item)
+            if url:
+                self.downloaded_files.add(url)
+            self.stats["images_found"] += 1
+            queued += 1
+        # Set pages_processed so completion monitor can trigger
+        self.stats["pages_processed"] = 1
+        if queued < attempted:
+            logger.info(
+                f"One-shot: {queued} of {attempted} items added to download_queue "
+                f"({attempted - queued} already queued/restored)"
+            )
+        else:
+            logger.info(f"One-shot: {queued} items added to download_queue")
+        self.pending_downloads = []
+        return True
+
     async def _main_task(self):
         # Reset PriorityURLQueue's asyncio primitives now that the loop is running.
         # This is the only safe place to do so, as asyncio.Lock/Event must be
@@ -363,18 +405,12 @@ class ParserManager(QObject):
             await self.load_state(self.download_path)
 
             # If we have pre-populated download items (from extension one-shot),
-            # add them to download_queue — extension did full scanning, no parsing needed
-            if self.pending_downloads:
-                for item in self.pending_downloads:
-                    await self.download_queue.put(item)
-                    self.stats["images_found"] += 1
-                # Set pages_processed so completion monitor can trigger
-                self.stats["pages_processed"] = 1
-                logger.info(f"One-shot: {len(self.pending_downloads)} items added to download_queue")
-                self.pending_downloads = []
-                # Don't seed start_url — items are already in download_queue
-                # Skip to waiting for downloads to complete
-            elif len(self.processed_urls) == 0:
+            # add them to download_queue — extension did full scanning, no parsing
+            # needed. G-02: seeding is idempotent (see _seed_pending_downloads),
+            # so a Pause→Resume of a one-shot task no longer queues the whole
+            # original list on top of the items restored from state.pkl.
+            seeded_one_shot = await self._seed_pending_downloads()
+            if not seeded_one_shot and len(self.processed_urls) == 0:
                 # Seed the initial URL ONLY for fresh sessions (no state loaded, no pending downloads)
                 await self.url_queue.put(
                     self.start_url, 0, self.start_url,
@@ -840,10 +876,15 @@ class ParserManager(QObject):
                             return
                         html = await resp.text()
 
+                    # E-06: remember WHICH path produced the URLs — the rule's own
+                    # `res` regex or the blind <img> dump (see the source choice
+                    # below).
+                    res_meta = {}
                     res_urls = [u for u in await probe_loop.run_in_executor(
                         self._js_executor,
                         lambda: self.pattern_manager.extract_res_urls(
-                            rule, html, page_url=page_url, groups=link_groups, href=link_url))
+                            rule, html, page_url=page_url, groups=link_groups,
+                            href=link_url, meta=res_meta))
                         if is_format_allowed(u, "image", self.settings)]
 
                     # Loop continuation check: rule opted in via `loop & 1`,
@@ -881,9 +922,18 @@ class ParserManager(QObject):
                                 loop_guard += 1
 
                     if next_link is None:
-                        # Chain ended — everything found on this hop is media.
+                        # E-06: the extension classifies an <img> fallback by its
+                        # count (`classifyPageImages`) — ONE image is a detail
+                        # page's full-size original, MANY are a grid's own
+                        # thumbnails. The desktop used to call every fallback URL
+                        # "sieve-res" (a fullsize source), so a grid/index page
+                        # downloaded all of its previews as originals (the
+                        # e-hentai symptom that was only fixed in the extension).
+                        source = "sieve-res"
+                        if res_meta.get("fallback"):
+                            source = "linked-img" if len(res_urls) == 1 else "page-img"
                         for u in res_urls:
-                            discovered.append(("image", u, {"source": "sieve-res", "thumbnail_url": thumb}))
+                            discovered.append(("image", u, {"source": source, "thumbnail_url": thumb}))
                             if thumb:
                                 resolved_thumbnails.add(thumb)
                         break
@@ -1059,7 +1109,7 @@ class ParserManager(QObject):
                 self._active_tasks += 1
 
             current_url, depth, source_page_url, context = url_data
-            self._inflight_url_item = url_data  # A-03
+            self._inflight_pages[url_data[0]] = url_data  # A-03/C-01
             logger.debug(f"Parser worker got URL: {current_url} (depth={depth})")
             try:
                 # Check before expensive network call
@@ -1100,7 +1150,7 @@ class ParserManager(QObject):
                 self.stats["pages_processed"] += 1
                 self._last_activity_time = time.time()
             finally:
-                self._inflight_url_item = None  # A-03
+                self._inflight_pages.pop(url_data[0], None)  # A-03/C-01
                 with self._active_tasks_lock:
                     self._active_tasks -= 1
                 self.url_queue.task_done()
@@ -1184,7 +1234,7 @@ class ParserManager(QObject):
             
             with self._active_tasks_lock:
                 self._active_tasks += 1
-            self._inflight_media = media_item  # A-03
+            self._inflight_downloads[media_item["url"]] = media_item  # A-03/C-01
 
             try:
                 # Check before expensive download
@@ -1274,7 +1324,7 @@ class ParserManager(QObject):
             except Exception as err:
                 logger.error(f"Error in downloader_worker for {media_item.get('url', 'Unknown URL')}: {str(err)}", exc_info=True)
             finally:
-                self._inflight_media = None  # A-03
+                self._inflight_downloads.pop(media_item["url"], None)  # A-03/C-01
                 with self._active_tasks_lock:
                     self._active_tasks -= 1
                 self.download_queue.task_done()
@@ -1374,38 +1424,24 @@ class ParserManager(QObject):
         return self._sanitize_filename(basename)
 
     def _sanitize_filename(self, filename: str) -> str:
-        invalid_os_chars = r'<>:"/\\|?*' 
-        control_chars = ''.join(map(chr, range(32)))
-        sanitized_name = re.sub(f'[{re.escape(invalid_os_chars + control_chars)}]+', '_', filename)
-        sanitized_name = re.sub(r'\s+', '_', sanitized_name) 
-        sanitized_name = re.sub(r'__+', '_', sanitized_name).strip('_')
-        name_part, ext_part = os.path.splitext(sanitized_name)
-        # R-P-2: a query/tracking tail survived sanitising inside the extension
-        # ("photo.jpeg?w=100" -> ".jpeg_w"), so files were written with an
-        # unusable extension. Recover the real one from the known lists instead.
-        known_extensions = sorted(K.IMAGE_EXTENSIONS + K.VIDEO_EXTENSIONS + K.AUDIO_EXTENSIONS,
-                                  key=len, reverse=True)
-        ext_lower = ext_part.lower()
-        known_match = next((e for e in known_extensions if ext_lower.startswith(e)), None)
-        if known_match:
-            ext_part = ext_part[:len(known_match)]
-        elif len(ext_part) > 7:
-            ext_part = ext_part[:7] 
-        
-        # K.MAX_FILENAME_LENGTH from constants.py is for the name_part only
-        if len(name_part) > K.MAX_FILENAME_LENGTH: name_part = name_part[:K.MAX_FILENAME_LENGTH]
-        
-        final_filename = f"{name_part}{ext_part}"
-        if not name_part: 
-             final_filename = f"{hashlib.md5(filename.encode()).hexdigest()[:K.DEFAULT_FILENAME_HASH_LENGTH]}{ext_part or K.DEFAULT_IMAGE_EXTENSION}"
-        return final_filename
+        """C-05: thin delegate to the one shared sanitiser.
+
+        The extension's one-shot route built file names inline and never called
+        this, so the two paths drifted: reserved Windows device names (`CON.jpg`)
+        and `:`/`|`/`?` failed every attempt there. The implementation — including
+        the reserved-name and trailing-dot handling — now lives in
+        `src.parser.utils.sanitize_filename`; this method stays because callers
+        and tests use it.
+        """
+        return sanitize_filename(filename)
     
     def _get_media_priority(self, media_item: Tuple[str, str, Dict[str, Any]], source_url: str) -> float:
         media_type, url, attrs = media_item; priority = 1.0
         if media_type == "image": priority *= 2.0
         elif media_type == "video": priority *= 3.0
         source_type = attrs.get("source", "")
-        if "fullsize" in source_type or "original" in source_type or source_type in ("sieve-res", "link-direct"):
+        if ("fullsize" in source_type or "original" in source_type
+                or source_type in ("sieve-res", "link-direct", "linked-img")):
             priority *= 3.0
         elif "parent-link" in source_type: priority *= 2.5
         if any(p in url.lower() for p in ["/full/", "/large/", "/original/", "fullsize", "highres"]): priority *= 2.0
@@ -1468,9 +1504,10 @@ class ParserManager(QObject):
                 "domain_health": {d: dict(v) if isinstance(v, dict) else v
                                   for d, v in self.domain_health.items()},
                 "quarantined_domains": list(self.quarantined_domains),
-                # A-03: the page/download that is being worked on right now.
-                "inflight_url_item": self._inflight_url_item,
-                "inflight_media": self._inflight_media,
+                # A-03/C-01: the pages/downloads that are being worked on right
+                # now — one entry per worker, not one shared slot.
+                "inflight_url_items": list(self._inflight_pages.values()),
+                "inflight_media_items": list(self._inflight_downloads.values()),
             }
 
         logger.info(f"save_state: {len(url_queue_items)} URL items, {len(download_queue_items)} download items, {len(self.downloaded_files)} downloaded files")
@@ -1537,20 +1574,39 @@ class ParserManager(QObject):
             for item in state.get("quarantine_queue_items", []):
                 await self.quarantine_queue.put(item)
 
-            # A-03: put the interrupted page/download back at the front of its
-            # queue. They were already consumed from the queue, so restoring
-            # them cannot duplicate anything.
-            inflight_url = state.get("inflight_url_item")
-            if inflight_url and len(inflight_url) == 4:
+            # A-03/C-01: put the interrupted pages/downloads back at the front
+            # of their queues. They were already consumed, so restoring them
+            # cannot duplicate anything. Both the new list form and the legacy
+            # single-slot form are read — a session saved by an older build must
+            # still resume.
+            inflight_pages = list(state.get("inflight_url_items") or [])
+            legacy_page = state.get("inflight_url_item")
+            if legacy_page:
+                inflight_pages.append(legacy_page)
+            for item_tuple in inflight_pages:
+                if not item_tuple or len(item_tuple) != 4:
+                    continue
+                # C-01: the parser worker adds a URL to processed_urls BEFORE it
+                # parses (parser_manager:processed_urls.add). Without discarding
+                # it here the re-queued page is skipped as "already processed"
+                # and the whole restore is a no-op — the page was lost anyway.
+                self.processed_urls.discard(normalize_url(item_tuple[0]))
+                self.processed_urls.discard(item_tuple[0])
                 await self.url_queue.put(
-                    inflight_url[0], inflight_url[1], inflight_url[2], inflight_url[3],
+                    item_tuple[0], item_tuple[1], item_tuple[2], item_tuple[3],
                     bypass_checks=True,
                 )
-                logger.info(f"load_state: re-queued in-flight page {inflight_url[0]}")
-            inflight_media = state.get("inflight_media")
-            if inflight_media:
-                await self.download_queue.put(inflight_media)
-                logger.info(f"load_state: re-queued in-flight download {inflight_media.get('url')}")
+                logger.info(f"load_state: re-queued in-flight page {item_tuple[0]}")
+
+            inflight_media = list(state.get("inflight_media_items") or [])
+            legacy_media = state.get("inflight_media")
+            if legacy_media:
+                inflight_media.append(legacy_media)
+            for item in inflight_media:
+                if not item:
+                    continue
+                await self.download_queue.put(item)
+                logger.info(f"load_state: re-queued in-flight download {item.get('url')}")
 
             logger.info(f"Successfully loaded state from {session_file_path}")
         except Exception as err:
