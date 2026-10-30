@@ -312,9 +312,92 @@
       if (content) addMedia(content, "image", { source: "meta" });
     });
 
+    // --- JS-REL-EXT: media literals inside inline <script> data ---------------
+    // Gallery pages that render their cards from a data array
+    // (`const D=[{"thumb":"thumbs/x.webp","full":"png/x.png"}]`) put the full-size
+    // path in the SCRIPT TEXT, not in any attribute, so a DOM-only scan reports
+    // only the reduced rendition (Errors.txt, ai-costume-gallery.pages.dev).
+    // The text is still in the DOM (script.textContent) — no page-world access
+    // or network round-trip is needed.
+    //
+    // Only a quoted literal ending in a media extension matches, so page/script
+    // extensions (.html/.json/.css) can never be collected; the scheme filter,
+    // the junk table and the ${} template check still run in addMedia below.
+    const JS_MEDIA_LITERAL_RE = /["']([^"'\s]+\.(?:jpe?g|jfif|jif|png|gif|webp|bmp|tiff?|avif|heic|mp4|webm|ogv|ogg|mov|m4v|mkv|avi|flv|wmv|ts|mpeg|mpg|m3u8|mpd)(?:[?#][^"'\s]*)?)["']/gi;
+    const JS_LITERAL_VIDEO_RE = /\.(?:mp4|webm|ogv|ogg|mov|m4v|mkv|avi|flv|wmv|ts|mpeg|mpg|m3u8|mpd)(?:[?#]|$)/i;
+    // A single page can inline megabytes of JSON; scan but do not chew on a
+    // pathological document.
+    const JS_SCAN_MAX_CHARS = 2000000;
+    // Soft hints, same data as the desktop's K.THUMBNAIL_URL_HINTS. They only
+    // ever classify an item that a same-stem fullsize sibling also covers —
+    // never a standalone drop rule (see dropShadowThumbnails).
+    const THUMB_HINTS = ["/thumb", "/thumbs/", "/thumbnail", "_thumb", "-thumb",
+                         "/small/", "/s/", "/preview/", "/lqip/", "w=150", "w=200"];
+
+    function isThumbHintUrl(url) {
+      const lower = (url || "").toLowerCase();
+      return THUMB_HINTS.some((h) => lower.includes(h));
+    }
+
+    function fileStem(url) {
+      try {
+        const path = new URL(url, baseUrl).pathname;
+        const base = path.slice(path.lastIndexOf("/") + 1);
+        const dot = base.lastIndexOf(".");
+        return (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+      } catch (e) {
+        return "";
+      }
+    }
+
+    (doc.querySelectorAll("script") || []).forEach((tag) => {
+      // External scripts are fetched, not inlined — their text is empty anyway,
+      // but a stub (or a CDN tag with body text) must not be scanned.
+      if (tag.hasAttribute && tag.hasAttribute("src")) return;
+      const text = tag.textContent || "";
+      if (!text || text.length > JS_SCAN_MAX_CHARS) return;
+      JS_MEDIA_LITERAL_RE.lastIndex = 0;
+      let m;
+      while ((m = JS_MEDIA_LITERAL_RE.exec(text)) !== null) {
+        // An un-interpolated `${id}` is a TEMPLATE PIECE, not a path: URL
+        // serialization percent-encodes the braces, so the junk table's
+        // /\$\{/ check (which runs on the resolved URL) can no longer see it.
+        if (m[1].includes("${")) continue;
+        const abs = toAbsolute(m[1]);
+        if (!abs) continue;
+        addMedia(abs, JS_LITERAL_VIDEO_RE.test(abs) ? "video" : "image", {
+          // A literal that looks like a rendition stays in the Thumbnails
+          // bucket; the plain one is a full-size candidate (FULLSIZE_SOURCES).
+          source: isThumbHintUrl(abs) ? "js-thumb" : "js-literal",
+        });
+      }
+    });
+
+    // --- WP-2.4 mirror: drop a thumbnail only when its fullsize twin is here --
+    // A gallery that ships both renditions under the SAME file name
+    // (thumbs/x.webp + img/x.webp + png/x.png) has a true duplicate: keeping the
+    // reduced one only pads the list and outbids the original for the on-disk
+    // name. A thumbnail WITHOUT a same-stem, non-thumbnail sibling — the classic
+    // thumb -> viewer page shape, where the original is one link away — is kept,
+    // and `links` is never touched by this rule.
+    function dropShadowThumbnails(items) {
+      if (items.length < 2) return items;
+      const fullsizeStems = new Set();
+      for (const it of items) {
+        if (isThumbHintUrl(it.url)) continue;
+        const stem = fileStem(it.url);
+        if (stem) fullsizeStems.add(stem);
+      }
+      if (!fullsizeStems.size) return items;
+      return items.filter((it) => {
+        const stem = fileStem(it.url);
+        return !(stem && fullsizeStems.has(stem) && isThumbHintUrl(it.url));
+      });
+    }
+
     // Media-bearing links first: discovery works the list in order, so a link that shows
     // a thumbnail must not sit behind a "Watched"/"Faq" link.
-    return { media, links: links.concat(linkRest) };
+    return { media: dropShadowThumbnails(media), links: links.concat(linkRest) };
   }
 
   // R-E-7 (NEW-2): split a srcset into { url, descriptor } candidates. A

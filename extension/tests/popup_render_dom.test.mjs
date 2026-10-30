@@ -73,8 +73,17 @@ class El {
     return this.children.length * 78;
   }
 
-  set innerHTML(_v) {
+  set innerHTML(v) {
     this.children = [];
+    // The only markup the popup writes through innerHTML is a <select>'s
+    // option list ("All formats (5)"); a real DOM would build those nodes,
+    // so the stub has to as well. Anything else just clears the container.
+    for (const m of String(v).matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)) {
+      const opt = new El("option");
+      opt.value = m[1];
+      opt.textContent = m[2];
+      this.appendChild(opt);
+    }
   }
 
   appendChild(node) {
@@ -324,11 +333,62 @@ await tick();
   sourceFilter.dispatch("change");
   check("a filter that matches nothing shows the filter explanation",
     document.getElementById("empty").querySelector("p").textContent,
-    "No items match the filters \u2014 pick another source or domain above.");
+    "No items match the filters \u2014 pick another source, format or domain above.");
   sourceFilter.value = "fullsize";
   sourceFilter.dispatch("change");
   check("switching back repaints the full set", api.renderState().queued, 1439);
   check("and the selection still covers all of it", api.countSpan.textContent, "1439 / 1439 selected");
+}
+
+// --- 5. FMT-1: the file-type filter drives the whole model ------------------
+//
+// A page that ships an original AND a web variant of every picture must be
+// reducible to one type from the popup — list, counter, selection and the
+// Save payload all at once.
+
+{
+  const fmt = document.getElementById("format-filter");
+  const mk = (n, ext) => ({
+    url: `https://gallery.example/art/${n}.${ext}`,
+    pageUrl: "https://gallery.example/post/1",
+    source: "js-literal",
+    type: "image",
+  });
+  api.applyScanResult({
+    tabId: 1,
+    pageUrl: "https://gallery.example/post/1",
+    title: "Mixed gallery",
+    media: [mk(1, "png"), mk(2, "png"), mk(3, "png"), mk(4, "webp"), mk(5, "webp")],
+  });
+
+  check("the type filter lists every type found",
+    fmt.children.map((o) => o.textContent),
+    ["All formats (5)", "PNG (3)", "WEBP (2)"]);
+  check("everything is selected while the filter is open",
+    api.countSpan.textContent, "5 / 5 selected");
+
+  fmt.value = ".png";
+  fmt.dispatch("change");
+  check("choosing PNG narrows the counter", api.countSpan.textContent, "3 / 3 selected");
+  check("and the paint queue with it", api.renderState().queued, 3);
+
+  sentMessages.length = 0;
+  api.chromeDownloadBtn.dispatch("click");
+  await tick();
+  await tick();
+  {
+    const msg = sentMessages.find((m) => m.action === "chromeDownload");
+    check("Save in Chrome saves only the chosen type",
+      msg ? msg.items.map((i) => i.url) : -1,
+      ["https://gallery.example/art/1.png",
+       "https://gallery.example/art/2.png",
+       "https://gallery.example/art/3.png"]);
+  }
+
+  fmt.value = "";
+  fmt.dispatch("change");
+  check("back to All formats restores the whole set",
+    api.countSpan.textContent, "5 / 5 selected");
 }
 
 if (failures) {

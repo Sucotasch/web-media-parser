@@ -36,8 +36,9 @@ function extractFn(source, marker, label) {
 }
 
 // shared.js defines these two; they are injected rather than parsed so the test
-// fails if the popup starts depending on anything else.
-const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img"]);
+// fails if the popup starts depending on anything else. "js-literal" is the
+// inline-<script> source (JS-REL-EXT) — kept in sync with shared.js.
+const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img", "js-literal"]);
 const isNotMedia = (item) => !!item && item.mediaVerdict === "not-media";
 
 const api = new Function(
@@ -45,14 +46,15 @@ const api = new Function(
   "isNotMedia",
   `
   ${extractFn(src, "function extractDomain(", "extractDomain")}
+  ${extractFn(src, "function mediaExtension(", "mediaExtension")}
   ${extractFn(src, "function matchesFilters(", "matchesFilters")}
   ${extractFn(src, "function filteredItems(", "filteredItems")}
   ${extractFn(src, "function selectedItems(", "selectedItems")}
-  return { extractDomain, matchesFilters, filteredItems, selectedItems };
+  return { extractDomain, mediaExtension, matchesFilters, filteredItems, selectedItems };
 `
 )(FULLSIZE_SOURCES, isNotMedia);
 
-const { filteredItems, selectedItems } = api;
+const { filteredItems, selectedItems, mediaExtension } = api;
 
 let failures = 0;
 function check(name, actual, expected) {
@@ -126,6 +128,39 @@ const DOMAIN = "gallery.example";
     filteredItems(items, DOMAIN, "fullsize").length, 1438);
 }
 
+// --- FMT-1: file-type filter -----------------------------------------------
+//
+// A gallery that ships an original AND a web variant of every picture (1407
+// png + 1407 webp on ai-costume-gallery.pages.dev) must be reducible to one
+// type from the popup — without changing the model for anyone who leaves the
+// filter on "All formats".
+const MIXED = [
+  { url: "https://gallery.example/png/a.png", source: "js-literal", type: "image" },
+  { url: "https://gallery.example/img/a.webp?sig=1", source: "js-literal", type: "image" },
+  { url: "https://gallery.example/img/b.PNG", source: "js-literal", type: "image" },
+  { url: "https://gallery.example/media/noext", source: "js-literal", type: "image" },
+];
+
+{
+  check("no format chosen = everything", filteredItems(MIXED, DOMAIN, "fullsize").length, 4);
+  check("the empty format argument means the same thing",
+    filteredItems(MIXED, DOMAIN, "fullsize", "").length, 4);
+  check(".png keeps both the lower- and upper-case names",
+    filteredItems(MIXED, DOMAIN, "fullsize", ".png").map((i) => i.url),
+    ["https://gallery.example/png/a.png", "https://gallery.example/img/b.PNG"]);
+  check(".webp keeps the one web variant (query stripped)",
+    filteredItems(MIXED, DOMAIN, "fullsize", ".webp").map((i) => i.url),
+    ["https://gallery.example/img/a.webp?sig=1"]);
+  check("an extension-less URL is only listed under All formats",
+    filteredItems(MIXED, DOMAIN, "fullsize", ".webp").some((i) => i.url.endsWith("noext")), false);
+  check("the selection model honours the type too",
+    selectedItems(MIXED, DOMAIN, "fullsize", new Set(), ".png").length, 2);
+  check("mediaExtension ignores the query and lowercases",
+    mediaExtension("https://gallery.example/img/X.WebP?v=2"), ".webp");
+  check("mediaExtension reports no type for an extension-less path",
+    mediaExtension("https://gallery.example/media/noext"), "");
+}
+
 // --- structural guards -----------------------------------------------------
 
 check("the list is no longer truncated by a render cap",
@@ -134,15 +169,17 @@ check("the 'narrow the filter to reach them' dead end is gone",
   /narrow the domain or source filter to reach them/.test(src), false);
 check("Select all updates the model", /filtered\.forEach\(\(item\) => \(select \? deselected\.delete\(item\) : deselected\.add\(item\)\)\);/.test(src), true);
 check("Send to App builds its payload from the model",
-  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected\)/.test(src), true);
+  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter\)/.test(src), true);
 check("Save in Chrome builds its payload from the model",
-  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected\)\s*\n\s*\.map\(\(item\) => \(\{/.test(src), true);
+  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter\)\s*\n\s*\.map\(\(item\) => \(\{/.test(src), true);
 check("Copy links exports the model, not the painted rows",
-  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected\);/.test(src), true);
+  /const selected = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter\);/.test(src), true);
 check("no bulk action reads the selection back from the DOM",
   /querySelectorAll\("input\[type='checkbox'\]:checked"\)/.test(src), false);
 check("the counter counts the model",
-  /const checkedCount = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected\)\.length;/.test(src), true);
+  /const checkedCount = selectedItems\(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter\)\.length;/.test(src), true);
+check("the type filter is threaded through every model call",
+  (src.match(/activeFormatFilter/g) || []).length >= 10, true);
 
 if (failures) {
   console.log(`\n${failures} FAILURE(S)`);

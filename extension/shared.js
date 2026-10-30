@@ -19,7 +19,12 @@
 // to be a GRID of images (the page's own thumbnails). Errors.txt (e-hentai):
 // promoting those made "Full size" list 285 thumbnails next to the real
 // originals; they stay in the "Thumbnails" bucket (see classifyPageImages).
-const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img"]);
+// "js-literal" = a media path found inside an inline <script> data array
+// (content_script.js, JS-REL-EXT). Pages that build their grid from
+// `const D=[{...}]` never expose the full-size path in an attribute, so the
+// literal is the only place the original URL exists; literals that look like a
+// rendition are tagged "js-thumb" instead and stay out of this set.
+const FULLSIZE_SOURCES = new Set(["sieve-res", "link-direct", "sieve-to", "a-link", "linked-img", "js-literal"]);
 // (D-07's sanitizeFilename lives below, next to the other shared helpers.)
 
 /**

@@ -6,6 +6,10 @@
 const mediaItems = [];
 let activeDomainFilter = "";
 let activeSourceFilter = "";
+// FMT-1: which file types the list/selection shows ("" = all). A gallery that
+// ships both an original and a web variant of the same picture must not make
+// the user download both by default — he picks the type, or leaves it open.
+let activeFormatFilter = "";
 let concurrentLimit = 2;
 
 // --- Selection model and render state ---
@@ -44,6 +48,7 @@ const emptyDiv = document.getElementById("empty");
 const errorDiv = document.getElementById("error");
 const domainFilter = document.getElementById("domain-filter");
 const sourceFilter = document.getElementById("source-filter");
+const formatFilter = document.getElementById("format-filter");
 const chromeDownloadBtn = document.getElementById("chrome-download-btn");
 const chromeCountSpan = document.getElementById("chrome-count");
 
@@ -70,6 +75,7 @@ const concurrentLimitInput = document.getElementById("concurrent-limit");
 // the user sees — start from it, and `change` keeps the pair in sync afterwards.
 activeDomainFilter = domainFilter.value;
 activeSourceFilter = sourceFilter.value;
+activeFormatFilter = formatFilter.value;
 let isAppConnected = false;
 
 function updateAppButtonsState() {
@@ -149,6 +155,42 @@ function populateDomainFilter() {
   });
 }
 
+// The file type of a media URL: the last path segment's extension, lowercased,
+// query and fragment stripped. "" when there is none (extension-less CDN paths) —
+// such an item belongs to no named option, so it shows up only while the filter
+// is on "All formats".
+function mediaExtension(url) {
+  const path = String(url || "").split(/[?#]/)[0];
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot).toLowerCase() : "";
+}
+
+function populateFormatFilter() {
+  // Keep the user's choice across a re-scan or a popup re-open while the type
+  // is still present; a type that disappeared must not leave the list empty by
+  // filtering for something that no longer exists.
+  const previous = activeFormatFilter;
+  const counts = new Map();
+  mediaItems.forEach((item) => {
+    const ext = mediaExtension(item.url);
+    if (ext) counts.set(ext, (counts.get(ext) || 0) + 1);
+  });
+
+  formatFilter.innerHTML = `<option value="">All formats (${mediaItems.length})</option>`;
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  sorted.forEach(([ext, count]) => {
+    const opt = document.createElement("option");
+    opt.value = ext;
+    opt.textContent = `${ext.slice(1).toUpperCase()} (${count})`;
+    formatFilter.appendChild(opt);
+  });
+
+  const stillThere = previous && counts.has(previous);
+  activeFormatFilter = stillThere ? previous : "";
+  formatFilter.value = activeFormatFilter;
+}
+
 // --- Scan page ---
 // ERR-4: the scan runs in the background service worker, not the popup.
 // Action popups are closed by Chrome on blur (moving the mouse away kills
@@ -165,8 +207,10 @@ scanBtn.addEventListener("click", async () => {
   deselected.clear();
   activeDomainFilter = "";
   activeSourceFilter = "fullsize";
+  activeFormatFilter = "";
   domainFilter.value = "";
   sourceFilter.value = "fullsize";
+  formatFilter.value = "";
   resultsDiv.classList.add("hidden");
   emptyDiv.classList.add("hidden");
 
@@ -275,6 +319,7 @@ function applyScanResult(result) {
   pageInfoDiv.title = [result.title, result.pageUrl, vNote].filter(Boolean).join("\n");
   pageInfoDiv.classList.remove("hidden");
   populateDomainFilter();
+  populateFormatFilter();
   // Fallback to "all" if no fullsize sources found
   const fsCount = mediaItems.filter(m => FULLSIZE_SOURCES.has(m.source)).length;
   if (fsCount === 0) {
@@ -396,6 +441,12 @@ sourceFilter.addEventListener("change", () => {
   updateCount();
 });
 
+formatFilter.addEventListener("change", () => {
+  activeFormatFilter = formatFilter.value;
+  renderMediaList();
+  updateCount();
+});
+
 // --- Dimensions display ---
 // The dims we record come from the DOM element, so they describe the FILE at
 // item.url only when that URL is the very image the browser loaded, untouched:
@@ -413,35 +464,38 @@ function shouldShowDims(item) {
 
 // One definition of "matches the current filters" — the painter, the counters,
 // Select all, Copy links, Send to App and Save must all agree on the set.
-function matchesFilters(item, domain, source) {
+function matchesFilters(item, domain, source, format) {
   if (domain && extractDomain(item.url) !== domain) return false;
+  // FMT-1: the type filter narrows the SAME set every other caller sees —
+  // the rows, the counter, Select all, Copy links, Send to App and Save.
+  if (format && mediaExtension(item.url) !== format) return false;
   if (source === "fullsize" && (!FULLSIZE_SOURCES.has(item.source) || isNotMedia(item))) return false;
   if (source === "thumbnail" && FULLSIZE_SOURCES.has(item.source)) return false;
   return true;
 }
 
-function filteredItems(items, domain, source) {
-  return items.filter((item) => matchesFilters(item, domain, source));
+function filteredItems(items, domain, source, format = "") {
+  return items.filter((item) => matchesFilters(item, domain, source, format));
 }
 
 // Selected = every filtered item the user did not uncheck. Having no painted
 // row must never mean "not selected".
-function selectedItems(items, domain, source, skipped) {
-  return filteredItems(items, domain, source).filter((item) => !skipped.has(item));
+function selectedItems(items, domain, source, skipped, format = "") {
+  return filteredItems(items, domain, source, format).filter((item) => !skipped.has(item));
 }
 
 function renderMediaList() {
   mediaList.innerHTML = "";
   stopRenderObserver();
 
-  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter, activeFormatFilter);
 
   if (filtered.length === 0) {
     // "No media found on this page" was shown for a filter that hides everything
     // too - the page does have media, the FILTER is the reason. Say which one.
     emptyDiv.querySelector("p").textContent = mediaItems.length === 0
       ? "No media found on this page."
-      : "No items match the filters — pick another source or domain above.";
+      : "No items match the filters — pick another source, format or domain above.";
     resultsDiv.classList.add("hidden");
     emptyDiv.classList.remove("hidden");
     return;
@@ -714,8 +768,8 @@ function getVisibleCheckboxes() {
 function updateCount() {
   // Counted over the model, not over the painted rows: the rows past the last
   // painted chunk have no checkbox and are still selected.
-  const total = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter).length;
-  const checkedCount = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected).length;
+  const total = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter, activeFormatFilter).length;
+  const checkedCount = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter).length;
 
   // Both counters are re-queried: their spans live inside button labels that
   // other code rewrites via innerHTML, so the cached references go stale.
@@ -749,7 +803,7 @@ function updateCount() {
 selectAllCheckbox.addEventListener("change", () => {
   // Applies to every item the filters match — the rows that are not painted yet
   // included — and only mirrors the result onto the rows that do exist.
-  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter, activeFormatFilter);
   const select = selectAllCheckbox.checked;
   filtered.forEach((item) => (select ? deselected.delete(item) : deselected.add(item)));
   getVisibleCheckboxes().forEach((cb) => { cb.checked = select; });
@@ -761,7 +815,7 @@ selectAllCheckbox.addEventListener("change", () => {
 chromeDownloadBtn.addEventListener("click", async () => {
     // Every selected item, painted row or not — reading `:checked` from the DOM
     // silently limited a save to the rows that happened to be built.
-    const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected)
+    const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter)
       .map((item) => ({
         url: item.url,
         referer: item.pageUrl || "",
@@ -869,8 +923,8 @@ if (deepCrawlBtn) {
 // --- Copy / Export Media Links ---
 
 function getExportUrls() {
-  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter);
-  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected);
+  const filtered = filteredItems(mediaItems, activeDomainFilter, activeSourceFilter, activeFormatFilter);
+  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter);
   // Nothing selected falls back to everything the filters match; either way the
   // set comes from the model, never from the painted rows.
   return (selected.length > 0 ? selected : filtered)
@@ -934,7 +988,7 @@ if (copyLinksBtn) {
 
 downloadBtn.addEventListener("click", async () => {
   // The same set the counter shows: all selected items, painted or not.
-  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected)
+  const selected = selectedItems(mediaItems, activeDomainFilter, activeSourceFilter, deselected, activeFormatFilter)
     .map((item) => ({
       url: item.url,
       // EXT-4: `source` in the scan results means ORIGIN (img/srcset/sieve-res);

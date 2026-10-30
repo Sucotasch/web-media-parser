@@ -66,16 +66,24 @@ function img(attrs) {
   }, attrs);
 }
 
-function fakeDoc(imgs = [], anchors = [], sources = []) {
+function fakeDoc(imgs = [], anchors = [], sources = [], scripts = []) {
   return {
     querySelectorAll(sel) {
       if (sel === "img") return imgs;
       if (sel === "a[href]") return anchors;
       if (sel === "picture source") return sources;
+      if (sel === "script") return scripts;
       return [];
     },
   };
 }
+
+// An inline <script> element stub: JS-REL-EXT reads textContent and skips
+// tags that carry a src (external scripts are fetched, not inlined).
+const script = (text, external = false) => ({
+  textContent: text,
+  hasAttribute: (name) => (name === "src" ? external : false),
+});
 
 // An anchor stub with no media of its own: page_link() in content_script.js now
 // asks an anchor whether it PRESENTS media (img child / background image), so the
@@ -280,6 +288,81 @@ check("parseSrcset: data URI with commas stays one candidate", parseSrcset(`${DA
     ["http://127.0.0.1:9811/photo.jfif", "a-link"],
   ]);
   check(".jif anchors are not added to page links", out.links, []);
+}
+
+// --- JS-REL-EXT: media literals inside inline <script> data ---------------
+//
+// The real page (Errors.txt, ai-costume-gallery.pages.dev) builds its grid
+// from `const D=[{thumb,img,full}]` where every path is site-relative. The DOM
+// only ever holds the reduced rendition, so a DOM-only scan reports thumbs and
+// nothing else — the desktop twin hit exactly this ("Found 0 images").
+const GRID_JSON = 'const META={"total":1};const D=[{"id":"SXY-0159",'
+  + '"thumb":"thumbs/SXY-0159.webp","img":"img/SXY-0159.webp",'
+  + '"full":"png/SXY-0159.png"}];';
+
+{
+  // DOM thumb + the page's own data array: full-size comes from the literals,
+  // and the reduced rendition loses to its same-stem sibling (WP-2.4 mirror).
+  const thumb = img({ src: "/thumbs/SXY-0159.webp" });
+  const out = scanPageMedia(fakeDoc([thumb], [], [], [script(GRID_JSON)]), BASE);
+  check(
+    "JS-REL-EXT: relative literals collected, thumbnail shadow dropped",
+    out.media.map((m) => [m.url, m.source]),
+    [
+      ["http://127.0.0.1:9811/img/SXY-0159.webp", "js-literal"],
+      ["http://127.0.0.1:9811/png/SXY-0159.png", "js-literal"],
+    ]
+  );
+}
+
+{
+  // A thumbnail with NO same-stem fullsize on the page stays — that is the
+  // thumb -> viewer-page shape, whose original is still one link away.
+  const out = scanPageMedia(
+    fakeDoc([], [], [], [script('const A=[{"t":"thumbs/only.webp"}];')]),
+    BASE
+  );
+  check(
+    "JS-REL-EXT: a lone thumbnail literal is kept and labelled js-thumb",
+    out.media.map((m) => [m.url, m.source]),
+    [["http://127.0.0.1:9811/thumbs/only.webp", "js-thumb"]]
+  );
+}
+
+{
+  const out = scanPageMedia(fakeDoc([img({ src: "/thumbs/lonely.webp" })]), BASE);
+  check(
+    "WP-2.4: a lone DOM thumbnail is not dropped either",
+    out.media.map((m) => m.url),
+    ["http://127.0.0.1:9811/thumbs/lonely.webp"]
+  );
+}
+
+{
+  const out = scanPageMedia(fakeDoc([], [], [], [script(GRID_JSON, true)]), BASE);
+  check("external <script src> is never scanned", out.media, []);
+}
+
+{
+  // The junk table still runs on literals: an un-interpolated template
+  // placeholder resolves to a URL that does not exist.
+  const out = scanPageMedia(
+    fakeDoc([], [], [], [script('var u = "cdn/${id}/photo.jpg";')]),
+    BASE
+  );
+  check("a ${} template placeholder is not media", out.media, []);
+}
+
+{
+  const out = scanPageMedia(
+    fakeDoc([], [anchor("/post.html")], [], [script(GRID_JSON)]),
+    BASE
+  );
+  check(
+    "links are untouched by the JS literal scan and the thumbnail rule",
+    out.links,
+    ["http://127.0.0.1:9811/post.html"]
+  );
 }
 
 if (failures > 0) {
