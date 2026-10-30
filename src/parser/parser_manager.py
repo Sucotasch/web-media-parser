@@ -54,6 +54,81 @@ from src import constants as K # Import constants
 logger = logging.getLogger(__name__)
 
 
+def _file_stem(url: str) -> str:
+    """Lowercased file name of `url` without its extension (query/fragment excluded)."""
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return ""
+    return os.path.splitext(path.rsplit("/", 1)[-1])[0].lower()
+
+
+def _is_thumbnail_candidate(url: str, attrs: Optional[Dict[str, Any]]) -> bool:
+    """True when a media URL looks like a reduced rendition of a larger file.
+
+    Reads the soft thumbnail hint the parser already tags media with
+    (K.THUMBNAIL_URL_HINTS / attrs['likely_thumbnail']). On its own it is a
+    priority signal only — it is never a filter, see drop_shadow_thumbnails.
+    """
+    if attrs and attrs.get("likely_thumbnail"):
+        return True
+    url_lower = (url or "").lower()
+    return any(hint in url_lower for hint in K.THUMBNAIL_URL_HINTS)
+
+
+def drop_shadow_thumbnails(
+    media_files: List[Tuple[str, str, Dict[str, Any]]],
+    settings: Dict[str, Any],
+    source_url: str = "",
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """WP-2.4: drop a thumbnail when the SAME page already carries its
+    full-size sibling: same file stem, not a thumbnail itself, format enabled.
+
+    Why the same-stem condition instead of a blanket 'thumb' match:
+
+    * A gallery that names both renditions identically (thumbs/x.webp +
+      img/x.webp + png/x.png) is a true duplicate — keeping the reduced one
+      only inflates the queue and, worse, wins the on-disk name
+      (x.webp from thumbs/ and x_1.webp from img/).
+    * A thumbnail whose full-size lives behind a link (thumb -> viewer page)
+      has no same-stem sibling in this batch, so it is kept and its crawl
+      transition keeps working: THIS FUNCTION ONLY EVER SEES MEDIA TUPLES.
+      Links, the frontier and crawl priorities are handled elsewhere and are
+      never filtered by an URL substring test.
+    * A lone thumbnail (no sibling on this page) is kept as well.
+    """
+    if len(media_files) < 2:
+        return list(media_files)
+
+    fullsize_stems = set()
+    for media_type, url, attrs in media_files:
+        if _is_thumbnail_candidate(url, attrs):
+            continue
+        if not is_format_allowed(url, media_type, settings):
+            continue  # a disabled format is no fallback for the thumbnail
+        stem = _file_stem(url)
+        if stem:
+            fullsize_stems.add(stem)
+
+    if not fullsize_stems:
+        return list(media_files)
+
+    kept: List[Tuple[str, str, Dict[str, Any]]] = []
+    dropped = 0
+    for media_type, url, attrs in media_files:
+        stem = _file_stem(url)
+        if stem and stem in fullsize_stems and _is_thumbnail_candidate(url, attrs):
+            dropped += 1
+            continue
+        kept.append((media_type, url, attrs))
+    if dropped:
+        logger.debug(
+            f"Dropped {dropped} thumbnail duplicates whose fullsize sibling "
+            f"is queued on {source_url}"
+        )
+    return kept
+
+
 class ParserManager(QObject):
     """Enhanced parser manager with async support"""
 
@@ -1157,6 +1232,11 @@ class ParserManager(QObject):
         logger.info(f"Parser worker {threading.get_ident()} finished.")
 
     async def _process_media_files(self, media_files: List[Tuple[str, str, Dict[str, Any]]], source_url: str) -> None:
+        # WP-2.4: same-page thumbnail shadows are removed here — the single
+        # funnel from a parsed page to the download queue — so links, the
+        # crawl frontier and queue priorities (fed with the raw list) are
+        # untouched.
+        media_files = drop_shadow_thumbnails(media_files, self.settings, source_url)
         if not media_files: return
         await self._process_media_batch(media_files, source_url)
 

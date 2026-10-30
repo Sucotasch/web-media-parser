@@ -148,6 +148,46 @@ def test_apple_touch_icons_filtered_at_parse():
                     "https://example.com/content/photo-2.jpg"}, urls
 
 
+def test_relative_media_literals_in_inline_script_extracted():
+    """JS-REL: a gallery whose whole grid lives in an inline <script> JSON array
+    (`const D=[{"thumb": "thumbs/x.webp", "full": "png/x.png"}]`) must yield
+    media. The JS scan used to accept only absolute http(s) literals, so every
+    site-relative path (the common case for same-host galleries) was dropped
+    and the task finished with "Found 0 images"."""
+    html = """<html><body><div id="grid"></div>
+    <script>
+    const META={"total": 2};
+    const D=[{"id": "SXY-0159", "thumb": "thumbs/SXY-0159.webp",
+              "img": "img/SXY-0159.webp", "full": "png/SXY-0159.png"},
+             {"id": "SPR-0001", "thumb": "/thumbs/SPR-0001.webp",
+              "full": "https://cdn.example.com/png/SPR-0001.png"}];
+    </script></body></html>"""
+    parser, soup = _make_parser_html(html, url="https://example.com/", process_js=True)
+    media = asyncio.run(_dynamic(parser, soup))
+    urls = {u for _, u, _ in media}
+    assert "https://example.com/thumbs/SXY-0159.webp" in urls, urls
+    assert "https://example.com/img/SXY-0159.webp" in urls, urls
+    assert "https://example.com/png/SXY-0159.png" in urls, urls
+    # Root-relative and absolute literals keep working.
+    assert "https://example.com/thumbs/SPR-0001.webp" in urls, urls
+    assert "https://cdn.example.com/png/SPR-0001.png" in urls, urls
+    # Non-media relative strings in the same script are not media.
+    assert not any(u.endswith(".css") for u in urls), urls
+
+
+def test_relative_media_literal_rejects_non_media_and_junk():
+    """The relative-literal scan must not turn arbitrary JS strings into media:
+    page/script extensions and data: URIs stay out."""
+    html = """<html><body><script>
+    var conf = {tpl: "partials/card.html", api: "/api/list.json",
+                css: "theme.css", img: "photos/pic.jpg"};
+    </script></body></html>"""
+    parser, soup = _make_parser_html(html, url="https://example.com/", process_js=True)
+    media = asyncio.run(_dynamic(parser, soup))
+    urls = {u for _, u, _ in media}
+    assert urls == {"https://example.com/photos/pic.jpg"}, urls
+
+
 def test_regular_link_tag_not_treated_as_media():
     """Icons with sizes="any" or no sizes must not leak into media either."""
     html = """<html><head>

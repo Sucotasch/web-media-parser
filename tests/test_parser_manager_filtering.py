@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from src.parser.parser_manager import ParserManager
+from src.parser.parser_manager import ParserManager, drop_shadow_thumbnails
 from src import constants as K
 
 from helpers import MockGUILogHandler
@@ -186,6 +186,110 @@ class TestDomainBlocklistCoversSubdomains(unittest.TestCase):
         # Deriving a base domain from an IP would produce the nonsense "3.4",
         # which would block unrelated hosts ending in .3.4.
         self.assertNotIn('3.4', blocked)
+
+
+class TestShadowThumbnailFiltering(unittest.TestCase):
+    """WP-2.4: same-page thumbnail shadows are dropped from the MEDIA batch only.
+
+    The crawl frontier must stay untouched — a thumbnail whose full-size lives
+    behind a link (thumb -> viewer page) has no same-stem sibling here, so both
+    the thumb and its transition link keep working.
+    """
+
+    _PAGE = "https://gallery.test/"
+    _THUMB = "https://gallery.test/thumbs/SXY-0159.webp"
+    _FULL_WEBP = "https://gallery.test/img/SXY-0159.webp"
+    _FULL_PNG = "https://gallery.test/png/SXY-0159.png"
+    _VIEWER = "https://gallery.test/albums/item-0159"
+
+    def _batch(self):
+        return [
+            ("image", self._THUMB, {}),
+            ("image", self._FULL_WEBP, {}),
+            ("image", self._FULL_PNG, {}),
+        ]
+
+    def _manager(self):
+        with patch('src.parser.parser_manager.AsyncClientManager', MagicMock()), \
+             patch('src.parser.parser_manager.ParserManager._load_domain_blocklist',
+                   return_value=set()):
+            pm = ParserManager(
+                url=self._PAGE, download_path="test_downloads",
+                settings={K.SETTING_SEARCH_DEPTH: 5, K.SETTING_STAY_IN_DOMAIN: False,
+                          K.SETTING_STOP_WORDS: []},
+                log_handler=MockGUILogHandler(),
+            )
+        pm.download_queue = MagicMock()
+        pm.download_queue.put = AsyncMock()
+        pm.url_queue.put = AsyncMock()
+        pm._processed_lock = asyncio.Lock()
+        return pm
+
+    # --- pure filter -------------------------------------------------------
+
+    def test_fullsize_wins_over_same_stem_thumbnail(self):
+        kept = [u for _, u, _ in drop_shadow_thumbnails(self._batch(), {})]
+        self.assertEqual(kept, [self._FULL_WEBP, self._FULL_PNG], kept)
+
+    def test_lone_thumbnail_has_nothing_to_be_dropped_for(self):
+        batch = [("image", self._THUMB, {})]
+        self.assertEqual(drop_shadow_thumbnails(batch, {}), batch)
+
+    def test_thumbnail_with_unrelated_sibling_is_kept(self):
+        batch = [
+            ("image", self._THUMB, {}),
+            ("image", "https://gallery.test/img/OTHER-0001.webp", {}),
+        ]
+        kept = [u for _, u, _ in drop_shadow_thumbnails(batch, {})]
+        self.assertIn(self._THUMB, kept, kept)
+        self.assertEqual(len(kept), 2, kept)
+
+    def test_thumbnail_kept_when_the_sibling_format_is_disabled(self):
+        """A format-disabled sibling can never stand in for the thumbnail."""
+        batch = [
+            ("image", "https://gallery.test/thumbs/a.jpg", {}),
+            ("image", "https://gallery.test/img/a.png", {}),
+        ]
+        settings = {K.SETTING_ENABLED_IMAGE_FORMATS: [".jpg"]}
+        kept = [u for _, u, _ in drop_shadow_thumbnails(batch, settings)]
+        self.assertEqual(kept, [u for _, u, _ in batch], kept)
+
+    def test_two_thumbnails_are_never_dropped_for_each_other(self):
+        batch = [
+            ("image", "https://gallery.test/thumbs/a.webp", {}),
+            ("image", "https://gallery.test/preview/a.webp", {}),
+        ]
+        kept = [u for _, u, _ in drop_shadow_thumbnails(batch, {})]
+        self.assertEqual(len(kept), 2, kept)
+
+    # --- wiring ------------------------------------------------------------
+
+    def test_process_media_files_queues_only_fullsize(self):
+        pm = self._manager()
+        asyncio.run(pm._process_media_files(self._batch(), self._PAGE))
+        queued = [c[0][0]["url"] for c in pm.download_queue.put.call_args_list]
+        self.assertEqual(queued, [self._FULL_WEBP, self._FULL_PNG], queued)
+
+    def test_crawl_transition_of_a_thumbnail_is_not_filtered(self):
+        """The filter sees media tuples only: when the full-size sibling makes
+        the thumbnail redundant, the thumb's viewer-page link must STILL reach
+        the frontier — no URL-substring rule may touch the crawl queue."""
+        pm = self._manager()
+        links_data = {self._VIEWER: {"from_image": True, "source_url": self._THUMB}}
+
+        async def _run():
+            await pm._process_parser_results(
+                url=self._PAGE, depth=0, links_data=links_data,
+                media_files=self._batch(),
+                original_url_context={"start_url": self._PAGE},
+            )
+
+        asyncio.run(_run())
+
+        queued_links = [c[0][0] for c in pm.url_queue.put.call_args_list]
+        self.assertIn(self._VIEWER, queued_links, queued_links)
+        queued_media = [c[0][0]["url"] for c in pm.download_queue.put.call_args_list]
+        self.assertEqual(queued_media, [self._FULL_WEBP, self._FULL_PNG], queued_media)
 
 
 if __name__ == '__main__':

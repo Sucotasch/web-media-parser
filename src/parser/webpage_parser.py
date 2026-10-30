@@ -71,6 +71,28 @@ def _resolve_codec_name(name) -> Optional[str]:
 logger = logging.getLogger(__name__)
 
 
+def _js_media_literal(exts) -> str:
+    r"""Regex matching a quoted JS string literal that ends in one of `exts`.
+
+    JS-REL: galleries routinely embed their whole catalogue in an inline
+    <script> as JSON (`const D=[{\"thumb\": \"thumbs/x.webp\", \"full\":
+    \"png/x.png\"}])`, and those paths are site-relative far more often than
+    absolute. The old pattern demanded an `http(s)://` prefix, so every one of
+    them was dropped and the page reported "Found 0 images" while the browser
+    view showed the full grid.
+
+    Classification is left to `is_media_url` + the format allowlist — this
+    regex only anchors the extension (plus an optional query/fragment), so
+    page/script extensions (\.html, \.json, \.css) never match.
+    """
+    alt = "|".join(re.escape(e) for e in exts)
+    return r'["\x27]([^"\x27\s]+(?:' + alt + r')(?:[?#][^"\x27\s]*)?)["\x27]'
+
+
+_JS_MEDIA_LITERAL_IMAGE = _js_media_literal(K.IMAGE_EXTENSIONS)
+_JS_MEDIA_LITERAL_VIDEO = _js_media_literal(K.VIDEO_EXTENSIONS + [".m3u8", ".mpd"])
+
+
 class WebpageParser:
     """
     Enhanced webpage parser class for extracting media files and links from webpages
@@ -99,8 +121,10 @@ class WebpageParser:
         "picture": [("source", "nested")]
     }
     JS_PATTERNS = { 
-        "image_sources": [r'["\'](https?://[^"\']+\.(?:jpg|jpeg|jfif|jif|png|gif|webp))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+)["\']', r'loadImage\s*\(\s*["\'](https?://[^"\']+)["\']', r'background(?:-image)?\s*:\s*url\(["\']?(https?://[^"\']+)["\']?\)',],
-        "video_sources": [r'["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'\.src\s*=\s*["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'loadVideo\s*\(\s*["\'](https?://[^"\']+)["\']',],
+        # JS-REL: the literal patterns accept site-relative and protocol-relative
+        # paths too — only the extension anchors the match.
+        "image_sources": [_JS_MEDIA_LITERAL_IMAGE, r'\.src\s*=\s*["\'](https?://[^"\']+)["\']', r'loadImage\s*\(\s*["\'](https?://[^"\']+)["\']', r'background(?:-image)?\s*:\s*url\(["\']?(https?://[^"\']+)["\']?\)',],
+        "video_sources": [_JS_MEDIA_LITERAL_VIDEO, r'\.src\s*=\s*["\'](https?://[^"\']+\.(?:mp4|webm|ogg))["\']', r'loadVideo\s*\(\s*["\'](https?://[^"\']+)["\']',],
         # CORE-14: the data-srcset regex was removed — its group(1) captured the
         # whole srcset string (multi-URL srcsets became one garbage URL that
         # is_media_url rejects); single-URL data-srcset is already covered by the
@@ -1769,8 +1793,13 @@ class WebpageParser:
                 media_hint = "image" if "image" in pattern_type else "video" if "video" in pattern_type else "image" 
                 for pattern in patterns:
                     for match in re.finditer(pattern, js_content):
-                        url = match.group(1) 
-                        if url and url.startswith(("http://", "https://", "/")) and is_media_url(url):
+                        url = match.group(1)
+                        # JS-REL: accept site-relative paths ("thumbs/x.webp") —
+                        # urljoin below resolves them against the page. Only
+                        # non-URL schemes are rejected outright.
+                        if not url or url.startswith(("data:", "javascript:", "mailto:", "#")):
+                            continue
+                        if is_media_url(url):
                             abs_url = urljoin(self.url, url)
                             if abs_url in preview_urls:
                                 continue
